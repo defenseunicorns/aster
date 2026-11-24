@@ -2,11 +2,12 @@ use super::map_bluer_error;
 use crate::{
     ASTER_ROSTER_BEACON_V1_BYTES, ASTER_ROSTER_SERVICE_UUID, CanonicalLocator,
     CanonicalLocatorError, DriverError, DriverErrorKind, ValidatedControllerConfig,
+    config::ControllerOperationBinding,
 };
 use bluer::{Address, AddressType, Uuid, adv};
 use futures::{Stream, StreamExt, stream, stream::SelectAll};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     future::Future,
     pin::Pin,
@@ -130,19 +131,18 @@ fn bluez_advertisement(roster: RosterAdvertisement) -> adv::Advertisement {
     }
 }
 
-fn validate_advertising_support(
-    supported_instances: u8,
-    active_instances: u8,
-    secondary_channels: &BTreeSet<adv::SecondaryChannel>,
-    capabilities: &adv::Capabilities,
-) -> Result<(), DriverError> {
-    if supported_instances <= active_instances
-        || !secondary_channels.contains(&adv::SecondaryChannel::OneM)
-        || capabilities.max_advertisement_length < 79
-    {
-        return Err(advertising_unsupported());
+fn map_advertisement_registration_error(error: bluer::Error) -> DriverError {
+    if matches!(
+        &error.kind,
+        bluer::ErrorKind::InvalidArguments | bluer::ErrorKind::InvalidLength
+    ) {
+        DriverError::new(
+            DriverErrorKind::Unavailable,
+            "BlueZ advertisement registration rejected",
+        )
+    } else {
+        map_bluer_error(error)
     }
-    Ok(())
 }
 
 fn bluez_discovery_filter() -> bluer::DiscoveryFilter {
@@ -520,9 +520,32 @@ fn scan_owner_lost() -> DriverError {
 type AdapterEventStream = Pin<Box<dyn Stream<Item = bluer::AdapterEvent> + Send>>;
 type DeviceEventStream = Pin<Box<dyn Stream<Item = WatchedDeviceEvent> + Send>>;
 
+async fn final_discovery_io<Adapter, T, Verify, VerifyFuture, Operation, OperationFuture>(
+    controller: &ControllerOperationBinding,
+    verify: Verify,
+    operation: Operation,
+) -> Result<T, DriverError>
+where
+    Verify: FnOnce() -> VerifyFuture,
+    VerifyFuture: Future<Output = Result<Adapter, DriverError>>,
+    Operation: FnOnce(Adapter) -> OperationFuture,
+    OperationFuture: Future<Output = Result<T, DriverError>>,
+{
+    controller.ensure_current()?;
+    let adapter = verify().await?;
+    controller.ensure_current()?;
+    operation(adapter).await
+}
+
 enum WatchedDeviceEvent {
-    Property(CanonicalLocator, bluer::DeviceEvent),
-    Ended(Address),
+    Property(u64, CanonicalLocator, bluer::DeviceEvent),
+    Ended(u64, Address),
+}
+
+#[derive(Clone, Copy)]
+struct WatchedDevice {
+    generation: u64,
+    locator: CanonicalLocator,
 }
 
 enum AddDeviceError {
@@ -530,74 +553,194 @@ enum AddDeviceError {
     Platform,
 }
 
-struct BluezScanBackend {
-    adapter: bluer::Adapter,
-    adapter_events: Option<AdapterEventStream>,
+enum DeviceSnapshotError {
+    Disappeared,
+    Driver,
+}
+
+type DeviceSnapshotFuture =
+    Pin<Box<dyn Future<Output = Result<Option<DiscoveryObservation>, DeviceSnapshotError>> + Send>>;
+
+fn take_watch_generation(next: &mut u64) -> Option<u64> {
+    let generation = *next;
+    *next = next.checked_add(1)?;
+    Some(generation)
+}
+
+trait DeviceWatchBackend: Clone + Send + 'static {
+    fn subscribe(
+        &self,
+        address: Address,
+        generation: u64,
+    ) -> PlatformFuture<'_, Option<(CanonicalLocator, DeviceEventStream)>>;
+    fn snapshot(&self, locator: CanonicalLocator) -> DeviceSnapshotFuture;
+}
+
+#[derive(Clone)]
+struct BluezDeviceWatchBackend {
+    guard: BluezControllerGuard,
+}
+
+impl DeviceWatchBackend for BluezDeviceWatchBackend {
+    fn subscribe(
+        &self,
+        address: Address,
+        generation: u64,
+    ) -> PlatformFuture<'_, Option<(CanonicalLocator, DeviceEventStream)>> {
+        Box::pin(subscribe_device(&self.guard, address, generation))
+    }
+
+    fn snapshot(&self, locator: CanonicalLocator) -> DeviceSnapshotFuture {
+        let guard = self.guard.clone();
+        Box::pin(async move { read_device_snapshot(&guard, locator).await })
+    }
+}
+
+struct BluezScanBackend<D = BluezDeviceWatchBackend> {
+    devices: D,
+    raw_adapter_events: Option<AdapterEventStream>,
+    discovery_owner_events: Option<AdapterEventStream>,
     device_events: SelectAll<DeviceEventStream>,
-    watched: BTreeSet<Address>,
+    watched: BTreeMap<Address, WatchedDevice>,
+    retained_watch_generations: BTreeSet<u64>,
+    next_watch_generation: u64,
     initial_capacity_exceeded: bool,
     owner_loss: watch::Receiver<bool>,
 }
 
-impl BluezScanBackend {
+impl BluezScanBackend<BluezDeviceWatchBackend> {
     async fn start(
-        adapter: bluer::Adapter,
+        guard: BluezControllerGuard,
         owner_loss: watch::Receiver<bool>,
     ) -> Result<Self, DriverError> {
-        adapter
-            .set_discovery_filter(bluez_discovery_filter())
-            .await
-            .map_err(map_bluer_error)?;
-        let mut addresses = adapter.device_addresses().await.map_err(map_bluer_error)?;
+        final_discovery_io(
+            &guard.controller,
+            || guard.adapter(),
+            |adapter| async move {
+                adapter
+                    .set_discovery_filter(bluez_discovery_filter())
+                    .await
+                    .map_err(map_bluer_error)
+            },
+        )
+        .await?;
+        let raw_adapter_events = Box::pin(
+            final_discovery_io(
+                &guard.controller,
+                || guard.adapter(),
+                |adapter| async move { adapter.events().await.map_err(map_bluer_error) },
+            )
+            .await?,
+        );
+        let mut addresses = final_discovery_io(
+            &guard.controller,
+            || guard.adapter(),
+            |adapter| async move { adapter.device_addresses().await.map_err(map_bluer_error) },
+        )
+        .await?;
         addresses.sort_unstable();
         let mut initial_capacity_exceeded =
             addresses.len() > DISCOVERY_INITIAL_DEVICE_INSPECTION_CAPACITY;
         addresses.truncate(DISCOVERY_INITIAL_DEVICE_INSPECTION_CAPACITY);
         let mut device_events = SelectAll::new();
-        let mut watched = BTreeSet::new();
+        let mut watched = BTreeMap::new();
+        let mut retained_watch_generations = BTreeSet::new();
+        let mut next_watch_generation = 1_u64;
         for address in addresses {
-            let device = adapter.device(address).map_err(map_bluer_error)?;
-            let service_data = device.service_data().await.map_err(map_bluer_error)?;
-            if !service_data.is_some_and(|data| {
-                data.contains_key(&bluer::Uuid::from_bytes(ASTER_ROSTER_SERVICE_UUID))
-            }) {
-                continue;
-            }
-            if watched.len() >= DISCOVERY_DEVICE_WATCHER_CAPACITY {
-                initial_capacity_exceeded = true;
-                break;
-            }
-            if let Some(events) = subscribe_device(&adapter, address).await? {
-                watched.insert(address);
+            let generation =
+                take_watch_generation(&mut next_watch_generation).ok_or_else(|| {
+                    DriverError::new(DriverErrorKind::Transport, "BlueZ device watcher exhausted")
+                })?;
+            if let Some((locator, events)) = subscribe_device(&guard, address, generation).await? {
+                if retained_watch_generations.len() >= DISCOVERY_DEVICE_WATCHER_CAPACITY {
+                    initial_capacity_exceeded = true;
+                    break;
+                }
+                watched.insert(
+                    address,
+                    WatchedDevice {
+                        generation,
+                        locator,
+                    },
+                );
+                retained_watch_generations.insert(generation);
                 device_events.push(events);
             }
         }
-        let adapter_events = Box::pin(adapter.discover_devices().await.map_err(map_bluer_error)?);
+        let discovery_owner_events = Box::pin(
+            final_discovery_io(
+                &guard.controller,
+                || guard.adapter(),
+                |adapter| async move { adapter.discover_devices().await.map_err(map_bluer_error) },
+            )
+            .await?,
+        );
         Ok(Self {
-            adapter,
-            adapter_events: Some(adapter_events),
+            devices: BluezDeviceWatchBackend { guard },
+            raw_adapter_events: Some(raw_adapter_events),
+            discovery_owner_events: Some(discovery_owner_events),
             device_events,
             watched,
+            retained_watch_generations,
+            next_watch_generation,
             initial_capacity_exceeded,
             owner_loss,
         })
     }
+}
 
-    async fn add_device(&mut self, address: Address) -> Result<(), AddDeviceError> {
-        if self.watched.contains(&address) {
-            return Ok(());
-        }
-        if self.watched.len() >= DISCOVERY_DEVICE_WATCHER_CAPACITY {
-            return Err(AddDeviceError::Capacity);
-        }
-        if let Some(events) = subscribe_device(&self.adapter, address)
-            .await
-            .map_err(|_| AddDeviceError::Platform)?
-        {
-            self.watched.insert(address);
+impl<D> BluezScanBackend<D>
+where
+    D: DeviceWatchBackend,
+{
+    async fn add_live_device(
+        &mut self,
+        address: Address,
+    ) -> Result<Option<DiscoveryObservation>, AddDeviceError> {
+        let watched = if let Some(watched) = self.watched.get(&address).copied() {
+            watched
+        } else {
+            let generation = take_watch_generation(&mut self.next_watch_generation)
+                .ok_or(AddDeviceError::Platform)?;
+            let Some((locator, events)) = self
+                .devices
+                .subscribe(address, generation)
+                .await
+                .map_err(|_| AddDeviceError::Platform)?
+            else {
+                return Ok(None);
+            };
+            if self.retained_watch_generations.len() >= DISCOVERY_DEVICE_WATCHER_CAPACITY {
+                return Err(AddDeviceError::Capacity);
+            }
+            let watched = WatchedDevice {
+                generation,
+                locator,
+            };
+            self.watched.insert(address, watched);
+            self.retained_watch_generations.insert(generation);
             self.device_events.push(events);
+            watched
+        };
+
+        match self.devices.snapshot(watched.locator).await {
+            Ok(Some(observation)) if observation.locator() == watched.locator => {
+                Ok(Some(observation))
+            }
+            Ok(Some(_)) => Err(AddDeviceError::Platform),
+            Err(DeviceSnapshotError::Driver) => Err(AddDeviceError::Platform),
+            Ok(None) | Err(DeviceSnapshotError::Disappeared) => Ok(None),
         }
-        Ok(())
+    }
+
+    fn remove_live_device(&mut self, address: Address) {
+        self.watched.remove(&address);
+    }
+
+    fn watch_is_current(&self, generation: u64, locator: CanonicalLocator) -> bool {
+        self.watched
+            .get(&locator.address())
+            .is_some_and(|watched| watched.generation == generation && watched.locator == locator)
     }
 
     async fn next_bluez_event(&mut self) -> ScanBackendEvent {
@@ -606,60 +749,90 @@ impl BluezScanBackend {
         }
         loop {
             enum SourceEvent {
-                Adapter(Option<bluer::AdapterEvent>),
+                LiveAdapter(Option<bluer::AdapterEvent>),
+                DiscoveryOwner(Option<bluer::AdapterEvent>),
                 Device(Option<WatchedDeviceEvent>),
             }
-            let Some(adapter_events) = self.adapter_events.as_mut() else {
+            let Some(raw_adapter_events) = self.raw_adapter_events.as_mut() else {
+                return ScanBackendEvent::Terminated;
+            };
+            let Some(discovery_owner_events) = self.discovery_owner_events.as_mut() else {
                 return ScanBackendEvent::Terminated;
             };
             let event = {
                 tokio::select! {
-                    event = adapter_events.next() => SourceEvent::Adapter(event),
+                    event = raw_adapter_events.next() => SourceEvent::LiveAdapter(event),
                     event = self.device_events.next(), if !self.device_events.is_empty() => {
                         SourceEvent::Device(event)
                     }
+                    event = discovery_owner_events.next() => SourceEvent::DiscoveryOwner(event),
                 }
             };
             match event {
-                SourceEvent::Adapter(None) => {
+                SourceEvent::LiveAdapter(None) | SourceEvent::DiscoveryOwner(None) => {
                     return ScanBackendEvent::Terminated;
                 }
-                SourceEvent::Adapter(Some(bluer::AdapterEvent::DeviceAdded(address))) => {
-                    match self.add_device(address).await {
-                        Ok(()) => {}
+                SourceEvent::LiveAdapter(Some(bluer::AdapterEvent::DeviceAdded(address))) => {
+                    match self.add_live_device(address).await {
+                        Ok(Some(observation)) => {
+                            return ScanBackendEvent::Observation(observation);
+                        }
+                        Ok(None) => {}
                         Err(AddDeviceError::Capacity) => {
                             return ScanBackendEvent::CapacityExceeded;
                         }
                         Err(AddDeviceError::Platform) => return ScanBackendEvent::NeedsDrain,
                     }
                 }
-                SourceEvent::Adapter(Some(bluer::AdapterEvent::DeviceRemoved(_)))
-                | SourceEvent::Adapter(Some(bluer::AdapterEvent::PropertyChanged(_))) => {}
-                SourceEvent::Device(Some(WatchedDeviceEvent::Ended(address))) => {
-                    self.watched.remove(&address);
+                SourceEvent::LiveAdapter(Some(bluer::AdapterEvent::DeviceRemoved(address))) => {
+                    self.remove_live_device(address);
+                }
+                SourceEvent::LiveAdapter(Some(bluer::AdapterEvent::PropertyChanged(_))) => {}
+                SourceEvent::DiscoveryOwner(Some(_)) => {}
+                SourceEvent::Device(Some(WatchedDeviceEvent::Ended(generation, address))) => {
+                    self.retained_watch_generations.remove(&generation);
+                    if self
+                        .watched
+                        .get(&address)
+                        .is_some_and(|watched| watched.generation == generation)
+                    {
+                        self.watched.remove(&address);
+                    }
                 }
                 SourceEvent::Device(Some(WatchedDeviceEvent::Property(
+                    generation,
                     locator,
                     bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::ServiceData(data)),
                 ))) => {
-                    if let Some(observation) = observation_from_service_data(locator, &data) {
+                    if self.watch_is_current(generation, locator)
+                        && let Some(observation) = observation_from_service_data(locator, &data)
+                    {
                         return ScanBackendEvent::Observation(observation);
                     }
                 }
                 SourceEvent::Device(Some(WatchedDeviceEvent::Property(
+                    generation,
                     locator,
                     bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::AddressType(kind)),
-                ))) if kind != locator.address_type() => return ScanBackendEvent::NeedsDrain,
-                SourceEvent::Device(Some(WatchedDeviceEvent::Property(_, _))) => {}
+                ))) if self.watch_is_current(generation, locator)
+                    && kind != locator.address_type() =>
+                {
+                    return ScanBackendEvent::NeedsDrain;
+                }
+                SourceEvent::Device(Some(WatchedDeviceEvent::Property(_, _, _))) => {}
                 SourceEvent::Device(None) => return ScanBackendEvent::NeedsDrain,
             }
         }
     }
 }
 
-impl ScanBackend for BluezScanBackend {
+impl<D> ScanBackend for BluezScanBackend<D>
+where
+    D: DeviceWatchBackend,
+{
     fn stop(&mut self) -> PlatformFuture<'_, ()> {
-        self.adapter_events.take();
+        self.raw_adapter_events.take();
+        self.discovery_owner_events.take();
         Box::pin(async { Ok(()) })
     }
 
@@ -673,26 +846,159 @@ impl ScanBackend for BluezScanBackend {
 }
 
 async fn subscribe_device(
-    adapter: &bluer::Adapter,
+    guard: &BluezControllerGuard,
     address: Address,
-) -> Result<Option<DeviceEventStream>, DriverError> {
-    let device = adapter.device(address).map_err(map_bluer_error)?;
-    let events = device.events().await.map_err(map_bluer_error)?;
-    let address_type = device.address_type().await.map_err(map_bluer_error)?;
+    generation: u64,
+) -> Result<Option<(CanonicalLocator, DeviceEventStream)>, DriverError> {
+    let events = final_discovery_io(
+        &guard.controller,
+        || guard.adapter(),
+        |adapter| async move {
+            adapter
+                .device(address)
+                .map_err(map_bluer_error)?
+                .events()
+                .await
+                .map_err(map_bluer_error)
+        },
+    )
+    .await?;
+    let address_type = final_discovery_io(
+        &guard.controller,
+        || guard.adapter(),
+        |adapter| async move {
+            adapter
+                .device(address)
+                .map_err(map_bluer_error)?
+                .address_type()
+                .await
+                .map_err(map_bluer_error)
+        },
+    )
+    .await?;
     let Ok(locator) = CanonicalLocator::new(address, address_type) else {
         return Ok(None);
     };
     let events = events
-        .map(move |event| WatchedDeviceEvent::Property(locator, event))
-        .chain(stream::once(
-            async move { WatchedDeviceEvent::Ended(address) },
-        ));
-    Ok(Some(Box::pin(events)))
+        .map(move |event| WatchedDeviceEvent::Property(generation, locator, event))
+        .chain(stream::once(async move {
+            WatchedDeviceEvent::Ended(generation, address)
+        }));
+    Ok(Some((locator, Box::pin(events))))
+}
+
+async fn read_device_snapshot(
+    guard: &BluezControllerGuard,
+    expected: CanonicalLocator,
+) -> Result<Option<DiscoveryObservation>, DeviceSnapshotError> {
+    let adapter = guard
+        .adapter()
+        .await
+        .map_err(|_| DeviceSnapshotError::Driver)?;
+    guard
+        .controller
+        .ensure_current()
+        .map_err(|_| DeviceSnapshotError::Driver)?;
+    let Some(service_data) = adapter
+        .device(expected.address())
+        .map_err(map_device_snapshot_error)?
+        .service_data()
+        .await
+        .map_err(map_device_snapshot_error)?
+    else {
+        return Ok(None);
+    };
+    guard
+        .controller
+        .ensure_current()
+        .map_err(|_| DeviceSnapshotError::Driver)?;
+    let Some(record) = service_data.get(&Uuid::from_bytes(ASTER_ROSTER_SERVICE_UUID)) else {
+        return Ok(None);
+    };
+    let record = record
+        .as_slice()
+        .try_into()
+        .map(BoundedRecord::Exact)
+        .unwrap_or(BoundedRecord::WrongLength);
+    drop(service_data);
+    let adapter = guard
+        .adapter()
+        .await
+        .map_err(|_| DeviceSnapshotError::Driver)?;
+    guard
+        .controller
+        .ensure_current()
+        .map_err(|_| DeviceSnapshotError::Driver)?;
+    let address_type = adapter
+        .device(expected.address())
+        .map_err(map_device_snapshot_error)?
+        .address_type()
+        .await
+        .map_err(map_device_snapshot_error)?;
+    guard
+        .controller
+        .ensure_current()
+        .map_err(|_| DeviceSnapshotError::Driver)?;
+    let Ok(locator) = CanonicalLocator::new(expected.address(), address_type) else {
+        return Ok(None);
+    };
+    Ok(Some(DiscoveryObservation { locator, record }))
+}
+
+fn map_device_snapshot_error(error: bluer::Error) -> DeviceSnapshotError {
+    match error.kind {
+        bluer::ErrorKind::DoesNotExist | bluer::ErrorKind::NotFound => {
+            DeviceSnapshotError::Disappeared
+        }
+        _ => DeviceSnapshotError::Driver,
+    }
 }
 
 pub(crate) struct BluezDiscoveryPlatform {
     session: bluer::Session,
     owner_loss: BluezOwnerLoss,
+}
+
+#[derive(Clone)]
+struct BluezControllerGuard {
+    session: bluer::Session,
+    controller: ControllerOperationBinding,
+}
+
+impl BluezControllerGuard {
+    async fn adapter(&self) -> Result<bluer::Adapter, DriverError> {
+        self.controller.ensure_current()?;
+        let names = self
+            .session
+            .adapter_names()
+            .await
+            .map_err(map_bluer_error)?;
+        if !names
+            .iter()
+            .any(|name| name == self.controller.adapter_name())
+        {
+            return Err(controller_unavailable());
+        }
+        self.controller.ensure_current()?;
+        let adapter = self
+            .session
+            .adapter(self.controller.adapter_name())
+            .map_err(map_bluer_error)?;
+        self.controller.ensure_current()?;
+        let powered = adapter.is_powered().await.map_err(map_bluer_error)?;
+        self.controller.ensure_current()?;
+        let address = adapter.address().await.map_err(map_bluer_error)?;
+        self.controller.ensure_current()?;
+        let address_type = adapter.address_type().await.map_err(map_bluer_error)?;
+        self.controller.ensure_current()?;
+        if !powered
+            || address != self.controller.local_address()
+            || address_type != self.controller.local_address_type()
+        {
+            return Err(controller_unavailable());
+        }
+        Ok(adapter)
+    }
 }
 
 #[derive(Clone)]
@@ -737,32 +1043,11 @@ impl BluezDiscoveryPlatform {
         self.owner_loss.clone()
     }
 
-    async fn adapter(
-        &self,
-        controller: &ValidatedControllerConfig,
-    ) -> Result<bluer::Adapter, DriverError> {
-        let names = self
-            .session
-            .adapter_names()
-            .await
-            .map_err(map_bluer_error)?;
-        if !names.iter().any(|name| name == controller.adapter_name()) {
-            return Err(controller_unavailable());
+    fn guard(&self, controller: &ValidatedControllerConfig) -> BluezControllerGuard {
+        BluezControllerGuard {
+            session: self.session.clone(),
+            controller: controller.operation_binding(),
         }
-        let adapter = self
-            .session
-            .adapter(controller.adapter_name())
-            .map_err(map_bluer_error)?;
-        let powered = adapter.is_powered().await.map_err(map_bluer_error)?;
-        let address = adapter.address().await.map_err(map_bluer_error)?;
-        let address_type = adapter.address_type().await.map_err(map_bluer_error)?;
-        if !powered
-            || address != controller.local_address()
-            || address_type != controller.local_address_type()
-        {
-            return Err(controller_unavailable());
-        }
-        Ok(adapter)
     }
 }
 
@@ -773,30 +1058,21 @@ impl DiscoveryPlatform for BluezDiscoveryPlatform {
         advertisement: RosterAdvertisement,
     ) -> PlatformFuture<'a, Box<dyn OwnedAdvertisement>> {
         Box::pin(async move {
-            let adapter = self.adapter(controller).await?;
-            let supported = adapter
-                .supported_advertising_instances()
-                .await
-                .map_err(map_bluer_error)?;
-            let active = adapter
-                .active_advertising_instances()
-                .await
-                .map_err(map_bluer_error)?;
-            let channels = adapter
-                .supported_advertising_secondary_channels()
-                .await
-                .map_err(map_bluer_error)?
-                .ok_or_else(advertising_unsupported)?;
-            let capabilities = adapter
-                .supported_advertising_capabilities()
-                .await
-                .map_err(map_bluer_error)?
-                .ok_or_else(advertising_unsupported)?;
-            validate_advertising_support(supported, active, &channels, &capabilities)?;
-            let handle = adapter
-                .advertise(bluez_advertisement(advertisement))
-                .await
-                .map_err(map_bluer_error)?;
+            let guard = self.guard(controller);
+            // Passive controller compatibility is established by controller_probe.
+            // Exact registration is the operational advertisement capability
+            // and permission check for this policy-authorized radio epoch.
+            let handle = final_discovery_io(
+                &guard.controller,
+                || guard.adapter(),
+                |adapter| async move {
+                    adapter
+                        .advertise(bluez_advertisement(advertisement))
+                        .await
+                        .map_err(map_advertisement_registration_error)
+                },
+            )
+            .await?;
             Ok(
                 Box::new(spawn_advertisement_owner(BluezAdvertisementBackend::new(
                     handle,
@@ -811,8 +1087,7 @@ impl DiscoveryPlatform for BluezDiscoveryPlatform {
         controller: &'a ValidatedControllerConfig,
     ) -> PlatformFuture<'a, StartedScan> {
         Box::pin(async move {
-            let adapter = self.adapter(controller).await?;
-            BluezScanBackend::start(adapter, self.owner_loss.subscribe())
+            BluezScanBackend::start(self.guard(controller), self.owner_loss.subscribe())
                 .await
                 .map(spawn_scan_owner)
         })
@@ -827,13 +1102,6 @@ fn controller_unavailable() -> DriverError {
     DriverError::new(
         DriverErrorKind::Unavailable,
         "configured Bluetooth controller is unavailable",
-    )
-}
-
-fn advertising_unsupported() -> DriverError {
-    DriverError::new(
-        DriverErrorKind::Unavailable,
-        "configured controller lacks rostered advertising support",
     )
 }
 
@@ -923,6 +1191,19 @@ mod tests {
         }))
         .validate()
         .unwrap()
+        .unwrap()
+    }
+
+    fn automatic_controller(
+        cancellation: &crate::LifecycleCancellation,
+    ) -> ValidatedControllerConfig {
+        ValidatedControllerConfig::for_epoch(
+            "hci7".to_owned(),
+            Address::new([2, 0, 0, 0, 0, 1]),
+            AddressType::LeRandom,
+            1,
+            cancellation.observer(),
+        )
         .unwrap()
     }
 
@@ -1036,6 +1317,54 @@ mod tests {
         assert!(oversized.record().is_empty());
     }
 
+    #[tokio::test]
+    async fn cancellation_after_exact_verification_blocks_final_rf_call() {
+        let cancellation = crate::LifecycleCancellation::new();
+        let binding = automatic_controller(&cancellation).operation_binding();
+        let calls = AtomicUsize::new(0);
+
+        let result = final_discovery_io(
+            &binding,
+            || async {
+                cancellation.cancel();
+                Ok(())
+            },
+            |_| async {
+                calls.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().kind(), DriverErrorKind::Cancelled);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn exact_identity_change_blocks_final_rf_call() {
+        let cancellation = crate::LifecycleCancellation::new();
+        let binding = automatic_controller(&cancellation).operation_binding();
+        let calls = AtomicUsize::new(0);
+
+        let result = final_discovery_io(
+            &binding,
+            || async {
+                Err::<(), _>(DriverError::new(
+                    DriverErrorKind::Unavailable,
+                    "test controller identity changed",
+                ))
+            },
+            |_| async {
+                calls.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().kind(), DriverErrorKind::Unavailable);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
+
     #[test]
     fn production_advertisement_uses_the_frozen_extended_tuple() {
         let record = [0x55; ASTER_ROSTER_BEACON_V1_BYTES];
@@ -1073,18 +1402,33 @@ mod tests {
     }
 
     #[test]
-    fn advertising_eligibility_requires_capacity_instance_and_one_m_phy() {
-        let channels = [bluer::adv::SecondaryChannel::OneM].into_iter().collect();
-        let mut capabilities = bluer::adv::Capabilities::default();
-        capabilities.max_advertisement_length = 79;
+    fn advertisement_registration_errors_preserve_operational_categories() {
+        for kind in [
+            bluer::ErrorKind::InvalidArguments,
+            bluer::ErrorKind::InvalidLength,
+        ] {
+            let error = map_advertisement_registration_error(bluer::Error {
+                kind,
+                message: "sensitive BlueZ detail".to_owned(),
+            });
 
-        assert!(validate_advertising_support(2, 1, &channels, &capabilities).is_ok());
-        assert!(validate_advertising_support(1, 1, &channels, &capabilities).is_err());
+            assert_eq!(
+                error,
+                DriverError::new(
+                    DriverErrorKind::Unavailable,
+                    "BlueZ advertisement registration rejected",
+                )
+            );
+        }
 
-        let mut short = bluer::adv::Capabilities::default();
-        short.max_advertisement_length = 78;
-        assert!(validate_advertising_support(2, 1, &channels, &short).is_err());
-        assert!(validate_advertising_support(2, 1, &Default::default(), &capabilities).is_err());
+        let timeout = map_advertisement_registration_error(bluer::Error {
+            kind: bluer::ErrorKind::AuthenticationTimeout,
+            message: "sensitive BlueZ detail".to_owned(),
+        });
+        assert_eq!(
+            timeout,
+            DriverError::new(DriverErrorKind::Timeout, "BlueZ operation failed")
+        );
     }
 
     #[test]
@@ -1119,6 +1463,262 @@ mod tests {
         let observation = observation_from_service_data(locator, &service_data).unwrap();
         assert_eq!(observation.locator(), locator);
         assert_eq!(observation.record(), &[0x55; 40]);
+    }
+
+    #[derive(Clone)]
+    struct ScriptedDeviceWatchBackend {
+        locator: CanonicalLocator,
+        snapshot_locator: CanonicalLocator,
+        record: [u8; ASTER_ROSTER_BEACON_V1_BYTES],
+        snapshot_disappeared: bool,
+    }
+
+    impl DeviceWatchBackend for ScriptedDeviceWatchBackend {
+        fn subscribe(
+            &self,
+            _address: Address,
+            _generation: u64,
+        ) -> PlatformFuture<'_, Option<(CanonicalLocator, DeviceEventStream)>> {
+            let locator = self.locator;
+            Box::pin(async move {
+                Ok(Some((
+                    locator,
+                    Box::pin(stream::pending::<WatchedDeviceEvent>()) as DeviceEventStream,
+                )))
+            })
+        }
+
+        fn snapshot(&self, locator: CanonicalLocator) -> DeviceSnapshotFuture {
+            if self.snapshot_disappeared {
+                return Box::pin(async { Err(DeviceSnapshotError::Disappeared) });
+            }
+            let snapshot = (locator == self.locator)
+                .then(|| {
+                    DiscoveryObservation::new(
+                        self.snapshot_locator.address(),
+                        self.snapshot_locator.address_type(),
+                        &self.record,
+                    )
+                })
+                .transpose()
+                .expect("scripted locator is LE");
+            Box::pin(async move { Ok(snapshot) })
+        }
+    }
+
+    fn test_scan<D>(devices: D, raw_adapter_events: AdapterEventStream) -> BluezScanBackend<D>
+    where
+        D: DeviceWatchBackend,
+    {
+        let (_owner_loss, owner_loss) = watch::channel(false);
+        BluezScanBackend {
+            devices,
+            raw_adapter_events: Some(raw_adapter_events),
+            discovery_owner_events: Some(Box::pin(stream::pending())),
+            device_events: SelectAll::new(),
+            watched: BTreeMap::new(),
+            retained_watch_generations: BTreeSet::new(),
+            next_watch_generation: 1,
+            initial_capacity_exceeded: false,
+            owner_loss,
+        }
+    }
+
+    #[tokio::test]
+    async fn device_added_after_prearming_is_snapshot_admitted() {
+        let address = Address::new([2, 0, 0, 0, 0, 9]);
+        let locator = CanonicalLocator::new(address, AddressType::LeRandom).unwrap();
+        let record = [0x55; ASTER_ROSTER_BEACON_V1_BYTES];
+        let raw_adapter_events =
+            stream::once(async move { bluer::AdapterEvent::DeviceAdded(address) });
+        let mut backend = test_scan(
+            ScriptedDeviceWatchBackend {
+                locator,
+                snapshot_locator: locator,
+                record,
+                snapshot_disappeared: false,
+            },
+            Box::pin(raw_adapter_events),
+        );
+
+        let ScanBackendEvent::Observation(observation) = backend.next_bluez_event().await else {
+            panic!("live new-device snapshot must produce one observation");
+        };
+        assert_eq!(observation.locator(), locator);
+        assert_eq!(observation.record(), &record);
+    }
+
+    #[tokio::test]
+    async fn raw_add_snapshots_an_already_prearmed_device() {
+        let address = Address::new([2, 0, 0, 0, 0, 9]);
+        let locator = CanonicalLocator::new(address, AddressType::LeRandom).unwrap();
+        let record = [0x55; ASTER_ROSTER_BEACON_V1_BYTES];
+        let mut backend = test_scan(
+            ScriptedDeviceWatchBackend {
+                locator,
+                snapshot_locator: locator,
+                record,
+                snapshot_disappeared: false,
+            },
+            Box::pin(stream::pending()),
+        );
+        backend.watched.insert(
+            address,
+            WatchedDevice {
+                generation: 1,
+                locator,
+            },
+        );
+        backend.retained_watch_generations.insert(1);
+
+        let Ok(Some(observation)) = backend.add_live_device(address).await else {
+            panic!("a raw add must snapshot its prearmed watcher");
+        };
+        assert_eq!(observation.locator(), locator);
+        assert_eq!(observation.record(), &record);
+    }
+
+    #[tokio::test]
+    async fn address_type_change_during_snapshot_stops_the_scan() {
+        let address = Address::new([2, 0, 0, 0, 0, 9]);
+        let subscribed = CanonicalLocator::new(address, AddressType::LeRandom).unwrap();
+        let changed = CanonicalLocator::new(address, AddressType::LePublic).unwrap();
+        let raw_adapter_events =
+            stream::once(async move { bluer::AdapterEvent::DeviceAdded(address) });
+        let mut backend = test_scan(
+            ScriptedDeviceWatchBackend {
+                locator: subscribed,
+                snapshot_locator: changed,
+                record: [0x55; ASTER_ROSTER_BEACON_V1_BYTES],
+                snapshot_disappeared: false,
+            },
+            Box::pin(raw_adapter_events),
+        );
+
+        assert!(matches!(
+            backend.next_bluez_event().await,
+            ScanBackendEvent::NeedsDrain
+        ));
+    }
+
+    #[tokio::test]
+    async fn old_watcher_end_does_not_remove_replacement() {
+        let address = Address::new([2, 0, 0, 0, 0, 9]);
+        let locator = CanonicalLocator::new(address, AddressType::LeRandom).unwrap();
+        let record = [0x55; ASTER_ROSTER_BEACON_V1_BYTES];
+        let service_data: HashMap<_, _> =
+            [(Uuid::from_bytes(ASTER_ROSTER_SERVICE_UUID), record.to_vec())]
+                .into_iter()
+                .collect();
+        let mut backend = test_scan(
+            ScriptedDeviceWatchBackend {
+                locator,
+                snapshot_locator: locator,
+                record,
+                snapshot_disappeared: false,
+            },
+            Box::pin(stream::pending()),
+        );
+        backend.watched.insert(
+            address,
+            WatchedDevice {
+                generation: 2,
+                locator,
+            },
+        );
+        backend.retained_watch_generations.extend([1, 2]);
+        backend.device_events.push(Box::pin(stream::iter([
+            WatchedDeviceEvent::Ended(1, address),
+            WatchedDeviceEvent::Property(
+                2,
+                locator,
+                bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::ServiceData(
+                    service_data,
+                )),
+            ),
+        ])));
+
+        let ScanBackendEvent::Observation(observation) = backend.next_bluez_event().await else {
+            panic!("replacement watcher must still emit observations");
+        };
+        assert_eq!(observation.locator(), locator);
+        assert_eq!(observation.record(), &record);
+        assert_eq!(backend.retained_watch_generations, BTreeSet::from([2]));
+    }
+
+    #[tokio::test]
+    async fn retired_device_streams_remain_charged_until_end() {
+        let address = Address::new([2, 0, 0, 0, 0, 9]);
+        let locator = CanonicalLocator::new(address, AddressType::LeRandom).unwrap();
+        let mut backend = test_scan(
+            ScriptedDeviceWatchBackend {
+                locator,
+                snapshot_locator: locator,
+                record: [0x55; ASTER_ROSTER_BEACON_V1_BYTES],
+                snapshot_disappeared: false,
+            },
+            Box::pin(stream::pending()),
+        );
+
+        for _ in 0..DISCOVERY_DEVICE_WATCHER_CAPACITY {
+            assert!(backend.add_live_device(address).await.is_ok());
+            backend.remove_live_device(address);
+        }
+
+        assert!(matches!(
+            backend.add_live_device(address).await,
+            Err(AddDeviceError::Capacity)
+        ));
+    }
+
+    #[derive(Clone)]
+    struct IgnoredDeviceWatchBackend;
+
+    impl DeviceWatchBackend for IgnoredDeviceWatchBackend {
+        fn subscribe(
+            &self,
+            _address: Address,
+            _generation: u64,
+        ) -> PlatformFuture<'_, Option<(CanonicalLocator, DeviceEventStream)>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn snapshot(&self, _locator: CanonicalLocator) -> DeviceSnapshotFuture {
+            unreachable!("an ignored device has no snapshot")
+        }
+    }
+
+    #[tokio::test]
+    async fn non_le_device_does_not_exhaust_retained_watcher_capacity() {
+        let mut backend = test_scan(IgnoredDeviceWatchBackend, Box::pin(stream::pending()));
+        backend
+            .retained_watch_generations
+            .extend(1..=DISCOVERY_DEVICE_WATCHER_CAPACITY as u64);
+
+        assert!(matches!(
+            backend
+                .add_live_device(Address::new([2, 0, 0, 0, 0, 9]))
+                .await,
+            Ok(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn device_disappearance_during_snapshot_is_not_a_scan_failure() {
+        let address = Address::new([2, 0, 0, 0, 0, 9]);
+        let locator = CanonicalLocator::new(address, AddressType::LeRandom).unwrap();
+        let mut backend = test_scan(
+            ScriptedDeviceWatchBackend {
+                locator,
+                snapshot_locator: locator,
+                record: [0x55; ASTER_ROSTER_BEACON_V1_BYTES],
+                snapshot_disappeared: true,
+            },
+            Box::pin(stream::pending()),
+        );
+
+        assert!(matches!(backend.add_live_device(address).await, Ok(None)));
+        assert_eq!(backend.retained_watch_generations.len(), 1);
     }
 
     struct BlockingAdvertisementBackend {

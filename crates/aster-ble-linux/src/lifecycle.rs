@@ -76,6 +76,8 @@ pub enum SupervisorError {
     ContactTerminal(ContactReason),
     /// The controller monitor stopped with a closed driver category.
     Controller(DriverErrorKind),
+    /// The discovery credential epoch ended cleanly and requires owner restart.
+    CredentialExpired,
     /// An owned supervisor child task stopped unexpectedly.
     TaskStopped,
     /// Consuming shutdown forced owner loss without confirming platform cleanup.
@@ -102,6 +104,9 @@ impl fmt::Display for SupervisorError {
                 "Linux BTLE ordered Event contact terminated: {reason:?}"
             ),
             Self::Controller(kind) => write!(formatter, "Linux BTLE controller failed: {kind:?}"),
+            Self::CredentialExpired => {
+                formatter.write_str("Linux BTLE discovery credential expired")
+            }
             Self::TaskStopped => formatter.write_str("Linux BTLE supervisor task stopped"),
             Self::PlatformCleanupUnconfirmed => {
                 formatter.write_str("Linux BTLE platform cleanup could not be confirmed")

@@ -35,7 +35,7 @@ use std::os::unix::{
     fs::{DirBuilderExt as _, FileTypeExt as _, MetadataExt as _, PermissionsExt as _},
 };
 #[cfg(test)]
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 use aster_contact::{ContactError, ContactErrorKind, OrderedContact};
 use aster_iroh::{
@@ -160,7 +160,9 @@ use crate::{
     event_transport::{
         AutomaticEventTransportHandle, ContactDisposition, ContactOutcome, ContactProvenance,
         ContactReason, ContactScope, ContactStage, EventAdapterControl, EventAdapterSnapshot,
-        EventAttemptAdmission, EventAttemptReceiver, EventPeerEligibility,
+        EventAdapterState, EventAttemptAdmission, EventAttemptReceiver, EventCohortAuthority,
+        EventOutboundAttempt, EventPeerEligibility, EventTransportKind, MAX_EVENT_PEER_ELIGIBILITY,
+        UnauthenticatedCarrierOpenFailure, event_cohort_authority_for_peer,
     },
     format_node_id, format_path_field, format_receipt_field,
     frame::{
@@ -344,6 +346,10 @@ const AUTOMATIC_NEARBY_REOPEN_MIN_BACKOFF: Duration = Duration::from_millis(250)
 const AUTOMATIC_NEARBY_REOPEN_MAX_BACKOFF: Duration = Duration::from_secs(4);
 const MAX_INBOUND_CONTACTS: usize = 16;
 const MAX_OUTBOUND_CONTACTS: usize = 16;
+// Fixed initial Iroh ranking. An operator-configured BTLE value above 100 can
+// prefer the qualified radio; an equal value preserves Iroh through the
+// selector's stable kind tie. This local value is not a protocol allocation.
+const DEFAULT_IROH_EVENT_PRIORITY: u16 = 100;
 // Preserve single-sided contact in the normal case, but do not let carrier-ID
 // ordering permanently hide a ReceiveOnly peer from a permitted initiator.
 const MIN_NON_PREFERRED_CONTACT_FALLBACK_DELAY: Duration = Duration::from_secs(1);
@@ -2383,6 +2389,25 @@ struct ContactTaskMetadata {
     event_inserted: Arc<AtomicBool>,
 }
 
+struct OutboundContactAbort {
+    task: TaskId,
+    abort: AbortHandle,
+    cancellation: NativeIrohCancellation,
+}
+
+#[derive(Clone, Default)]
+struct NativeIrohCancellation(Arc<AtomicBool>);
+
+impl NativeIrohCancellation {
+    fn cancel_for_collision(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn was_collision_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 impl ContactTaskMetadata {
     fn inbound(carrying_peer: EndpointId, event_inserted: Arc<AtomicBool>) -> Self {
         Self {
@@ -3825,6 +3850,7 @@ pub struct RunningNode {
     selected_controls: SelectedControlHandle,
     ordered_event_contacts: OrderedEventContactHandle,
     automatic_event_transports: RunningAutomaticEventTransportHandle,
+    automatic_iroh_event_peer: Option<NodeId>,
     state_root: PinnedNodeStateRoot,
     application_admission: Arc<AtomicBool>,
     transport_admission: Arc<TransportAdmission>,
@@ -3852,6 +3878,21 @@ struct TransportAdmission {
     changes: watch::Sender<()>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrderedContactAdmissionRejection {
+    StartupClosed,
+    TerminalClosed,
+}
+
+impl OrderedContactAdmissionRejection {
+    fn outcome(self) -> ContactOutcome {
+        match self {
+            Self::StartupClosed => ContactOutcome::admission_busy(),
+            Self::TerminalClosed => ContactOutcome::admission_closed(),
+        }
+    }
+}
+
 impl TransportAdmission {
     fn open() -> Self {
         Self::new(TRANSPORT_ADMISSION_OPEN)
@@ -3871,6 +3912,19 @@ impl TransportAdmission {
 
     fn is_open(&self) -> bool {
         self.state.load(Ordering::Acquire) == TRANSPORT_ADMISSION_OPEN
+    }
+
+    fn ordered_contact_rejection(&self) -> Option<OrderedContactAdmissionRejection> {
+        match self.state.load(Ordering::Acquire) {
+            TRANSPORT_ADMISSION_OPEN => None,
+            TRANSPORT_ADMISSION_STARTUP_CLOSED => {
+                Some(OrderedContactAdmissionRejection::StartupClosed)
+            }
+            TRANSPORT_ADMISSION_TERMINAL_CLOSED => {
+                Some(OrderedContactAdmissionRejection::TerminalClosed)
+            }
+            _ => Some(OrderedContactAdmissionRejection::TerminalClosed),
+        }
     }
 
     fn allows_composition(&self) -> bool {
@@ -3921,7 +3975,12 @@ pub enum OrderedEventContactRole {
 #[derive(Default)]
 struct AutomaticEventRuntimeState {
     durable_generation: u64,
-    requested_generation: BTreeMap<NodeId, u64>,
+    requested_generation: BTreeMap<NodeId, RequestedEventGeneration>,
+}
+
+struct RequestedEventGeneration {
+    authority: EventCohortAuthority,
+    generation: u64,
 }
 
 /// Runtime-owned automatic Event transport registration and eligibility facade.
@@ -3933,6 +3992,7 @@ struct AutomaticEventRuntimeState {
 pub struct RunningAutomaticEventTransportHandle {
     coordinator: AutomaticEventTransportHandle,
     admission: Arc<TransportAdmission>,
+    lifecycle: Arc<StdMutex<()>>,
     state: Arc<StdMutex<AutomaticEventRuntimeState>>,
     mission: NodeId,
     ordered_contacts: OrderedEventContactHandle,
@@ -3947,15 +4007,34 @@ pub enum AutomaticEventRosterStatus {
     PendingCapacity,
 }
 
+/// Result of one transport-owner request for an automatic Event attempt.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutomaticEventAttemptOutcome {
+    /// The admitted attempt completed with its typed contact result.
+    Completed(Result<(), ContactOutcome>),
+    /// Node transport admission was closed before a request could run.
+    AdmissionClosed,
+    /// The requested peer no longer had current eligibility.
+    PeerUnavailable,
+}
+
+type AutomaticEventAttemptFuture =
+    Pin<Box<dyn Future<Output = Result<(), ContactOutcome>> + Send + 'static>>;
+
 impl RunningAutomaticEventTransportHandle {
     fn new(
         admission: Arc<TransportAdmission>,
         mission: NodeId,
         ordered_contacts: OrderedEventContactHandle,
+        outbound_enabled: bool,
     ) -> Self {
+        let coordinator = AutomaticEventTransportHandle::new();
+        coordinator.set_outbound_suspended(!outbound_enabled);
         Self {
-            coordinator: AutomaticEventTransportHandle::new(),
+            coordinator,
             admission,
+            lifecycle: Arc::new(StdMutex::new(())),
             state: Arc::new(StdMutex::new(AutomaticEventRuntimeState::default())),
             mission,
             ordered_contacts,
@@ -3973,6 +4052,10 @@ impl RunningAutomaticEventTransportHandle {
         &self,
         snapshot: EventAdapterSnapshot,
     ) -> Option<(EventAdapterControl, EventAttemptReceiver)> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.admission
             .allows_composition()
             .then(|| self.coordinator.register(snapshot))
@@ -3987,6 +4070,10 @@ impl RunningAutomaticEventTransportHandle {
         &self,
         snapshot: EventAdapterSnapshot,
     ) -> Option<crate::EventAdapterRegistration> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.admission
             .allows_composition()
             .then(|| self.coordinator.register_paired(snapshot))
@@ -3996,21 +4083,39 @@ impl RunningAutomaticEventTransportHandle {
     /// Replaces the complete exact-peer eligibility roster and wakes every
     /// unique current peer for this node's mission.
     ///
-    /// Returns `None` when node admission is closed or the bounded coordinator
-    /// rejects the replacement. A pending-capacity result keeps the accepted
-    /// roster and durable scheduling obligations for an event-driven retry.
+    /// Supervised startup may install the complete roster while transport
+    /// admission remains closed. Selection begins only when the supervisor
+    /// opens admission. Returns `None` after terminal closure or when the
+    /// bounded coordinator rejects the replacement. A pending-capacity result
+    /// keeps the accepted roster and durable scheduling obligations for an
+    /// event-driven retry.
     pub fn replace_eligibility(
         &self,
         eligibility: Vec<EventPeerEligibility>,
     ) -> Option<AutomaticEventRosterStatus> {
-        if !self.admission.is_open() {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.admission.allows_composition() {
             return None;
         }
-        let current_peers = eligibility
+        if eligibility.len() > MAX_EVENT_PEER_ELIGIBILITY {
+            return None;
+        }
+        let now = self.coordinator.authority_time();
+        let current_authority = eligibility
             .iter()
             .filter(|entry| entry.mission() == self.mission)
             .map(EventPeerEligibility::peer)
-            .collect::<BTreeSet<_>>();
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|peer| {
+                let authority =
+                    event_cohort_authority_for_peer(&eligibility, self.mission, peer, now);
+                (!authority.is_empty()).then_some((peer, authority))
+            })
+            .collect::<BTreeMap<_, _>>();
         let mut state = self
             .state
             .lock()
@@ -4018,18 +4123,56 @@ impl RunningAutomaticEventTransportHandle {
         if !self.coordinator.replace_eligibility(eligibility) {
             return None;
         }
-        state
-            .requested_generation
-            .retain(|peer, _| current_peers.contains(peer));
-        for peer in &current_peers {
-            state.requested_generation.entry(*peer).or_default();
+        state.requested_generation.retain(|peer, requested| {
+            current_authority
+                .get(peer)
+                .is_some_and(|authority| authority == &requested.authority)
+        });
+        for (peer, authority) in current_authority {
+            state
+                .requested_generation
+                .entry(peer)
+                .or_insert(RequestedEventGeneration {
+                    authority,
+                    generation: 0,
+                });
         }
-        let pending_capacity = self.schedule_current_generation(&mut state);
+        let pending_capacity =
+            self.admission.is_open() && self.schedule_current_generation(&mut state);
         Some(if pending_capacity {
             AutomaticEventRosterStatus::PendingCapacity
         } else {
             AutomaticEventRosterStatus::Scheduled
         })
+    }
+
+    /// Runs one transport-owner request for a current exact peer.
+    #[doc(hidden)]
+    pub async fn run_peer_attempt(&self, peer: NodeId) -> AutomaticEventAttemptOutcome {
+        if !self.admission.is_open() {
+            return AutomaticEventAttemptOutcome::AdmissionClosed;
+        }
+        {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !state.requested_generation.contains_key(&peer) {
+                return AutomaticEventAttemptOutcome::PeerUnavailable;
+            }
+        }
+        let (admission, observation) = self.coordinator.request_observed_attempt(
+            self.mission,
+            peer,
+            self.event_attempt_runner(peer),
+        );
+        let immediate_error = match admission {
+            EventAttemptAdmission::Accepted | EventAttemptAdmission::Retained => false,
+            EventAttemptAdmission::Closed | EventAttemptAdmission::CapacityFull => true,
+        };
+        let result = observation.wait().await;
+        debug_assert!(!immediate_error || result.is_err());
+        AutomaticEventAttemptOutcome::Completed(result)
     }
 
     fn note_durable_work(&self) {
@@ -4057,6 +4200,22 @@ impl RunningAutomaticEventTransportHandle {
         self.schedule_current_generation(&mut state);
     }
 
+    fn open_admission(&self) -> bool {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.admission.open_initial() {
+            return false;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.schedule_current_generation(&mut state);
+        true
+    }
+
     fn schedule_current_generation(&self, state: &mut AutomaticEventRuntimeState) -> bool {
         let peers = state
             .requested_generation
@@ -4080,31 +4239,95 @@ impl RunningAutomaticEventTransportHandle {
             || state
                 .requested_generation
                 .get(&peer)
-                .is_some_and(|requested| *requested >= generation)
+                .is_some_and(|requested| requested.generation >= generation)
         {
             return true;
         }
-        let ordered_contacts = self.ordered_contacts.clone();
-        let accepted =
-            self.coordinator
-                .request_attempt_admission(self.mission, peer, move |contact| {
-                    let ordered_contacts = ordered_contacts.clone();
-                    async move {
-                        let expectation =
-                            MissionPeerExpectation::new(contact.peer_evidence(), peer);
-                        ordered_contacts
-                            .run(OrderedEventContactRole::Initiator, contact, expectation)
-                            .await
-                            .map(|_| ())
-                    }
-                });
-        match accepted {
+        let admission = self.coordinator.request_attempt_admission(
+            self.mission,
+            peer,
+            self.event_attempt_runner(peer),
+        );
+        match admission {
             EventAttemptAdmission::Accepted => {
-                state.requested_generation.insert(peer, generation);
+                state
+                    .requested_generation
+                    .get_mut(&peer)
+                    .expect("scheduled peer retains current authority")
+                    .generation = generation;
+                true
+            }
+            EventAttemptAdmission::Retained => {
+                state
+                    .requested_generation
+                    .get_mut(&peer)
+                    .expect("retained peer retains current authority")
+                    .generation = generation;
+                true
+            }
+            EventAttemptAdmission::Closed => {
+                state.requested_generation.remove(&peer);
                 true
             }
             EventAttemptAdmission::CapacityFull => false,
         }
+    }
+
+    fn event_attempt_runner(
+        &self,
+        peer: NodeId,
+    ) -> impl Fn(Arc<dyn OrderedContact>) -> AutomaticEventAttemptFuture + Send + Sync + 'static
+    {
+        let ordered_contacts = self.ordered_contacts.clone();
+        move |contact: Arc<dyn OrderedContact>| {
+            let ordered_contacts = ordered_contacts.clone();
+            Box::pin(async move {
+                let expectation = MissionPeerExpectation::new(contact.peer_evidence(), peer);
+                ordered_contacts
+                    .run(OrderedEventContactRole::Initiator, contact, expectation)
+                    .await
+                    .map(|_| ())
+            })
+        }
+    }
+
+    fn update_emission_policy(
+        &self,
+        emission_policy: &LiveEmissionPolicy,
+        policy: EventEmissionPolicy,
+        #[cfg(feature = "nearby-discovery")] nearby_discovery_stop: Option<&NearbyDiscoveryControl>,
+    ) -> Result<u64, NodeError> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = emission_policy.snapshot()?;
+        if current.policy != policy
+            && self
+                .coordinator
+                .has_registration(crate::EventTransportKind::BLE_L2CAP_V1)
+        {
+            return Err(NodeError::EmissionPolicyRestartRequired);
+        }
+        let update = emission_policy.update(policy)?;
+        self.coordinator
+            .set_outbound_suspended(!policy.permits_contact_initiation());
+        #[cfg(feature = "nearby-discovery")]
+        if policy != EventEmissionPolicy::Normal
+            && let Some(stop) = nearby_discovery_stop
+        {
+            stop.stop();
+        }
+        Ok(update.snapshot.revision)
+    }
+
+    fn close(&self) {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.coordinator.shutdown();
+        self.admission.close();
     }
 
     #[cfg(test)]
@@ -4128,7 +4351,11 @@ type OrderedEventContactTaskOutput = (
 );
 
 tokio::task_local! {
-    static ORDERED_CONTACT_EXACT_AUTHENTICATED: Arc<AtomicBool>;
+    static EVENT_CONTACT_EXACT_AUTHENTICATED: Arc<AtomicBool>;
+}
+
+tokio::task_local! {
+    static COORDINATED_IROH_EVENT_V9: ();
 }
 
 struct OrderedEventContactTaskFailure {
@@ -4136,27 +4363,28 @@ struct OrderedEventContactTaskFailure {
     error: Option<NodeError>,
 }
 
-fn mark_ordered_contact_authenticated() {
-    let _ = ORDERED_CONTACT_EXACT_AUTHENTICATED
+fn mark_event_contact_authenticated() {
+    let _ = EVENT_CONTACT_EXACT_AUTHENTICATED
         .try_with(|authenticated| authenticated.store(true, Ordering::Release));
 }
 
-#[allow(dead_code)] // The automatic attempt ticket calls this boundary in Task 2.
-fn classify_ordered_contact_carrier_open<T>(
-    opened: Result<T, ContactError>,
-) -> Result<T, ContactOutcome> {
-    opened.map_err(|error| match error.kind() {
-        ContactErrorKind::Unavailable => ContactOutcome::carrier_open_unavailable(),
-        ContactErrorKind::Configuration
-        | ContactErrorKind::Bounds
-        | ContactErrorKind::Timeout
-        | ContactErrorKind::Transport
-        | ContactErrorKind::Unauthorized
-        | ContactErrorKind::Protocol
-        | ContactErrorKind::Unsupported => {
-            ContactOutcome::local_invariant(ContactStage::CarrierOpen)
-        }
-    })
+fn require_event_contact_semantic_v9(
+    native_iroh: bool,
+    semantic_version: u16,
+) -> Result<(), NodeError> {
+    if !native_iroh && semantic_version != SEMANTIC_PROTOCOL_V9 {
+        return Err(NodeError::Protocol(
+            "ordered Event contacts require semantic protocol v9".into(),
+        ));
+    }
+    if COORDINATED_IROH_EVENT_V9.try_with(|_| ()).is_ok()
+        && semantic_version != SEMANTIC_PROTOCOL_V9
+    {
+        return Err(NodeError::Protocol(
+            "coordinated Iroh Event contacts require semantic protocol v9".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn await_ordered_contact_response<F>(
@@ -4215,10 +4443,14 @@ fn ordered_contact_transport_outcome(
                 ContactReason::TransportInterrupted,
             ),
             ContactErrorKind::Configuration
+            | ContactErrorKind::Invariant
             | ContactErrorKind::Bounds
+            | ContactErrorKind::Unsupported => {
+                ContactOutcome::local_invariant(ContactStage::AuthenticatedSession)
+            }
+            ContactErrorKind::RemoteBounds
             | ContactErrorKind::Unauthorized
-            | ContactErrorKind::Protocol
-            | ContactErrorKind::Unsupported => ContactOutcome::authenticated_session(
+            | ContactErrorKind::Protocol => ContactOutcome::authenticated_session(
                 ContactScope::Mission,
                 ContactDisposition::Suppress,
                 ContactReason::ProtocolViolation,
@@ -4248,9 +4480,12 @@ fn ordered_contact_transport_outcome(
                 ContactOutcome::pre_auth_remote(ContactReason::AuthenticationFailed)
             }
             ContactErrorKind::Configuration
+            | ContactErrorKind::Invariant
             | ContactErrorKind::Bounds
-            | ContactErrorKind::Protocol
             | ContactErrorKind::Unsupported => {
+                ContactOutcome::local_invariant(ContactStage::MissionHandshake)
+            }
+            ContactErrorKind::RemoteBounds | ContactErrorKind::Protocol => {
                 ContactOutcome::pre_auth_remote(ContactReason::ProtocolViolation)
             }
         }
@@ -4266,19 +4501,16 @@ fn ordered_contact_failure(
             NodeError::Mission(MissionSessionError::Contact(error)) => {
                 ordered_contact_transport_outcome(error.kind(), true)
             }
-            NodeError::Carrier(_) => ContactOutcome::authenticated_transport(
-                ContactScope::Attempt,
-                ContactProvenance::Adapter,
-                ContactDisposition::Reselect,
-                ContactReason::TransportInterrupted,
-            ),
-            NodeError::EmissionPolicyChanged | NodeError::CustodySendSkipped => {
-                ContactOutcome::authenticated_session(
-                    ContactScope::Policy,
-                    ContactDisposition::RetryLater,
-                    ContactReason::PolicyRejected,
-                )
+            NodeError::Mission(MissionSessionError::Carrier(error)) | NodeError::Carrier(error) => {
+                ordered_iroh_carrier_outcome(error, true)
             }
+            NodeError::EmissionPolicyChanged
+            | NodeError::EmissionPolicyRestartRequired
+            | NodeError::CustodySendSkipped => ContactOutcome::authenticated_session(
+                ContactScope::Policy,
+                ContactDisposition::RetryLater,
+                ContactReason::PolicyRejected,
+            ),
             NodeError::Revoked(_) => ContactOutcome::authenticated_session(
                 ContactScope::ExpectedPeer,
                 ContactDisposition::Suppress,
@@ -4316,13 +4548,8 @@ fn ordered_contact_failure(
             NodeError::Mission(MissionSessionError::Contact(error)) => {
                 ordered_contact_transport_outcome(error.kind(), false)
             }
-            NodeError::Mission(MissionSessionError::Carrier(_)) | NodeError::Carrier(_) => {
-                ContactOutcome::pre_auth_transport(
-                    ContactScope::Attempt,
-                    ContactProvenance::UnauthenticatedRemote,
-                    ContactDisposition::RetryLater,
-                    ContactReason::TransportInterrupted,
-                )
+            NodeError::Mission(MissionSessionError::Carrier(error)) | NodeError::Carrier(error) => {
+                ordered_iroh_carrier_outcome(error, false)
             }
             NodeError::Mission(MissionSessionError::CarrierSecurityProfileMismatch { .. })
             | NodeError::SourceEnvelope(_)
@@ -4330,7 +4557,9 @@ fn ordered_contact_failure(
             | NodeError::Protocol(_) => {
                 ContactOutcome::pre_auth_remote(ContactReason::ProtocolViolation)
             }
-            NodeError::EmissionPolicyChanged | NodeError::CustodySendSkipped => {
+            NodeError::EmissionPolicyChanged
+            | NodeError::EmissionPolicyRestartRequired
+            | NodeError::CustodySendSkipped => {
                 ContactOutcome::local_policy(ContactStage::MissionHandshake)
             }
             NodeError::Configuration(_)
@@ -4347,6 +4576,70 @@ fn ordered_contact_failure(
     OrderedEventContactTaskFailure {
         outcome,
         error: Some(error),
+    }
+}
+
+fn ordered_iroh_carrier_outcome(error: &CarrierError, authenticated: bool) -> ContactOutcome {
+    let stage = if authenticated {
+        ContactStage::AuthenticatedSession
+    } else {
+        ContactStage::MissionHandshake
+    };
+    match error {
+        CarrierError::Configuration(_)
+        | CarrierError::Invariant(_)
+        | CarrierError::FrameTooLarge { .. }
+        | CarrierError::TurnTooLarge { .. } => ContactOutcome::local_invariant(stage),
+        CarrierError::Protocol(_)
+        | CarrierError::RemoteFrameTooLarge { .. }
+        | CarrierError::RemoteTurnTooLarge { .. }
+            if authenticated =>
+        {
+            ContactOutcome::authenticated_session(
+                ContactScope::Mission,
+                ContactDisposition::Suppress,
+                ContactReason::ProtocolViolation,
+            )
+        }
+        CarrierError::Protocol(_)
+        | CarrierError::RemoteFrameTooLarge { .. }
+        | CarrierError::RemoteTurnTooLarge { .. } => {
+            ContactOutcome::pre_auth_remote(ContactReason::ProtocolViolation)
+        }
+        CarrierError::Transport(_) if authenticated => ContactOutcome::authenticated_transport(
+            ContactScope::Attempt,
+            ContactProvenance::AuthenticatedMission,
+            ContactDisposition::Reselect,
+            ContactReason::TransportInterrupted,
+        ),
+        CarrierError::Timeout(_) if authenticated => ContactOutcome::authenticated_transport(
+            ContactScope::Attempt,
+            ContactProvenance::AuthenticatedMission,
+            ContactDisposition::Reselect,
+            ContactReason::TransportTimeout,
+        ),
+        CarrierError::Transport(_) => ContactOutcome::pre_auth_transport(
+            ContactScope::Attempt,
+            ContactProvenance::UnauthenticatedRemote,
+            ContactDisposition::RetryLater,
+            ContactReason::TransportInterrupted,
+        ),
+        CarrierError::Timeout(_) => ContactOutcome::pre_auth_transport(
+            ContactScope::Attempt,
+            ContactProvenance::UnauthenticatedRemote,
+            ContactDisposition::RetryLater,
+            ContactReason::TransportTimeout,
+        ),
+        CarrierError::UnauthorizedPeer(_) if authenticated => {
+            ContactOutcome::authenticated_session(
+                ContactScope::ExpectedPeer,
+                ContactDisposition::Suppress,
+                ContactReason::IdentityMismatch,
+            )
+        }
+        CarrierError::UnauthorizedPeer(_) => {
+            ContactOutcome::pre_auth_remote(ContactReason::IdentityMismatch)
+        }
     }
 }
 
@@ -4382,6 +4675,46 @@ pub struct OrderedEventContactHandle {
 }
 
 impl OrderedEventContactHandle {
+    fn try_reserve_native_iroh(&self) -> Result<OwnedSemaphorePermit, ContactOutcome> {
+        let permit = self
+            .session_permit
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ContactOutcome::admission_busy())?;
+        if let Some(rejection) = self.admission.ordered_contact_rejection() {
+            drop(permit);
+            return Err(rejection.outcome());
+        }
+        Ok(permit)
+    }
+
+    async fn reserve_event_session(&self) -> Result<OwnedSemaphorePermit, ContactOutcome> {
+        let mut admission_changes = self.admission.subscribe();
+        if let Some(rejection) = self.admission.ordered_contact_rejection() {
+            return Err(rejection.outcome());
+        }
+        let permit = tokio::select! {
+            biased;
+            changed = admission_changes.changed() => {
+                if changed.is_err() {
+                    return Err(ContactOutcome::actor_stopped());
+                }
+                return Err(self
+                    .admission
+                    .ordered_contact_rejection()
+                    .map_or_else(ContactOutcome::actor_stopped, |rejection| rejection.outcome()));
+            }
+            permit = self.session_permit.clone().acquire_owned() => {
+                permit.map_err(|_| ContactOutcome::actor_stopped())?
+            }
+        };
+        if let Some(rejection) = self.admission.ordered_contact_rejection() {
+            drop(permit);
+            return Err(rejection.outcome());
+        }
+        Ok(permit)
+    }
+
     /// Runs one already-connected ordered contact through the live node actor.
     ///
     /// Calling this method is privileged in-process roster admission: the caller
@@ -4397,20 +4730,9 @@ impl OrderedEventContactHandle {
         contact: Arc<dyn OrderedContact>,
         peer: MissionPeerExpectation,
     ) -> Result<PeerReceipt, ContactOutcome> {
-        if !self.admission.is_open() {
-            contact.close();
-            return Err(ContactOutcome::admission_closed());
-        }
-        let session_permit = self
-            .session_permit
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| {
-                contact.close();
-                ContactOutcome::admission_busy()
-            })?;
-        let (response, completed) = oneshot::channel();
         let mut pending = OrderedEventContactCloseGuard(Some(contact.clone()));
+        let session_permit = self.reserve_event_session().await?;
+        let (response, completed) = oneshot::channel();
         self.sender
             .try_send(OrderedEventContactCommand {
                 role,
@@ -4438,6 +4760,9 @@ struct ContactActivitySnapshot {
     completed: u64,
     failed: u64,
     transport_blocked: u64,
+    automatic_event_attempts_parked: u64,
+    automatic_event_admission_entries: u64,
+    event_admission_waits: u64,
 }
 
 #[cfg(test)]
@@ -4448,6 +4773,10 @@ struct ContactActivityProbe {
     completed: AtomicU64,
     failed: AtomicU64,
     transport_blocked: AtomicU64,
+    automatic_event_attempts_parked: AtomicU64,
+    automatic_event_admission_entries: AtomicU64,
+    event_admission_waits: AtomicU64,
+    automatic_event_admission_gate: OnceLock<Arc<Semaphore>>,
 }
 
 #[cfg(test)]
@@ -4469,6 +4798,29 @@ impl ContactActivityProbe {
         self.transport_blocked.fetch_add(1, Ordering::Release);
     }
 
+    fn automatic_event_admission_gate(&self) -> Arc<Semaphore> {
+        self.automatic_event_admission_gate
+            .get_or_init(|| Arc::new(Semaphore::new(1)))
+            .clone()
+    }
+
+    fn automatic_event_attempt_parked(&self) {
+        self.automatic_event_attempts_parked
+            .fetch_add(1, Ordering::Release);
+    }
+
+    async fn wait_at_automatic_event_admission(&self) {
+        self.automatic_event_admission_entries
+            .fetch_add(1, Ordering::Release);
+        let permit = self
+            .automatic_event_admission_gate()
+            .acquire_owned()
+            .await
+            .expect("test admission gate remains open");
+        self.event_admission_waits.fetch_add(1, Ordering::Release);
+        drop(permit);
+    }
+
     fn snapshot(&self) -> ContactActivitySnapshot {
         let active = self.active.load(Ordering::Acquire);
         ContactActivitySnapshot {
@@ -4477,6 +4829,13 @@ impl ContactActivityProbe {
             completed: self.completed.load(Ordering::Acquire),
             failed: self.failed.load(Ordering::Acquire),
             transport_blocked: self.transport_blocked.load(Ordering::Acquire),
+            automatic_event_attempts_parked: self
+                .automatic_event_attempts_parked
+                .load(Ordering::Acquire),
+            automatic_event_admission_entries: self
+                .automatic_event_admission_entries
+                .load(Ordering::Acquire),
+            event_admission_waits: self.event_admission_waits.load(Ordering::Acquire),
         }
     }
 }
@@ -4628,6 +4987,13 @@ impl RunningNode {
         self.automatic_event_transports.clone()
     }
 
+    /// Returns the configured peer whose Iroh Event route shares automatic
+    /// selection authority with in-process adapters.
+    #[doc(hidden)]
+    pub const fn automatic_iroh_event_peer(&self) -> Option<NodeId> {
+        self.automatic_iroh_event_peer
+    }
+
     /// Returns the exact directory authority used by this node's durable store.
     ///
     /// On Linux this path names a pinned directory descriptor, so later
@@ -4656,21 +5022,20 @@ impl RunningNode {
 
     /// Atomically replaces the live emission policy.
     ///
+    /// A differing policy requires a controlled restart while a BTLE owner is
+    /// composed; rejection leaves the policy, gate, discovery, and ownership
+    /// state unchanged.
+    ///
     /// In-flight contacts recheck this revision immediately before every
     /// application/control frame send and durable receive commit. A changed
     /// revision closes that contact so later work starts from a fresh policy.
     pub fn set_event_emission_policy(&self, policy: EventEmissionPolicy) -> Result<u64, NodeError> {
-        let update = self.emission_policy.update(policy)?;
-        #[cfg(feature = "nearby-discovery")]
-        if policy != EventEmissionPolicy::Normal
-            && let Some(stop) = &self.nearby_discovery_stop
-        {
-            // Clear the lookup registry and drop its provider before this
-            // public policy mutation returns. Once stopped, a nearby window
-            // cannot be reopened by returning to Normal.
-            stop.stop();
-        }
-        Ok(update.snapshot.revision)
+        self.automatic_event_transports.update_emission_policy(
+            self.emission_policy.as_ref(),
+            policy,
+            #[cfg(feature = "nearby-discovery")]
+            self.nearby_discovery_stop.as_ref(),
+        )
     }
 
     /// Idempotently closes contact and automatic-adapter admission without
@@ -4678,9 +5043,10 @@ impl RunningNode {
     /// work.
     ///
     /// Embeddings use this before cancelling and joining in-process transport
-    /// owners while their application server finishes draining.
+    /// owners while their application server finishes draining. Pending
+    /// automatic attempt observations complete with a shutdown outcome.
     pub fn close_transport_admission(&self) {
-        self.transport_admission.close();
+        self.automatic_event_transports.close();
     }
 
     /// Opens transport admission after supervised startup has composed every
@@ -4690,7 +5056,7 @@ impl RunningNode {
     /// Ordinary nodes are already open, and terminal closure cannot be undone.
     #[must_use]
     pub fn open_transport_admission(&self) -> bool {
-        self.transport_admission.open_initial()
+        self.automatic_event_transports.open_admission()
     }
 
     /// Idempotently closes application, contact, and automatic-adapter admission
@@ -4699,7 +5065,11 @@ impl RunningNode {
     /// Embeddings use this before cancelling and joining in-process transport
     /// owners, then consume the node through [`Self::shutdown`].
     pub fn close_admission(&self) {
-        close_node_admission(&self.application_admission, &self.transport_admission);
+        close_node_admission(
+            &self.application_admission,
+            &self.transport_admission,
+            Some(&self.automatic_event_transports),
+        );
     }
 
     /// Requests terminal software zeroization for an embedding-owned local node.
@@ -4766,8 +5136,16 @@ impl RunningNode {
     }
 }
 
-fn close_node_admission(application: &AtomicBool, transport: &TransportAdmission) {
-    transport.close();
+fn close_node_admission(
+    application: &AtomicBool,
+    transport: &TransportAdmission,
+    automatic: Option<&RunningAutomaticEventTransportHandle>,
+) {
+    if let Some(automatic) = automatic {
+        automatic.close();
+    } else {
+        transport.close();
+    }
     application.store(false, Ordering::Release);
 }
 
@@ -5357,6 +5735,8 @@ pub enum NodeError {
     Carrier(CarrierError),
     /// Live Event emission policy changed after a contact captured its revision.
     EmissionPolicyChanged,
+    /// A composed BTLE owner requires a controlled restart for policy changes.
+    EmissionPolicyRestartRequired,
     /// A custody item became routinely unsendable before carrier acquisition.
     CustodySendSkipped,
     /// Strict mechanics-frame failure.
@@ -5392,6 +5772,8 @@ impl fmt::Display for NodeError {
             Self::EmissionPolicyChanged => {
                 formatter.write_str("live Event emission policy changed; reconnect required")
             }
+            Self::EmissionPolicyRestartRequired => formatter
+                .write_str("BTLE emission policy changes require a controlled node restart"),
             Self::CustodySendSkipped => {
                 formatter.write_str("custody Event became unsendable before carrier acquisition")
             }
@@ -5420,6 +5802,7 @@ impl Error for NodeError {
             Self::Configuration(_)
             | Self::Revoked(_)
             | Self::EmissionPolicyChanged
+            | Self::EmissionPolicyRestartRequired
             | Self::CustodySendSkipped
             | Self::Protocol(_)
             | Self::FatalBlobCoherence(_)
@@ -17214,6 +17597,7 @@ pub async fn start_transport_neutral_node(
         false,
         true,
         InitialTransportAdmission::Open,
+        None,
     )
     .await
 }
@@ -17249,6 +17633,7 @@ pub async fn start_externally_supervised_local_node(
         false,
         false,
         InitialTransportAdmission::Embedded,
+        None,
     )
     .await
 }
@@ -17264,6 +17649,7 @@ async fn start_externally_supervised_transport_neutral_node_with_output(
         false,
         false,
         InitialTransportAdmission::Open,
+        None,
     )
     .await
 }
@@ -17307,6 +17693,7 @@ async fn start_node_with_forwarding_output(
         true,
         true,
         InitialTransportAdmission::Open,
+        None,
     )
     .await
 }
@@ -17330,6 +17717,31 @@ pub async fn start_supervised_node_with_forwarding_and_output_policy(
         true,
         false,
         InitialTransportAdmission::SupervisedClosed,
+        None,
+    )
+    .await
+}
+
+/// Starts a supervised node whose one configured Iroh Event peer participates
+/// in the same automatic transport selection authority as in-process adapters.
+///
+/// This is an initial composition boundary for the packaged Linux agent. Other
+/// Iroh peers retain the legacy selected-stack lifecycle.
+#[doc(hidden)]
+pub async fn start_supervised_node_with_automatic_iroh_event_peer(
+    config: NodeConfig,
+    forwarding: SelectedForwardingConfig,
+    output_policy: NodeOperatorOutputPolicy,
+    peer: NodeId,
+) -> Result<RunningNode, NodeError> {
+    start_node_with_shutdown_ownership(
+        config,
+        forwarding,
+        NodeOperatorOutput::process(output_policy),
+        true,
+        false,
+        InitialTransportAdmission::SupervisedClosed,
+        Some(peer),
     )
     .await
 }
@@ -17348,6 +17760,7 @@ async fn start_node_with_shutdown_ownership(
     iroh_transport_enabled: bool,
     handle_sigint: bool,
     initial_transport_admission: InitialTransportAdmission,
+    automatic_iroh_event_peer: Option<NodeId>,
 ) -> Result<RunningNode, NodeError> {
     let identity = config.mission.identity();
     let mission_authority = config.mission.mission_authority_id();
@@ -17392,14 +17805,15 @@ async fn start_node_with_shutdown_ownership(
         admission: transport_admission.clone(),
         session_permit: Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY)),
     };
+    let emission_policy = Arc::new(LiveEmissionPolicy::new(forwarding.emission_policy()));
     let automatic_event_transports = RunningAutomaticEventTransportHandle::new(
         transport_admission.clone(),
         mission_authority,
         ordered_event_contacts.clone(),
+        forwarding.emission_policy().permits_contact_initiation(),
     );
     let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
     let (ready_sender, ready_receiver) = oneshot::channel();
-    let emission_policy = Arc::new(LiveEmissionPolicy::new(forwarding.emission_policy()));
     let mut channels = NodeActorChannels::new(
         application_receiver,
         application_admission.clone(),
@@ -17423,6 +17837,7 @@ async fn start_node_with_shutdown_ownership(
     channels.handle_sigint = handle_sigint;
     channels.iroh_transport_enabled = iroh_transport_enabled;
     channels.automatic_event_transports = Some(automatic_event_transports.clone());
+    channels.automatic_iroh_event_peer = automatic_iroh_event_peer;
     #[cfg(test)]
     let contact_activity = channels.contact_activity.clone();
     let task = tokio::spawn(inherit_node_output(run_node_actor_with_forwarding_output(
@@ -17457,6 +17872,7 @@ async fn start_node_with_shutdown_ownership(
         selected_controls,
         ordered_event_contacts,
         automatic_event_transports,
+        automatic_iroh_event_peer,
         state_root: ready.state_root,
         application_admission,
         transport_admission,
@@ -17820,6 +18236,7 @@ struct NodeActorChannels {
     handle_sigint: bool,
     iroh_transport_enabled: bool,
     automatic_event_transports: Option<RunningAutomaticEventTransportHandle>,
+    automatic_iroh_event_peer: Option<NodeId>,
     application_receiver: mpsc::Receiver<SelectedApplicationCommand>,
     application_admission: Arc<AtomicBool>,
     transport_admission: Arc<TransportAdmission>,
@@ -18138,6 +18555,7 @@ impl NodeActorChannels {
             automatic_event_transports: None,
             #[cfg(unix)]
             embedded_zeroization: None,
+            automatic_iroh_event_peer: None,
             application_admission,
             transport_admission,
             control_receiver,
@@ -18226,6 +18644,7 @@ async fn run_node_actor_inner(
         handle_sigint,
         iroh_transport_enabled,
         automatic_event_transports,
+        automatic_iroh_event_peer,
         mut application_receiver,
         application_admission,
         transport_admission,
@@ -18277,6 +18696,19 @@ async fn run_node_actor_inner(
     }
     let (peer_missions, configured_peers) =
         configured_runtime_peers(&config, &forwarding, direct_peer_missions)?;
+    let automatic_iroh_event_peer = automatic_iroh_event_peer
+        .map(|mission_peer| {
+            configured_peers
+                .iter()
+                .copied()
+                .find(|peer| peer.mission == mission_peer)
+                .ok_or_else(|| {
+                    NodeError::Configuration(
+                        "automatic Iroh Event peer must name one configured exact peer".into(),
+                    )
+                })
+        })
+        .transpose()?;
     let allowed = peer_missions.keys().copied().collect::<BTreeSet<_>>();
     #[cfg(feature = "nearby-discovery")]
     let automatic_nearby = forwarding.automatic_nearby_discovery();
@@ -18505,6 +18937,34 @@ async fn run_node_actor_inner(
     } else {
         None
     };
+    let (automatic_iroh_event_control, mut automatic_iroh_event_attempts) =
+        match automatic_iroh_event_peer {
+            Some(_) => {
+                let automatic = automatic_event_transports.as_ref().ok_or_else(|| {
+                    NodeError::Configuration(
+                        "automatic Iroh Event peer requires transport selection".into(),
+                    )
+                })?;
+                let snapshot = EventAdapterSnapshot::new(
+                    EventTransportKind::IROH_QUIC_V1,
+                    1,
+                    if forwarding.emission_policy().permits_contact_initiation() {
+                        EventAdapterState::Available
+                    } else {
+                        EventAdapterState::Unavailable
+                    },
+                    true,
+                    DEFAULT_IROH_EVENT_PRIORITY,
+                );
+                let (control, attempts) = automatic.register(snapshot).ok_or_else(|| {
+                    NodeError::Configuration(
+                        "automatic Iroh Event adapter registration is already occupied".into(),
+                    )
+                })?;
+                (Some(control), Some(attempts))
+            }
+            None => (None, None),
+        };
     let relay_readiness = if let Some(endpoint) = endpoint.as_ref() {
         match &forwarding.controlled_relay {
             Some(routing) if routing.relay_only => {
@@ -18943,9 +19403,15 @@ async fn run_node_actor_inner(
         JoinSet::new();
     let mut outbound_peers = BTreeSet::new();
     let mut outbound_tasks = BTreeMap::<TaskId, ContactTaskMetadata>::new();
-    let mut outbound_abort_handles = BTreeMap::<EndpointId, (TaskId, AbortHandle)>::new();
+    let mut outbound_abort_handles = BTreeMap::<EndpointId, OutboundContactAbort>::new();
     let mut collision_aborted_outbound = BTreeSet::<TaskId>::new();
     let mut ordered_event_contacts: JoinSet<OrderedEventContactTaskOutput> = JoinSet::new();
+    let mut pending_automatic_iroh_attempt = None::<EventOutboundAttempt>;
+    let automatic_iroh_event_sessions = automatic_iroh_event_peer.and_then(|_| {
+        automatic_event_transports
+            .as_ref()
+            .map(|automatic| automatic.ordered_contacts.clone())
+    });
     let mut ordered_event_contacts_open = owner_ready;
     let non_preferred_fallback_delay = non_preferred_contact_fallback_delay(config.sync_interval);
     let contact_election_started = Instant::now();
@@ -19118,7 +19584,11 @@ async fn run_node_actor_inner(
                         &request,
                     ) {
                         Ok(plan) => {
-                            close_node_admission(&application_admission, &transport_admission);
+                            close_node_admission(
+                                &application_admission,
+                                &transport_admission,
+                                automatic_event_transports.as_ref(),
+                            );
                             live_zeroization = Some((request, plan));
                             break;
                         }
@@ -19166,7 +19636,11 @@ async fn run_node_actor_inner(
             completion = &mut blob_worker_completion_receiver,
                 if blob_worker_completion_open => {
                 blob_worker_completion_open = false;
-                close_node_admission(&application_admission, &transport_admission);
+                close_node_admission(
+                    &application_admission,
+                    &transport_admission,
+                    automatic_event_transports.as_ref(),
+                );
                 fatal_error = Some(match completion {
                     Ok(Err(error)) => error,
                     Ok(Ok(())) => NodeError::Protocol(
@@ -19196,6 +19670,9 @@ async fn run_node_actor_inner(
                     event_contact_wake.arm_normal_contact();
                     application_tick_pending = true;
                 } else {
+                    if let Some(attempt) = pending_automatic_iroh_attempt.take() {
+                        attempt.finish_revoked();
+                    }
                     if let Some(task) = accept_task.take() {
                         task.abort();
                         let _ = task.await;
@@ -19221,6 +19698,50 @@ async fn run_node_actor_inner(
                     }
                     Err(_) => automatic_event_capacity_progress = None,
                 }
+            }
+            attempt = async {
+                match automatic_iroh_event_attempts.as_mut() {
+                    Some(attempts) => attempts.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if automatic_iroh_event_attempts.is_some()
+                && pending_automatic_iroh_attempt.is_none() => {
+                match attempt {
+                    Some(attempt) => {
+                        if !transport_admission.is_open() {
+                            attempt.finish_revoked();
+                            continue;
+                        }
+                        let Some(peer) = automatic_iroh_event_peer.filter(|peer| {
+                            attempt.transport_kind() == EventTransportKind::IROH_QUIC_V1
+                                && attempt.peer() == peer.mission
+                        }) else {
+                            let _ = attempt.fail_unauthenticated_carrier_open(
+                                UnauthenticatedCarrierOpenFailure::Interrupted,
+                            );
+                            continue;
+                        };
+                        pending_automatic_iroh_attempt = Some(attempt);
+                        #[cfg(test)]
+                        contact_activity.automatic_event_attempt_parked();
+                        event_contact_wake.arm_event([peer.carrier]);
+                        application_tick_pending = true;
+                    }
+                    None => automatic_iroh_event_attempts = None,
+                }
+            }
+            _ = async {
+                pending_automatic_iroh_attempt
+                    .as_mut()
+                    .expect("guarded parked Iroh attempt")
+                    .revocation_outcome()
+                    .await
+            }, if pending_automatic_iroh_attempt.is_some() => {
+                pending_automatic_iroh_attempt
+                    .take()
+                    .expect("revoked parked Iroh attempt")
+                    .finish_revoked();
+                application_tick_pending = true;
             }
             command = ordered_event_contact_receiver.recv(),
                 if ordered_event_contacts_open
@@ -19330,7 +19851,7 @@ async fn run_node_actor_inner(
                                     )
                                 })?
                             };
-                            let session = ORDERED_CONTACT_EXACT_AUTHENTICATED
+                            let session = EVENT_CONTACT_EXACT_AUTHENTICATED
                                 .scope(authenticated.clone(), session);
                             let (response, result) = await_ordered_contact_response(
                                 response,
@@ -19860,6 +20381,12 @@ async fn run_node_actor_inner(
                     configured_peers
                         .iter()
                         .copied()
+                        .filter(|peer| {
+                            Some(peer.mission)
+                                != automatic_iroh_event_peer.map(|peer| peer.mission)
+                                || matches!(contact_cause, EventContactCause::Normal)
+                                || pending_automatic_iroh_attempt.is_some()
+                        })
                         .map(ContactPeer::Configured)
                         .collect::<Vec<_>>()
                 };
@@ -19867,6 +20394,11 @@ async fn run_node_actor_inner(
                 let contact_peers = configured_peers
                     .iter()
                     .copied()
+                    .filter(|peer| {
+                        Some(peer.mission) != automatic_iroh_event_peer.map(|peer| peer.mission)
+                            || matches!(contact_cause, EventContactCause::Normal)
+                            || pending_automatic_iroh_attempt.is_some()
+                    })
                     .map(ContactPeer::Configured)
                     .collect::<Vec<_>>();
                 let peer_count = contact_peers.len();
@@ -19915,6 +20447,17 @@ async fn run_node_actor_inner(
                         continue;
                     }
                     let launched_forced = event_contact_wake.launched(peer_id, contact_cause);
+                    let coordinated_iroh =
+                        Some(peer) == automatic_iroh_event_peer.map(ContactPeer::Configured);
+                    let automatic_iroh_attempt = coordinated_iroh
+                        .then(|| pending_automatic_iroh_attempt.take())
+                        .flatten();
+                    let coordinated_iroh_event_sessions = coordinated_iroh.then(|| {
+                            automatic_iroh_event_sessions
+                                .as_ref()
+                                .expect("automatic Iroh Event peer has shared admission")
+                                .clone()
+                        });
                     #[cfg(all(test, unix))]
                     let previous_activity = *last_activity;
                     *last_activity = election_now;
@@ -19939,6 +20482,10 @@ async fn run_node_actor_inner(
                     let contact_lifecycle_test_hook = contact_lifecycle_test_hook.clone();
                     let event_inserted = Arc::new(AtomicBool::new(false));
                     let task_event_inserted = event_inserted.clone();
+                    let cancellation = NativeIrohCancellation::default();
+                    let task_cancellation = cancellation.clone();
+                    #[cfg(test)]
+                    let task_contact_activity = contact_activity.clone();
                     let task = outbound.spawn(inherit_node_output(CONTACT_EVENT_INSERTED.scope(
                         task_event_inserted,
                         async move {
@@ -19970,28 +20517,51 @@ async fn run_node_actor_inner(
                                     hook.contact(peer_id, previous_activity, election_now).await,
                                 );
                             }
-                            (
+                            let contact = OutboundContact {
+                                store,
+                                mission,
                                 peer,
-                                sync_once_with_forwarding(
-                                    &endpoint,
-                                    OutboundContact {
-                                        store,
-                                        mission,
-                                        peer,
-                                        #[cfg(feature = "nearby-discovery")]
-                                        automatic_admission,
-                                        policy_lock,
-                                        emission_policy,
-                                        emission_snapshot,
-                                        custody_clock,
-                                        event_route_cache,
-                                        event_bridge,
-                                        mutable_interests,
-                                        controlled_relay,
-                                    },
-                                )
-                                .await,
-                            )
+                                #[cfg(feature = "nearby-discovery")]
+                                automatic_admission,
+                                policy_lock,
+                                emission_policy,
+                                emission_snapshot,
+                                custody_clock,
+                                event_route_cache,
+                                event_bridge,
+                                mutable_interests,
+                                controlled_relay,
+                            };
+                            let result = match (
+                                automatic_iroh_attempt,
+                                coordinated_iroh_event_sessions,
+                            ) {
+                                (Some(attempt), Some(event_sessions)) => {
+                                    sync_automatic_iroh_with_forwarding(
+                                        &endpoint,
+                                        contact,
+                                        attempt,
+                                        event_sessions,
+                                        task_cancellation,
+                                        #[cfg(test)]
+                                        task_contact_activity,
+                                    )
+                                    .await
+                                }
+                                (None, Some(event_sessions)) => {
+                                    sync_coordinated_iroh_maintenance_with_forwarding(
+                                        &endpoint,
+                                        contact,
+                                        event_sessions,
+                                    )
+                                    .await
+                                }
+                                (None, None) => sync_once_with_forwarding(&endpoint, contact).await,
+                                (Some(_), None) => unreachable!(
+                                    "automatic Iroh attempt retains shared admission"
+                                ),
+                            };
+                            (peer, result)
                         },
                     )));
                     let task_id = task.id();
@@ -19999,7 +20569,14 @@ async fn run_node_actor_inner(
                         task_id,
                         ContactTaskMetadata::outbound(peer, launched_forced, event_inserted),
                     );
-                    outbound_abort_handles.insert(peer_id, (task_id, task));
+                    outbound_abort_handles.insert(
+                        peer_id,
+                        OutboundContactAbort {
+                            task: task_id,
+                            abort: task,
+                            cancellation,
+                        },
+                    );
                     #[cfg(test)]
                     contact_activity.launched();
                 }
@@ -20083,9 +20660,16 @@ async fn run_node_actor_inner(
                             }
                             continue;
                         }
-                        if let Some((task, abort)) = outbound_abort_handles
+                        let mut yielded_outbound = false;
+                        if let Some((task, abort, cancellation)) = outbound_abort_handles
                             .get(&peer)
-                            .map(|(task, abort)| (*task, abort.clone()))
+                            .map(|contact| {
+                                (
+                                    contact.task,
+                                    contact.abort.clone(),
+                                    contact.cancellation.clone(),
+                                )
+                            })
                         {
                             match inbound_contact_collision(local_id, peer) {
                                 InboundContactCollision::KeepPreferredOutbound => {
@@ -20097,12 +20681,25 @@ async fn run_node_actor_inner(
                                     continue;
                                 }
                                 InboundContactCollision::YieldFallbackOutbound => {
+                                    yielded_outbound = true;
+                                    cancellation.cancel_for_collision();
                                     collision_aborted_outbound.insert(task);
                                     abort.abort();
                                     println!("CONTACT direction=out carrier_peer={peer} status=collision-resolved resolution=yield-fallback-to-preferred-inbound");
                                 }
                             }
                         }
+                        let automatic_iroh_session = automatic_iroh_event_peer
+                            .filter(|configured| configured.carrier == peer)
+                            .map(|_| {
+                                (
+                                    automatic_iroh_event_sessions
+                                        .as_ref()
+                                        .expect("automatic Iroh Event peer has shared admission")
+                                        .clone(),
+                                    yielded_outbound,
+                                )
+                            });
                         let inserted = inbound_peers.insert(peer);
                         let store = store.clone();
                         let policy_lock = policy_lock.clone();
@@ -20129,6 +20726,34 @@ async fn run_node_actor_inner(
                         let task = inbound.spawn(inherit_node_output(CONTACT_EVENT_INSERTED.scope(
                             task_event_inserted,
                             async move {
+                                let _close_on_cancel =
+                                    IrohConnectionCloseGuard(Some(connection.clone()));
+                                let coordinated_iroh = automatic_iroh_session.is_some();
+                                let _automatic_iroh_permit =
+                                    if let Some((sessions, wait_for_collision)) =
+                                        automatic_iroh_session
+                                    {
+                                        let permit = if wait_for_collision {
+                                            sessions.reserve_event_session().await
+                                        } else {
+                                            sessions.try_reserve_native_iroh()
+                                        };
+                                        match permit {
+                                            Ok(permit) => Some(permit),
+                                            Err(_) => {
+                                                connection.close();
+                                                return (
+                                                    peer,
+                                                    Err(NodeError::Protocol(
+                                                        "shared Event contact admission is busy"
+                                                            .into(),
+                                                    )),
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        None
+                                    };
                                 #[cfg(all(test, unix))]
                                 if let Some(hook) = contact_lifecycle_test_hook
                                     && hook.handles(ActorContactDirection::Inbound, peer)
@@ -20147,9 +20772,7 @@ async fn run_node_actor_inner(
                                         .await,
                                     );
                                 }
-                                (
-                                    peer,
-                                    serve_connection_with_forwarding(InboundContact {
+                                let session = serve_connection_with_forwarding(InboundContact {
                                         store,
                                         connection,
                                         mission,
@@ -20162,9 +20785,13 @@ async fn run_node_actor_inner(
                                         event_route_cache,
                                         event_bridge,
                                         mutable_interests,
-                                    })
-                                    .await,
-                                )
+                                    });
+                                let result = if coordinated_iroh {
+                                    COORDINATED_IROH_EVENT_V9.scope((), session).await
+                                } else {
+                                    session.await
+                                };
+                                (peer, result)
                             },
                         )));
                         let previous = inbound_abort_handles.insert(
@@ -20650,7 +21277,11 @@ async fn run_node_actor_inner(
         }
     }
 
-    close_node_admission(&application_admission, &transport_admission);
+    close_node_admission(
+        &application_admission,
+        &transport_admission,
+        automatic_event_transports.as_ref(),
+    );
     // Closing progress unblocks blocking_send and cancels at the next bounded
     // page checkpoint. Join before zeroization or releasing the store owner.
     audit_progress_receiver.close();
@@ -20675,6 +21306,9 @@ async fn run_node_actor_inner(
         let _ = command
             .response
             .send(Err(ContactOutcome::admission_closed()));
+    }
+    if let Some(attempt) = pending_automatic_iroh_attempt.take() {
+        attempt.finish_revoked();
     }
     if let Some(task) = audit_task.take() {
         let _ = task.await;
@@ -20704,6 +21338,7 @@ async fn run_node_actor_inner(
         let _ = task.await;
     }
     drop(accepted_receiver);
+    drop(automatic_iroh_event_control);
     inbound.shutdown().await;
     outbound.shutdown().await;
     ordered_event_contacts.shutdown().await;
@@ -20993,6 +21628,18 @@ async fn sync_once_with_forwarding(
     endpoint: &Endpoint,
     contact: OutboundContact,
 ) -> Result<CompletedPeerContact, NodeError> {
+    with_authenticated_contact_progress_deadline(async {
+        prepare_outbound_iroh_contact(&contact)?;
+        let connection = open_outbound_iroh_contact(endpoint, &contact).await?;
+        sync_opened_iroh_session(connection, contact).await
+    })
+    .await
+    .map_err(|()| {
+        NodeError::Protocol("contact exceeded its authenticated-progress deadline".into())
+    })?
+}
+
+fn prepare_outbound_iroh_contact(contact: &OutboundContact) -> Result<(), NodeError> {
     contact.emission_policy.require(contact.emission_snapshot)?;
     if !contact
         .emission_snapshot
@@ -21003,15 +21650,257 @@ async fn sync_once_with_forwarding(
             "receive-only policy cannot initiate a carrier contact".into(),
         ));
     }
-    with_authenticated_contact_progress_deadline(sync_session(endpoint, contact))
+    drive_custody_maintenance(&contact.store, &contact.custody_clock, &[])?;
+    Ok(())
+}
+
+async fn sync_automatic_iroh_with_forwarding(
+    endpoint: &Endpoint,
+    contact: OutboundContact,
+    attempt: EventOutboundAttempt,
+    event_sessions: OrderedEventContactHandle,
+    cancellation: NativeIrohCancellation,
+    #[cfg(test)] contact_activity: Arc<ContactActivityProbe>,
+) -> Result<CompletedPeerContact, NodeError> {
+    let authenticated = Arc::new(AtomicBool::new(false));
+    let mut attempt = NativeIrohAttemptGuard {
+        attempt: Some(attempt),
+        authenticated: authenticated.clone(),
+        cancellation,
+    };
+    prepare_outbound_iroh_contact(&contact)?;
+
+    let connection = {
+        let open = open_outbound_iroh_contact(endpoint, &contact);
+        tokio::pin!(open);
+        tokio::select! {
+            biased;
+            _ = attempt.current().revocation_outcome() => {
+                attempt.take().finish_revoked();
+                return Err(NodeError::Carrier(CarrierError::Transport(
+                    "automatic Iroh attempt revoked during carrier open".into(),
+                )));
+            }
+            result = &mut open => match result {
+                Ok(connection) => connection,
+                Err(error) => {
+                    let outcome = native_iroh_carrier_open_outcome(&error);
+                    let _ = attempt.take().finish_native(Err(outcome));
+                    return Err(error);
+                }
+            }
+        }
+    };
+
+    let mut close_on_cancel = IrohConnectionCloseGuard(Some(connection.clone()));
+    let _session_permit = {
+        #[cfg(test)]
+        contact_activity.wait_at_automatic_event_admission().await;
+        let reservation = event_sessions.reserve_event_session();
+        tokio::pin!(reservation);
+        tokio::select! {
+            biased;
+            _ = attempt.current().revocation_outcome() => {
+                attempt.take().finish_revoked();
+                return Err(NodeError::Carrier(CarrierError::Transport(
+                    "automatic Iroh attempt revoked while waiting for Event admission".into(),
+                )));
+            }
+            result = &mut reservation => match result {
+                Ok(permit) => permit,
+                Err(outcome) => {
+                    let _ = attempt.take().finish_native(Err(outcome));
+                    return Err(NodeError::Protocol(
+                        "shared Event contact admission closed while waiting".into(),
+                    ));
+                }
+            }
+        }
+    };
+    let session = COORDINATED_IROH_EVENT_V9.scope(
+        (),
+        EVENT_CONTACT_EXACT_AUTHENTICATED.scope(
+            authenticated.clone(),
+            with_authenticated_contact_progress_deadline(sync_opened_iroh_session(
+                connection, contact,
+            )),
+        ),
+    );
+    tokio::pin!(session);
+    let result = tokio::select! {
+        biased;
+        _ = attempt.current().revocation_outcome() => {
+            attempt.take().finish_revoked();
+            return Err(NodeError::Carrier(CarrierError::Transport(
+                "automatic Iroh attempt revoked during native session".into(),
+            )));
+        }
+        result = &mut session => result.map_err(|()| {
+            NodeError::Protocol("contact exceeded its authenticated-progress deadline".into())
+        })?,
+    };
+
+    match result {
+        Ok(completed) => match attempt.take().finish_native(Ok(())) {
+            Ok(()) => {
+                close_on_cancel.disarm();
+                Ok(completed)
+            }
+            Err(_) => Err(NodeError::Carrier(CarrierError::Transport(
+                "automatic Iroh attempt revoked at native-session completion".into(),
+            ))),
+        },
+        Err(error) => {
+            let failure = ordered_contact_failure_after_transition(error, &authenticated);
+            let _ = attempt.take().finish_native(Err(failure.outcome));
+            Err(failure
+                .error
+                .expect("native Iroh failure retains its node error"))
+        }
+    }
+}
+
+async fn sync_coordinated_iroh_maintenance_with_forwarding(
+    endpoint: &Endpoint,
+    contact: OutboundContact,
+    event_sessions: OrderedEventContactHandle,
+) -> Result<CompletedPeerContact, NodeError> {
+    prepare_outbound_iroh_contact(&contact)?;
+    let connection = open_outbound_iroh_contact(endpoint, &contact).await?;
+    let mut close_on_cancel = IrohConnectionCloseGuard(Some(connection.clone()));
+    let _session_permit = event_sessions.reserve_event_session().await.map_err(|_| {
+        NodeError::Protocol("shared Event contact admission closed during maintenance".into())
+    })?;
+    let result = COORDINATED_IROH_EVENT_V9
+        .scope(
+            (),
+            with_authenticated_contact_progress_deadline(sync_opened_iroh_session(
+                connection, contact,
+            )),
+        )
         .await
         .map_err(|()| {
             NodeError::Protocol("contact exceeded its authenticated-progress deadline".into())
-        })?
+        })?;
+    if result.is_ok() {
+        close_on_cancel.disarm();
+    }
+    result
 }
 
-async fn sync_session(
+fn native_iroh_carrier_open_outcome(error: &NodeError) -> ContactOutcome {
+    match error {
+        NodeError::Carrier(error) => match error {
+            CarrierError::Configuration(_)
+            | CarrierError::Invariant(_)
+            | CarrierError::FrameTooLarge { .. }
+            | CarrierError::TurnTooLarge { .. } => {
+                ContactOutcome::local_invariant(ContactStage::CarrierOpen)
+            }
+            CarrierError::Protocol(_)
+            | CarrierError::RemoteFrameTooLarge { .. }
+            | CarrierError::RemoteTurnTooLarge { .. } => {
+                ContactOutcome::rejected_carrier_open(ContactReason::ProtocolViolation)
+            }
+            CarrierError::Transport(_) => {
+                ContactOutcome::unauthenticated_carrier_open(ContactReason::TransportInterrupted)
+            }
+            CarrierError::Timeout(_) => {
+                ContactOutcome::unauthenticated_carrier_open(ContactReason::TransportTimeout)
+            }
+            CarrierError::UnauthorizedPeer(_) => {
+                ContactOutcome::rejected_carrier_open(ContactReason::IdentityMismatch)
+            }
+        },
+        NodeError::Configuration(_) => ContactOutcome::local_invariant(ContactStage::CarrierOpen),
+        _ => ContactOutcome::local_invariant(ContactStage::CarrierOpen),
+    }
+}
+
+struct NativeIrohAttemptGuard {
+    attempt: Option<EventOutboundAttempt>,
+    authenticated: Arc<AtomicBool>,
+    cancellation: NativeIrohCancellation,
+}
+
+impl NativeIrohAttemptGuard {
+    fn current(&mut self) -> &mut EventOutboundAttempt {
+        self.attempt
+            .as_mut()
+            .expect("native Iroh attempt is current")
+    }
+
+    fn take(&mut self) -> EventOutboundAttempt {
+        self.attempt.take().expect("native Iroh attempt is current")
+    }
+}
+
+impl Drop for NativeIrohAttemptGuard {
+    fn drop(&mut self) {
+        if let Some(attempt) = self.attempt.take() {
+            if self.cancellation.was_collision_cancelled() {
+                let _ = attempt.finish_native(Err(ContactOutcome::caller_cancelled(
+                    if self.authenticated.load(Ordering::Acquire) {
+                        ContactStage::AuthenticatedSession
+                    } else {
+                        ContactStage::CarrierOpen
+                    },
+                )));
+            } else if self.authenticated.load(Ordering::Acquire) {
+                let _ = attempt.finish_native(Err(ordered_contact_transport_outcome(
+                    ContactErrorKind::Transport,
+                    true,
+                )));
+            } else {
+                let _ = attempt.fail_unauthenticated_carrier_open(
+                    UnauthenticatedCarrierOpenFailure::Interrupted,
+                );
+            }
+        }
+    }
+}
+
+async fn open_outbound_iroh_contact(
     endpoint: &Endpoint,
+    contact: &OutboundContact,
+) -> Result<aster_iroh::Connection, NodeError> {
+    match contact.peer {
+        ContactPeer::Configured(peer) => {
+            open_configured_iroh_contact(endpoint, contact.controlled_relay.as_ref(), peer).await
+        }
+        #[cfg(feature = "nearby-discovery")]
+        ContactPeer::Discovered(carrier) => {
+            if contact.controlled_relay.is_some() {
+                return Err(NodeError::Configuration(
+                    "nearby discovery cannot use a controlled relay".into(),
+                ));
+            }
+            endpoint
+                .connect_discovered(carrier)
+                .await
+                .map_err(Into::into)
+        }
+    }
+}
+
+struct IrohConnectionCloseGuard(Option<aster_iroh::Connection>);
+
+impl IrohConnectionCloseGuard {
+    fn disarm(&mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for IrohConnectionCloseGuard {
+    fn drop(&mut self) {
+        if let Some(connection) = self.0.take() {
+            connection.close();
+        }
+    }
+}
+
+async fn sync_opened_iroh_session(
+    connection: aster_iroh::Connection,
     contact: OutboundContact,
 ) -> Result<CompletedPeerContact, NodeError> {
     let OutboundContact {
@@ -21027,66 +21916,8 @@ async fn sync_session(
         event_route_cache,
         event_bridge,
         mutable_interests,
-        controlled_relay,
+        controlled_relay: _,
     } = contact;
-    emission_policy.require(emission_snapshot)?;
-    drive_custody_maintenance(&store, &custody_clock, &[])?;
-    let connection = match (controlled_relay, peer) {
-        (
-            Some(routing),
-            ContactPeer::Configured(ConfiguredPeer {
-                carrier,
-                locator: PeerLocator::Direct(address),
-                ..
-            }),
-        ) => {
-            let direct_addresses = if routing.relay_only {
-                Vec::new()
-            } else {
-                vec![address]
-            };
-            let route = PeerRoute::new(carrier, direct_addresses, routing.relay.url().clone())?;
-            endpoint.connect_route(&route).await?
-        }
-        (
-            None,
-            ContactPeer::Configured(ConfiguredPeer {
-                carrier,
-                locator: PeerLocator::Direct(address),
-                ..
-            }),
-        ) => {
-            endpoint
-                .connect(ExpectedPeer {
-                    id: carrier,
-                    address,
-                })
-                .await?
-        }
-        #[cfg(feature = "nearby-discovery")]
-        (
-            None,
-            ContactPeer::Configured(ConfiguredPeer {
-                carrier,
-                locator: PeerLocator::Nearby,
-                ..
-            }),
-        )
-        | (None, ContactPeer::Discovered(carrier)) => endpoint.connect_discovered(carrier).await?,
-        #[cfg(feature = "nearby-discovery")]
-        (
-            Some(_),
-            ContactPeer::Configured(ConfiguredPeer {
-                locator: PeerLocator::Nearby,
-                ..
-            }),
-        )
-        | (Some(_), ContactPeer::Discovered(_)) => {
-            return Err(NodeError::Configuration(
-                "nearby discovery cannot use a controlled relay".into(),
-            ));
-        }
-    };
     emission_policy.require(emission_snapshot)?;
     let guard = ContactEmissionGuard {
         live: emission_policy,
@@ -21118,6 +21949,41 @@ async fn sync_session(
         connection.close();
     }
     result
+}
+
+async fn open_configured_iroh_contact(
+    endpoint: &Endpoint,
+    controlled_relay: Option<&ControlledRelayRouting>,
+    peer: ConfiguredPeer,
+) -> Result<aster_iroh::Connection, NodeError> {
+    match (controlled_relay, peer.locator) {
+        (Some(routing), PeerLocator::Direct(address)) => {
+            let direct_addresses = if routing.relay_only {
+                Vec::new()
+            } else {
+                vec![address]
+            };
+            let route =
+                PeerRoute::new(peer.carrier, direct_addresses, routing.relay.url().clone())?;
+            endpoint.connect_route(&route).await.map_err(Into::into)
+        }
+        (None, PeerLocator::Direct(address)) => endpoint
+            .connect(ExpectedPeer {
+                id: peer.carrier,
+                address,
+            })
+            .await
+            .map_err(Into::into),
+        #[cfg(feature = "nearby-discovery")]
+        (None, PeerLocator::Nearby) => endpoint
+            .connect_discovered(peer.carrier)
+            .await
+            .map_err(Into::into),
+        #[cfg(feature = "nearby-discovery")]
+        (Some(_), PeerLocator::Nearby) => Err(NodeError::Configuration(
+            "nearby discovery cannot use a controlled relay".into(),
+        )),
+    }
 }
 
 async fn sync_control_lane(
@@ -30020,14 +30886,8 @@ async fn sync_authenticated_event_session(
             (mission, handshake, None)
         }
     };
-    if contact.iroh().is_none() {
-        mark_ordered_contact_authenticated();
-    }
-    if contact.iroh().is_none() && mission.semantic_version() != SEMANTIC_PROTOCOL_V9 {
-        return Err(NodeError::Protocol(
-            "ordered Event contacts require semantic protocol v9".into(),
-        ));
-    }
+    mark_event_contact_authenticated();
+    require_event_contact_semantic_v9(contact.iroh().is_some(), mission.semantic_version())?;
     reject_unsupported_blob_intent(mission.semantic_version(), &mutable_interests)?;
     let mut receipt = authenticated_receipt(&contact, &mission, handshake)?;
     #[cfg(test)]
@@ -32500,14 +33360,11 @@ async fn serve_selected_event_session(
             (mission, handshake, None)
         }
     };
-    if selected_contact.iroh().is_none() {
-        mark_ordered_contact_authenticated();
-    }
-    if selected_contact.iroh().is_none() && mission.semantic_version() != SEMANTIC_PROTOCOL_V9 {
-        return Err(NodeError::Protocol(
-            "ordered Event contacts require semantic protocol v9".into(),
-        ));
-    }
+    mark_event_contact_authenticated();
+    require_event_contact_semantic_v9(
+        selected_contact.iroh().is_some(),
+        mission.semantic_version(),
+    )?;
     reject_unsupported_blob_intent(mission.semantic_version(), &mutable_interests)?;
     let mut receipt = authenticated_receipt(&selected_contact, &mission, handshake)?;
     #[cfg(test)]
@@ -35364,6 +36221,7 @@ mod tests {
     use std::sync::{Barrier, mpsc as std_mpsc};
 
     use super::*;
+    use crate::{EventAdapterState, EventTransportKind};
     use aster_ble_l2cap::BleL2capContact;
     use aster_contact::{CarrierPeerEvidence, TransientLocator};
     use tokio::io::duplex;
@@ -36017,6 +36875,7 @@ mod tests {
                 automatic_event_transports: None,
                 #[cfg(unix)]
                 embedded_zeroization: None,
+                automatic_iroh_event_peer: None,
                 application_receiver,
                 application_admission,
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -36266,6 +37125,7 @@ mod tests {
                 automatic_event_transports: None,
                 #[cfg(unix)]
                 embedded_zeroization: None,
+                automatic_iroh_event_peer: None,
                 application_receiver,
                 application_admission,
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -36365,6 +37225,7 @@ mod tests {
                 automatic_event_transports: None,
                 #[cfg(unix)]
                 embedded_zeroization: None,
+                automatic_iroh_event_peer: None,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -40671,6 +41532,7 @@ mod tests {
                 automatic_event_transports: None,
                 #[cfg(unix)]
                 embedded_zeroization: None,
+                automatic_iroh_event_peer: None,
                 application_receiver,
                 application_admission,
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -40918,6 +41780,7 @@ mod tests {
                 automatic_event_transports: None,
                 #[cfg(unix)]
                 embedded_zeroization: None,
+                automatic_iroh_event_peer: None,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -42121,62 +42984,145 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordered_contact_closed_is_typed() {
-        let (sender, receiver) = mpsc::channel(1);
-        drop(receiver);
+    async fn ordered_contact_startup_and_terminal_rejections_are_distinct() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let admission = Arc::new(TransportAdmission::startup_closed());
         let handle = OrderedEventContactHandle {
             sender,
-            admission: Arc::new(TransportAdmission::startup_closed()),
+            admission: admission.clone(),
             session_permit: Arc::new(Semaphore::new(1)),
         };
         let peer = issue_missions(1).remove(0);
-        let contact = Arc::new(StalledOrderedContact::default());
+        let (startup_stream, mut startup_remote) = duplex(64);
+        let startup_contact = Arc::new(
+            BleL2capContact::new(
+                startup_stream,
+                TransientLocator::new(b"startup-closed-contact".to_vec()).unwrap(),
+                1024,
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
 
-        let error = handle
+        let startup = handle
             .run(
                 OrderedEventContactRole::Initiator,
-                contact.clone(),
-                MissionPeerExpectation::new(contact.peer_evidence(), peer.identity),
+                startup_contact.clone(),
+                MissionPeerExpectation::new(startup_contact.peer_evidence(), peer.identity),
             )
             .await
-            .expect_err("closed admission must reject the ordered contact");
+            .expect_err("startup-closed admission must reject the ordered contact");
 
-        assert_eq!(error.stage(), ContactStage::Candidate);
-        assert_eq!(error.scope(), ContactScope::Attempt);
-        assert_eq!(error.provenance(), ContactProvenance::Local);
-        assert_eq!(error.disposition(), ContactDisposition::Terminal);
-        assert_eq!(error.reason(), ContactReason::AdmissionClosed);
-        assert!(!error.permits_reselection());
-        assert_eq!(contact.operations(), 0);
-        assert_eq!(contact.closes(), 1);
+        assert_eq!(startup.stage(), ContactStage::Candidate);
+        assert_eq!(startup.scope(), ContactScope::Attempt);
+        assert_eq!(startup.provenance(), ContactProvenance::Local);
+        assert_eq!(startup.disposition(), ContactDisposition::RetryLater);
+        assert_eq!(startup.reason(), ContactReason::AdmissionBusy);
+        assert!(!startup.permits_reselection());
+        let mut startup_byte = [0; 1];
+        assert_eq!(
+            timeout(
+                Duration::from_secs(1),
+                startup_remote.read(&mut startup_byte)
+            )
+            .await
+            .expect("startup-closed carrier close deadline")
+            .expect("startup-closed carrier read"),
+            0,
+            "startup rejection closes the remote carrier"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        assert!(admission.open_initial());
+        admission.close();
+        assert!(
+            !admission.open_initial(),
+            "terminal transport admission cannot be reopened"
+        );
+        let (terminal_stream, mut terminal_remote) = duplex(64);
+        let terminal_contact = Arc::new(
+            BleL2capContact::new(
+                terminal_stream,
+                TransientLocator::new(b"terminal-closed-contact".to_vec()).unwrap(),
+                1024,
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
+
+        let terminal = handle
+            .run(
+                OrderedEventContactRole::Initiator,
+                terminal_contact.clone(),
+                MissionPeerExpectation::new(terminal_contact.peer_evidence(), peer.identity),
+            )
+            .await
+            .expect_err("terminal admission must reject the ordered contact");
+
+        assert_eq!(terminal.stage(), ContactStage::Candidate);
+        assert_eq!(terminal.scope(), ContactScope::Attempt);
+        assert_eq!(terminal.provenance(), ContactProvenance::Local);
+        assert_eq!(terminal.disposition(), ContactDisposition::Terminal);
+        assert_eq!(terminal.reason(), ContactReason::AdmissionClosed);
+        assert!(!terminal.permits_reselection());
+        let mut terminal_byte = [0; 1];
+        assert_eq!(
+            timeout(
+                Duration::from_secs(1),
+                terminal_remote.read(&mut terminal_byte)
+            )
+            .await
+            .expect("terminal carrier close deadline")
+            .expect("terminal carrier read"),
+            0,
+            "terminal rejection closes the remote carrier"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
-    async fn ordered_contact_busy_is_typed() {
+    async fn ordered_contact_waits_fairly_for_the_shared_session() {
         let (sender, receiver) = mpsc::channel(1);
         drop(receiver);
+        let session_permit = Arc::new(Semaphore::new(0));
         let handle = OrderedEventContactHandle {
             sender,
             admission: Arc::new(TransportAdmission::open()),
-            session_permit: Arc::new(Semaphore::new(0)),
+            session_permit: session_permit.clone(),
         };
         let peer = issue_missions(1).remove(0);
         let contact = Arc::new(StalledOrderedContact::default());
 
-        let error = handle
-            .run(
-                OrderedEventContactRole::Initiator,
-                contact.clone(),
-                MissionPeerExpectation::new(contact.peer_evidence(), peer.identity),
-            )
+        let mut waiting = Box::pin(handle.run(
+            OrderedEventContactRole::Initiator,
+            contact.clone(),
+            MissionPeerExpectation::new(contact.peer_evidence(), peer.identity),
+        ));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            std::future::Future::poll(waiting.as_mut(), &mut context).is_pending(),
+            "an established contact queues fairly"
+        );
+        assert_eq!(contact.operations(), 0);
+        assert_eq!(contact.closes(), 0);
+
+        session_permit.add_permits(1);
+        let error = timeout(Duration::from_secs(1), &mut waiting)
             .await
-            .expect_err("exhausted admission must reject the ordered contact");
+            .expect("released admission wakes the ordered contact")
+            .expect_err("stopped actor rejects the admitted contact");
 
         assert_eq!(error.stage(), ContactStage::Candidate);
         assert_eq!(error.scope(), ContactScope::Attempt);
         assert_eq!(error.provenance(), ContactProvenance::Local);
         assert_eq!(error.disposition(), ContactDisposition::RetryLater);
-        assert_eq!(error.reason(), ContactReason::AdmissionBusy);
+        assert_eq!(error.reason(), ContactReason::ActorUnavailable);
         assert!(!error.permits_reselection());
         assert_eq!(contact.operations(), 0);
         assert_eq!(contact.closes(), 1);
@@ -42281,25 +43227,6 @@ mod tests {
         assert!(!outcome.permits_reselection());
     }
 
-    #[tokio::test]
-    async fn ordered_contact_carrier_open_unavailability_permits_reselection() {
-        let open = async {
-            Err::<(), _>(ContactError::new(
-                ContactErrorKind::Unavailable,
-                "synthetic locally observed adapter-open failure",
-            ))
-        };
-        let outcome = classify_ordered_contact_carrier_open(open.await)
-            .expect_err("adapter-open failure must be classified at carrier-open");
-
-        assert_eq!(outcome.stage(), ContactStage::CarrierOpen);
-        assert_eq!(outcome.scope(), ContactScope::AdapterEpoch);
-        assert_eq!(outcome.provenance(), ContactProvenance::Adapter);
-        assert_eq!(outcome.disposition(), ContactDisposition::Reselect);
-        assert_eq!(outcome.reason(), ContactReason::CarrierUnavailable);
-        assert!(outcome.permits_reselection());
-    }
-
     #[test]
     fn ordered_contact_mission_identity_mismatch_is_pre_auth_and_not_reselectable() {
         let failure = ordered_contact_failure(
@@ -42377,7 +43304,7 @@ mod tests {
         );
         let authenticated = Arc::new(AtomicBool::new(false));
 
-        ORDERED_CONTACT_EXACT_AUTHENTICATED
+        EVENT_CONTACT_EXACT_AUTHENTICATED
             .scope(
                 authenticated.clone(),
                 ordered_test_event_contact_pair(
@@ -42830,7 +43757,7 @@ mod tests {
             let responder_credentials = responder.credentials.clone();
             let responder_authenticated = responder_authenticated.clone();
             async move {
-                ORDERED_CONTACT_EXACT_AUTHENTICATED
+                EVENT_CONTACT_EXACT_AUTHENTICATED
                     .scope(
                         responder_authenticated,
                         CONTACT_EVENT_ROUTE_CACHE.scope(
@@ -43679,8 +44606,9 @@ mod tests {
         let closed = pending_shutdown
             .run(closed_contact.clone())
             .await
-            .expect_err("shutdown closes automatic contact admission");
-        assert_eq!(closed.reason(), ContactReason::AdmissionClosed);
+            .expect_err("adapter shutdown revokes the pending automatic ticket");
+        assert_eq!(closed.reason(), ContactReason::AdapterEpochEnded);
+        assert_eq!(closed.disposition(), ContactDisposition::Reselect);
         assert_eq!(closed_contact.operations(), 0);
         assert_eq!(closed_contact.closes(), 1);
 
@@ -43692,25 +44620,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatic_event_transport_full_roster_schedules_each_current_peer_once() {
-        use crate::{
-            EventAdapterSnapshot, EventAdapterState, EventPeerEligibility, EventTransportKind,
-        };
-
-        let mission = [0x81; 32];
-        let first_peer = [0x82; 32];
-        let second_peer = [0x83; 32];
-        let foreign_peer = [0x84; 32];
-        let admission = Arc::new(TransportAdmission::open());
-        let (ordered_sender, _ordered_receiver) = mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
+    async fn initial_receive_only_suspends_automatic_selection_before_admission_opens() {
+        let mission = [0xa1; 32];
+        let peer = [0xa2; 32];
+        let admission = Arc::new(TransportAdmission::startup_closed());
+        let (ordered_sender, _ordered) = mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
         let automatic = RunningAutomaticEventTransportHandle::new(
             admission.clone(),
             mission,
             OrderedEventContactHandle {
                 sender: ordered_sender,
-                admission,
+                admission: admission.clone(),
                 session_permit: Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY)),
             },
+            false,
         );
         automatic.note_durable_work();
         let (_control, mut attempts) = automatic
@@ -43721,10 +44644,10 @@ mod tests {
                 true,
                 10,
             ))
-            .expect("fake adapter registration");
-        let first = EventPeerEligibility::provisioned_exact_peer(
+            .expect("receive-only startup adapter");
+        let eligibility = EventPeerEligibility::provisioned_exact_peer(
             mission,
-            first_peer,
+            peer,
             EventTransportKind::BLE_L2CAP_V1,
             true,
             1,
@@ -43732,15 +44655,472 @@ mod tests {
             None,
         );
         assert_eq!(
+            automatic.replace_eligibility(vec![eligibility]),
+            Some(AutomaticEventRosterStatus::Scheduled),
+            "startup composition installs authority before transport admission opens"
+        );
+        tokio::select! {
+            _attempt = attempts.recv() => panic!("startup-closed admission selected an adapter"),
+            () = tokio::task::yield_now() => {}
+        }
+        assert!(admission.open_initial());
+        tokio::select! {
+            _attempt = attempts.recv() => panic!("receive-only startup selected an outbound adapter"),
+            () = tokio::task::yield_now() => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn collision_wait_stops_when_transport_admission_closes() {
+        let admission = Arc::new(TransportAdmission::open());
+        let session_permit = Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY));
+        let held = session_permit
+            .clone()
+            .try_acquire_owned()
+            .expect("hold the only Event session permit");
+        let (sender, _receiver) = mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
+        let handle = OrderedEventContactHandle {
+            sender,
+            admission: admission.clone(),
+            session_permit: session_permit.clone(),
+        };
+        let mut waiter = Box::pin(handle.reserve_event_session());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            std::future::Future::poll(waiter.as_mut(), &mut context).is_pending(),
+            "the collision waiter reaches the capacity boundary"
+        );
+
+        admission.close();
+
+        let outcome = timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("terminal admission wakes the collision waiter")
+            .expect_err("terminal admission cannot grant the shared permit");
+        assert_eq!(outcome.reason(), ContactReason::AdmissionClosed);
+        assert_eq!(session_permit.available_permits(), 0);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn queued_session_reservation_precedes_a_later_native_try() {
+        let admission = Arc::new(TransportAdmission::open());
+        let session_permit = Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY));
+        let held = session_permit
+            .clone()
+            .try_acquire_owned()
+            .expect("hold the active Event session");
+        let (sender, _receiver) = mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
+        let handle = OrderedEventContactHandle {
+            sender,
+            admission,
+            session_permit,
+        };
+        let mut queued = Box::pin(handle.reserve_event_session());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            std::future::Future::poll(queued.as_mut(), &mut context).is_pending(),
+            "the fair reservation waits for capacity"
+        );
+
+        drop(held);
+        let later = handle
+            .try_reserve_native_iroh()
+            .expect_err("a later non-waiting reservation cannot jump the queue");
+        assert_eq!(later.reason(), ContactReason::AdmissionBusy);
+        let queued_permit = timeout(Duration::from_secs(1), queued)
+            .await
+            .expect("queued reservation receives released capacity")
+            .expect("queued reservation succeeds");
+        drop(queued_permit);
+    }
+
+    #[test]
+    fn native_iroh_reservation_releases_capacity_after_terminal_admission() {
+        let admission = Arc::new(TransportAdmission::open());
+        let session_permit = Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY));
+        let (sender, _receiver) = mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
+        let handle = OrderedEventContactHandle {
+            sender,
+            admission: admission.clone(),
+            session_permit: session_permit.clone(),
+        };
+
+        admission.close();
+        let outcome = handle
+            .try_reserve_native_iroh()
+            .expect_err("terminal admission rejects a newly acquired native permit");
+        assert_eq!(outcome.reason(), ContactReason::AdmissionClosed);
+        assert_eq!(
+            session_permit.available_permits(),
+            ORDERED_EVENT_CONTACT_CAPACITY,
+            "terminal rejection releases the acquired session capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn btle_composition_rejects_live_policy_change_before_either_state_changes() {
+        let test_root = root("btle-live-policy-restart-required");
+        fs::create_dir_all(&test_root).expect("policy test state");
+        #[cfg(unix)]
+        fs::set_permissions(&test_root, fs::Permissions::from_mode(0o700))
+            .expect("owner-only policy test state");
+        let local = issue_missions(1).remove(0);
+        let mission = local.credentials.mission_authority_id();
+        let peer = [0xb1; 32];
+        let node = start_transport_neutral_node(TransportNeutralNodeConfig {
+            state: test_root.clone(),
+            mission: local.credentials,
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start policy test node");
+        let automatic = node.automatic_event_transports();
+        let (_control, mut attempts) = automatic
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("live BTLE registration");
+        let original = node.event_emission_policy().expect("initial policy");
+
+        assert!(matches!(
+            node.set_event_emission_policy(EventEmissionPolicy::ReceiveOnly),
+            Err(NodeError::EmissionPolicyRestartRequired)
+        ));
+        assert_eq!(
+            node.event_emission_policy().expect("unchanged policy"),
+            original
+        );
+
+        automatic.note_durable_work();
+        assert_eq!(
+            automatic.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                mission,
+                peer,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            )]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+        assert_eq!(
+            attempts
+                .recv()
+                .await
+                .expect("unchanged outbound gate")
+                .peer(),
+            peer
+        );
+
+        node.shutdown().await.expect("policy test shutdown");
+        fs::remove_dir_all(test_root).expect("policy test cleanup");
+    }
+
+    #[tokio::test]
+    async fn concurrent_rejected_policy_writers_leave_policy_and_transport_gate_consistent() {
+        let test_root = root("btle-concurrent-policy-restart-required");
+        fs::create_dir_all(&test_root).expect("concurrent policy state");
+        #[cfg(unix)]
+        fs::set_permissions(&test_root, fs::Permissions::from_mode(0o700))
+            .expect("owner-only concurrent policy state");
+        let local = issue_missions(1).remove(0);
+        let mission = local.credentials.mission_authority_id();
+        let peer = [0xb2; 32];
+        let node = start_transport_neutral_node(TransportNeutralNodeConfig {
+            state: test_root.clone(),
+            mission: local.credentials,
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start concurrent policy node");
+        let automatic = node.automatic_event_transports();
+        let (_control, mut attempts) = automatic
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("live BTLE registration");
+        let original = node.event_emission_policy().expect("initial policy");
+        let policies = [
+            EventEmissionPolicy::ReceiveOnly,
+            EventEmissionPolicy::at_least(Priority::Flash),
+            EventEmissionPolicy::at_least(Priority::Immediate),
+            EventEmissionPolicy::at_least(Priority::Priority),
+            EventEmissionPolicy::ReceiveOnly,
+            EventEmissionPolicy::at_least(Priority::Flash),
+        ];
+        let barrier = Arc::new(Barrier::new(policies.len()));
+        std::thread::scope(|scope| {
+            let mut writers = Vec::new();
+            for policy in policies {
+                let barrier = Arc::clone(&barrier);
+                let node = &node;
+                writers.push(scope.spawn(move || {
+                    barrier.wait();
+                    node.set_event_emission_policy(policy)
+                }));
+            }
+            for writer in writers {
+                assert!(matches!(
+                    writer.join().expect("policy writer joined"),
+                    Err(NodeError::EmissionPolicyRestartRequired)
+                ));
+            }
+        });
+        assert_eq!(
+            node.event_emission_policy().expect("stable policy"),
+            original,
+            "rejected writers must preserve both policy and revision"
+        );
+
+        automatic.note_durable_work();
+        assert_eq!(
+            automatic.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                mission,
+                peer,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            )]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+        assert_eq!(
+            attempts
+                .recv()
+                .await
+                .expect("original outbound gate remains open")
+                .peer(),
+            peer
+        );
+
+        node.shutdown().await.expect("concurrent policy shutdown");
+        fs::remove_dir_all(test_root).expect("concurrent policy cleanup");
+    }
+
+    #[tokio::test]
+    async fn run_peer_attempt_observes_existing_durable_attempt_without_a_second_mode() {
+        let mission = [0xc1; 32];
+        let peer = [0xc2; 32];
+        let admission = Arc::new(TransportAdmission::open());
+        let (ordered_sender, _ordered_receiver) = mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
+        let automatic = RunningAutomaticEventTransportHandle::new(
+            admission.clone(),
+            mission,
+            OrderedEventContactHandle {
+                sender: ordered_sender,
+                admission,
+                session_permit: Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY)),
+            },
+            true,
+        );
+        automatic.note_durable_work();
+        let (control, mut attempts) = automatic
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Unavailable,
+                true,
+                10,
+            ))
+            .expect("attempt observer adapter");
+        assert_eq!(
+            automatic.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                mission,
+                peer,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            )]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+        let mut observed = Box::pin(automatic.run_peer_attempt(peer));
+        tokio::select! {
+            biased;
+            result = &mut observed => panic!("observer completed before adapter availability: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        assert!(control.publish_availability(EventAdapterSnapshot::new(
+            EventTransportKind::BLE_L2CAP_V1,
+            2,
+            EventAdapterState::Available,
+            true,
+            10,
+        )));
+        let attempt = attempts.recv().await.expect("one shared durable attempt");
+        let outcome = attempt.cancel_carrier_open();
+        assert_eq!(
+            timeout(Duration::from_secs(1), &mut observed)
+                .await
+                .expect("observer completion deadline"),
+            AutomaticEventAttemptOutcome::Completed(Err(outcome))
+        );
+        assert_eq!(automatic.coordinator.pending_attempt_count(), 0);
+        tokio::select! {
+            biased;
+            _attempt = attempts.recv() => panic!("observer created queued follow-on work"),
+            () = tokio::task::yield_now() => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_transport_closure_completes_waiting_peer_attempt_with_shutdown() {
+        let test_root = root("automatic-attempt-terminal-closure");
+        fs::create_dir_all(&test_root).expect("terminal closure state");
+        #[cfg(unix)]
+        fs::set_permissions(&test_root, fs::Permissions::from_mode(0o700))
+            .expect("owner-only terminal closure state");
+        let local = issue_missions(1).remove(0);
+        let mission = local.credentials.mission_authority_id();
+        let peer = [0xc3; 32];
+        let node = start_transport_neutral_node(TransportNeutralNodeConfig {
+            state: test_root.clone(),
+            mission: local.credentials,
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start terminal closure node");
+        let automatic = node.automatic_event_transports();
+        automatic.note_durable_work();
+        assert_eq!(
+            automatic.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                mission,
+                peer,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            )]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+        let mut observed = Box::pin(automatic.run_peer_attempt(peer));
+        tokio::select! {
+            biased;
+            result = &mut observed => panic!("attempt completed before terminal closure: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        assert_eq!(automatic.coordinator.pending_attempt_count(), 1);
+
+        node.close_transport_admission();
+
+        let outcome = timeout(Duration::from_secs(1), &mut observed)
+            .await
+            .expect("shutdown observation deadline");
+        let AutomaticEventAttemptOutcome::Completed(Err(outcome)) = outcome else {
+            panic!("terminal closure must complete the current attempt: {outcome:?}");
+        };
+        assert_eq!(outcome.reason(), ContactReason::Shutdown);
+        assert_eq!(outcome.disposition(), ContactDisposition::Cancelled);
+        assert_eq!(automatic.coordinator.pending_attempt_count(), 0);
+
+        node.shutdown().await.expect("terminal closure shutdown");
+        fs::remove_dir_all(test_root).expect("terminal closure cleanup");
+    }
+
+    #[tokio::test]
+    async fn eligibility_replacement_schedules_only_current_exact_peers() {
+        use crate::{
+            EventAdapterSnapshot, EventAdapterState, EventPeerEligibility, EventTransportKind,
+        };
+
+        let mission = [0x81; 32];
+        let retired_peer = [0x82; 32];
+        let current_peer = [0x83; 32];
+        let revoked_peer = [0x84; 32];
+        let expired_peer = [0x85; 32];
+        let incapable_peer = [0x86; 32];
+        let foreign_peer = [0x87; 32];
+        let admission = Arc::new(TransportAdmission::open());
+        let (ordered_sender, _ordered_receiver) = mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
+        let automatic = RunningAutomaticEventTransportHandle::new(
+            admission.clone(),
+            mission,
+            OrderedEventContactHandle {
+                sender: ordered_sender,
+                admission,
+                session_permit: Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY)),
+            },
+            true,
+        );
+        automatic.note_durable_work();
+        let (control, mut attempts) = automatic
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Unavailable,
+                true,
+                10,
+            ))
+            .expect("fake adapter registration");
+        assert_eq!(
+            automatic.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                mission,
+                retired_peer,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            )]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+        assert_eq!(
             automatic.replace_eligibility(vec![
-                first,
-                first,
                 EventPeerEligibility::provisioned_exact_peer(
                     mission,
-                    second_peer,
+                    current_peer,
                     EventTransportKind::BLE_L2CAP_V1,
                     true,
-                    1,
+                    2,
+                    0,
+                    None,
+                ),
+                EventPeerEligibility::provisioned_exact_peer(
+                    mission,
+                    revoked_peer,
+                    EventTransportKind::BLE_L2CAP_V1,
+                    true,
+                    3,
+                    3,
+                    None,
+                ),
+                EventPeerEligibility::provisioned_exact_peer(
+                    mission,
+                    expired_peer,
+                    EventTransportKind::BLE_L2CAP_V1,
+                    true,
+                    4,
+                    0,
+                    Some(std::time::UNIX_EPOCH),
+                ),
+                EventPeerEligibility::provisioned_exact_peer(
+                    mission,
+                    incapable_peer,
+                    EventTransportKind::BLE_L2CAP_V1,
+                    false,
+                    5,
                     0,
                     None,
                 ),
@@ -43756,17 +45136,160 @@ mod tests {
             ]),
             Some(AutomaticEventRosterStatus::Scheduled)
         );
-
-        let first_attempt = attempts.recv().await.expect("first unique peer ticket");
-        let mut scheduled = BTreeSet::from([first_attempt.peer()]);
-        drop(first_attempt);
-        let second_attempt = attempts.recv().await.expect("second unique peer ticket");
-        assert!(scheduled.insert(second_attempt.peer()));
-        drop(second_attempt);
-        assert_eq!(scheduled, BTreeSet::from([first_peer, second_peer]));
+        {
+            let state = automatic
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                state
+                    .requested_generation
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![current_peer]
+            );
+        }
+        assert!(control.publish_availability(EventAdapterSnapshot::new(
+            EventTransportKind::BLE_L2CAP_V1,
+            2,
+            EventAdapterState::Available,
+            true,
+            10,
+        )));
+        let attempt = attempts.recv().await.expect("current exact-peer attempt");
+        assert_eq!(attempt.peer(), current_peer);
+        assert_eq!(
+            attempt.cancel_carrier_open().disposition(),
+            ContactDisposition::Cancelled
+        );
+        assert_eq!(automatic.coordinator.pending_attempt_count(), 0);
         tokio::select! {
             biased;
-            _attempt = attempts.recv() => panic!("duplicate or foreign-mission peer was scheduled"),
+            _attempt = attempts.recv() => panic!("stale or foreign authority remained queued"),
+            () = tokio::task::yield_now() => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn running_facade_rejects_oversized_eligibility_without_replacing_roster() {
+        let mission = [0xb1; 32];
+        let peer = [0xb2; 32];
+        let admission = Arc::new(TransportAdmission::open());
+        let (ordered_sender, _ordered_receiver) = mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
+        let automatic = RunningAutomaticEventTransportHandle::new(
+            admission.clone(),
+            mission,
+            OrderedEventContactHandle {
+                sender: ordered_sender,
+                admission,
+                session_permit: Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY)),
+            },
+            true,
+        );
+        automatic.note_durable_work();
+        let eligible = EventPeerEligibility::provisioned_exact_peer(
+            mission,
+            peer,
+            EventTransportKind::BLE_L2CAP_V1,
+            true,
+            1,
+            0,
+            None,
+        );
+        assert_eq!(
+            automatic.replace_eligibility(vec![eligible]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+
+        assert_eq!(
+            automatic.replace_eligibility(vec![eligible; MAX_EVENT_PEER_ELIGIBILITY + 1]),
+            None
+        );
+        let state = automatic
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            state
+                .requested_generation
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![peer]
+        );
+    }
+
+    #[tokio::test]
+    async fn same_peer_authority_replacement_rearms_current_durable_generation_once() {
+        let mission = [0xd1; 32];
+        let peer = [0xd2; 32];
+        let admission = Arc::new(TransportAdmission::open());
+        let (ordered_sender, _ordered_receiver) = mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
+        let automatic = RunningAutomaticEventTransportHandle::new(
+            admission.clone(),
+            mission,
+            OrderedEventContactHandle {
+                sender: ordered_sender,
+                admission,
+                session_permit: Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY)),
+            },
+            true,
+        );
+        automatic.note_durable_work();
+        let (_control, mut attempts) = automatic
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("authority replacement adapter");
+        let eligibility = |authority_generation| {
+            EventPeerEligibility::provisioned_exact_peer(
+                mission,
+                peer,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                authority_generation,
+                0,
+                None,
+            )
+        };
+        assert_eq!(
+            automatic.replace_eligibility(vec![eligibility(1)]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+        let mut old_attempt = attempts.recv().await.expect("old-authority attempt");
+
+        assert_eq!(
+            automatic.replace_eligibility(vec![eligibility(2)]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+        assert_eq!(automatic.coordinator.pending_attempt_count(), 2);
+        assert_eq!(
+            automatic.replace_eligibility(vec![eligibility(2)]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+        assert_eq!(
+            automatic.coordinator.pending_attempt_count(),
+            2,
+            "unchanged authority replay must not duplicate admission"
+        );
+
+        let revoked = old_attempt.revocation_outcome().await;
+        assert_eq!(revoked.reason(), ContactReason::AuthorityChanged);
+        old_attempt.finish_revoked();
+        let current_attempt = attempts.recv().await.expect("current-authority attempt");
+        assert_eq!(
+            current_attempt.cancel_carrier_open().disposition(),
+            ContactDisposition::Cancelled
+        );
+        assert_eq!(automatic.coordinator.pending_attempt_count(), 0);
+        tokio::select! {
+            biased;
+            _attempt = attempts.recv() => panic!("authority replay left duplicate custody queued"),
             () = tokio::task::yield_now() => {}
         }
     }
@@ -43788,6 +45311,7 @@ mod tests {
                 admission,
                 session_permit: Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY)),
             },
+            true,
         );
         automatic.note_durable_work();
         let eligibility = |peer| {
@@ -43853,7 +45377,23 @@ mod tests {
         .await
         .expect("start automatic capacity node");
         let automatic = node.automatic_event_transports();
+        let eligibility = |peer| {
+            EventPeerEligibility::provisioned_exact_peer(
+                mission,
+                peer,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            )
+        };
         automatic.note_durable_work();
+        assert!(
+            automatic
+                .coordinator
+                .replace_eligibility(vec![eligibility(filler_peer), eligibility(target_peer),])
+        );
         for _ in 0..MAX_PENDING_EVENT_COHORTS {
             assert_eq!(
                 automatic.coordinator.request_attempt_admission(
@@ -43873,17 +45413,6 @@ mod tests {
                 10,
             ))
             .expect("fake capacity adapter");
-        let eligibility = |peer| {
-            EventPeerEligibility::provisioned_exact_peer(
-                mission,
-                peer,
-                EventTransportKind::BLE_L2CAP_V1,
-                true,
-                1,
-                0,
-                None,
-            )
-        };
         assert_eq!(
             automatic.replace_eligibility(vec![eligibility(filler_peer), eligibility(target_peer)]),
             Some(AutomaticEventRosterStatus::PendingCapacity),
@@ -43902,8 +45431,11 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert_eq!(
-                state.requested_generation.get(&target_peer),
-                Some(&state.durable_generation),
+                state
+                    .requested_generation
+                    .get(&target_peer)
+                    .map(|requested| requested.generation),
+                Some(state.durable_generation),
                 "capacity progress never admitted the retained target generation"
             );
         }
@@ -44109,19 +45641,22 @@ mod tests {
             .register_paired(available())
             .expect("startup admission permits authorized adapter composition");
         automatic.note_durable_work();
-        assert!(automatic.replace_eligibility(vec![eligibility()]).is_none());
+        assert_eq!(
+            automatic.replace_eligibility(vec![eligibility()]),
+            Some(AutomaticEventRosterStatus::Scheduled),
+            "complete authority is installed while supervised admission remains closed"
+        );
+        let (_, _adapter, mut attempts) = registration.into_parts();
+        tokio::select! {
+            _attempt = attempts.recv() => panic!("startup-closed admission selected an adapter"),
+            () = tokio::task::yield_now() => {}
+        }
         node.selected_events()
             .status()
             .await
             .expect("startup transport gate preserves application admission");
 
         assert!(node.open_transport_admission());
-        assert_eq!(
-            automatic.replace_eligibility(vec![eligibility()]),
-            Some(AutomaticEventRosterStatus::Scheduled),
-            "transport selection begins only after the supervisor opens admission"
-        );
-        let (_, _adapter, mut attempts) = registration.into_parts();
         assert_eq!(
             timeout(Duration::from_secs(1), attempts.recv())
                 .await
@@ -44212,6 +45747,683 @@ mod tests {
 
         node.shutdown().await.expect("supervised Iroh shutdown");
         fs::remove_dir_all(test_root).expect("supervised Iroh cleanup");
+    }
+
+    #[tokio::test]
+    async fn published_event_wakes_coordinated_iroh_before_periodic_tick() {
+        let test_root = root("automatic-iroh-event-peer");
+        let local_state = test_root.join("local");
+        let peer_state = test_root.join("peer");
+        for state in [&local_state, &peer_state] {
+            fs::create_dir_all(state).expect("automatic Iroh state");
+            #[cfg(unix)]
+            fs::set_permissions(state, fs::Permissions::from_mode(0o700))
+                .expect("owner-only automatic Iroh state");
+        }
+        let local_carrier = NodeIdentity::load_or_create(&local_state)
+            .expect("automatic Iroh local carrier")
+            .id();
+        let peer_carrier = NodeIdentity::load_or_create(&peer_state)
+            .expect("automatic Iroh peer carrier")
+            .id();
+        let placeholder = SocketAddr::from(([127, 0, 0, 1], 9));
+        let mut issued = issue_missions(2);
+        let local = issued.remove(0);
+        let peer = issued.remove(0);
+        let peer_identity = peer.identity;
+        let peer_node = start_supervised_node_with_forwarding_and_output_policy(
+            NodeConfig {
+                state: peer_state,
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: peer.credentials,
+                peers: vec![MissionExpectedPeer {
+                    carrier: ExpectedPeer {
+                        id: local_carrier,
+                        address: placeholder,
+                    },
+                    mission: local.identity,
+                }],
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            SelectedForwardingConfig::default()
+                .with_emission_policy(EventEmissionPolicy::ReceiveOnly),
+            NodeOperatorOutputPolicy::default(),
+        )
+        .await
+        .expect("start automatic Iroh peer node");
+        let peer_address = peer_node
+            .bound_sockets
+            .iter()
+            .copied()
+            .find(SocketAddr::is_ipv4)
+            .expect("automatic Iroh peer IPv4 socket");
+        let node = start_supervised_node_with_automatic_iroh_event_peer(
+            NodeConfig {
+                state: local_state,
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: local.credentials,
+                peers: vec![MissionExpectedPeer {
+                    carrier: ExpectedPeer {
+                        id: peer_carrier,
+                        address: peer_address,
+                    },
+                    mission: peer.identity,
+                }],
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            SelectedForwardingConfig::default(),
+            NodeOperatorOutputPolicy::default(),
+            peer_identity,
+        )
+        .await
+        .expect("start automatic Iroh node");
+
+        assert_eq!(node.automatic_iroh_event_peer(), Some(peer_identity));
+        assert!(
+            node.automatic_event_transports()
+                .register(EventAdapterSnapshot::new(
+                    EventTransportKind::IROH_QUIC_V1,
+                    1,
+                    EventAdapterState::Available,
+                    true,
+                    DEFAULT_IROH_EVENT_PRIORITY,
+                ))
+                .is_none(),
+            "the node actor owns the sole Iroh selector registration"
+        );
+        let automatic = node.automatic_event_transports();
+        let (_btle_control, _btle_attempts) = automatic
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Unavailable,
+                true,
+                DEFAULT_IROH_EVENT_PRIORITY + 1,
+            ))
+            .expect("register unavailable BTLE adapter");
+        let held_automatic_admission = node
+            .contact_activity
+            .automatic_event_admission_gate()
+            .try_acquire_owned()
+            .expect("hold automatic Iroh before shared Event admission");
+        assert_eq!(
+            automatic.replace_eligibility(vec![
+                EventPeerEligibility::provisioned_exact_peer(
+                    node.selected_events().mission_authority(),
+                    peer_identity,
+                    EventTransportKind::IROH_QUIC_V1,
+                    true,
+                    1,
+                    0,
+                    None,
+                ),
+                EventPeerEligibility::provisioned_exact_peer(
+                    node.selected_events().mission_authority(),
+                    peer_identity,
+                    EventTransportKind::BLE_L2CAP_V1,
+                    true,
+                    1,
+                    0,
+                    None,
+                ),
+            ]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+        let events = node.selected_events();
+        let client = subscription_fixture_client(&events).await;
+        assert!(node.open_transport_admission());
+        tokio::task::yield_now().await;
+        assert_eq!(
+            node.contact_activity_snapshot()
+                .automatic_event_attempts_parked,
+            0,
+            "transport admission without durable Event work must not select Iroh"
+        );
+
+        events
+            .publish_numbered(
+                NumberedEventPublishRequest {
+                    client_id: client.client_id,
+                    session: client.session,
+                    sequence: aster_redb_store::EventOperationSequence::new(1).unwrap(),
+                    predecessor: None,
+                    topic: Topic::new("opaque").expect("automatic Iroh Event topic"),
+                    scope: Scope::new("test/runtime-contact").expect("automatic Iroh Event scope"),
+                    priority: Priority::Priority,
+                    logical_key: b"automatic-iroh-publish-wake".to_vec(),
+                    payload: b"wake coordinated Iroh before the periodic tick".to_vec(),
+                    tombstone: false,
+                },
+                EventPublishOptions::durable(),
+            )
+            .await
+            .expect("publish durable Event for coordinated Iroh");
+        timeout(Duration::from_secs(2), async {
+            while node
+                .contact_activity_snapshot()
+                .automatic_event_attempts_parked
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("published Event must select Iroh before the 60-second periodic tick");
+        assert!(peer_node.open_transport_admission());
+        timeout(Duration::from_secs(5), async {
+            while node
+                .contact_activity_snapshot()
+                .automatic_event_admission_entries
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("automatic Iroh attempt opens its carrier");
+        let held_event_session = node
+            .ordered_event_contacts
+            .session_permit
+            .clone()
+            .try_acquire_owned()
+            .expect("hold shared Event session permit");
+        drop(held_automatic_admission);
+        timeout(Duration::from_secs(2), async {
+            while node.contact_activity_snapshot().event_admission_waits == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("automatic Iroh attempt reaches Event admission");
+        assert_eq!(
+            peer_node
+                .selected_events()
+                .status()
+                .await
+                .expect("peer contact status")
+                .authenticated_contacts,
+            0,
+            "an opened automatic Iroh carrier cannot authenticate before shared Event admission"
+        );
+
+        drop(held_event_session);
+        let later = node
+            .ordered_event_contacts
+            .try_reserve_native_iroh()
+            .expect_err("the queued automatic reservation owns released Event capacity");
+        assert_eq!(later.reason(), ContactReason::AdmissionBusy);
+        wait_for_authenticated_contacts(&node.selected_events(), 1, "automatic Iroh local").await;
+        wait_for_authenticated_contacts(&peer_node.selected_events(), 1, "automatic Iroh peer")
+            .await;
+        assert_eq!(
+            node.contact_activity_snapshot()
+                .automatic_event_admission_entries,
+            1,
+            "capacity contention must retain one automatic Event attempt"
+        );
+
+        let (node_receipt, peer_receipt) = tokio::join!(node.shutdown(), peer_node.shutdown());
+        assert!(
+            node_receipt.is_ok(),
+            "automatic Iroh shutdown: {node_receipt:?}"
+        );
+        assert!(
+            peer_receipt.is_ok(),
+            "automatic Iroh peer shutdown: {peer_receipt:?}"
+        );
+        fs::remove_dir_all(test_root).expect("automatic Iroh cleanup");
+    }
+
+    #[tokio::test]
+    async fn cancelled_authenticated_native_iroh_attempt_retains_authenticated_outcome() {
+        use crate::event_transport::AutomaticEventTransportHandle;
+
+        let mission = [0x31; 32];
+        let peer = [0x32; 32];
+        let automatic = AutomaticEventTransportHandle::new();
+        assert!(
+            automatic.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                mission,
+                peer,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),])
+        );
+        let (_control, mut attempts) = automatic
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                DEFAULT_IROH_EVENT_PRIORITY,
+            ))
+            .expect("native Iroh registration");
+        let (admission, observation) =
+            automatic.request_observed_attempt(mission, peer, |_contact| async { Ok(()) });
+        assert_eq!(admission, EventAttemptAdmission::Accepted);
+        let attempt = attempts.recv().await.expect("native Iroh attempt");
+        drop(NativeIrohAttemptGuard {
+            attempt: Some(attempt),
+            authenticated: Arc::new(AtomicBool::new(true)),
+            cancellation: NativeIrohCancellation::default(),
+        });
+
+        let outcome = observation
+            .wait()
+            .await
+            .expect_err("authenticated cancellation must not report success");
+        assert_eq!(outcome.stage(), ContactStage::AuthenticatedSession);
+        assert_eq!(
+            outcome.provenance(),
+            ContactProvenance::AuthenticatedMission
+        );
+        assert_eq!(outcome.disposition(), ContactDisposition::Reselect);
+        assert_eq!(outcome.reason(), ContactReason::TransportInterrupted);
+    }
+
+    #[tokio::test]
+    async fn collision_cancelled_native_iroh_attempt_stays_cancelled() {
+        use crate::event_transport::AutomaticEventTransportHandle;
+
+        let mission = [0x33; 32];
+        let peer = [0x34; 32];
+        let automatic = AutomaticEventTransportHandle::new();
+        assert!(
+            automatic.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                mission,
+                peer,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),])
+        );
+        let (_control, mut attempts) = automatic
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                DEFAULT_IROH_EVENT_PRIORITY,
+            ))
+            .expect("native Iroh registration");
+        let (admission, observation) =
+            automatic.request_observed_attempt(mission, peer, |_contact| async { Ok(()) });
+        assert_eq!(admission, EventAttemptAdmission::Accepted);
+        let attempt = attempts.recv().await.expect("native Iroh attempt");
+        let cancellation = NativeIrohCancellation::default();
+        cancellation.cancel_for_collision();
+        drop(NativeIrohAttemptGuard {
+            attempt: Some(attempt),
+            authenticated: Arc::new(AtomicBool::new(true)),
+            cancellation,
+        });
+
+        let outcome = observation
+            .wait()
+            .await
+            .expect_err("collision arbitration must remain cancellation");
+        assert_eq!(outcome.stage(), ContactStage::AuthenticatedSession);
+        assert_eq!(outcome.provenance(), ContactProvenance::Local);
+        assert_eq!(outcome.disposition(), ContactDisposition::Cancelled);
+        assert_eq!(outcome.reason(), ContactReason::CallerCancelled);
+        assert_eq!(automatic.pending_attempt_count(), 0);
+    }
+
+    #[test]
+    fn native_iroh_carrier_open_errors_keep_typed_authority_outcomes() {
+        let local = native_iroh_carrier_open_outcome(&NodeError::Carrier(
+            CarrierError::Configuration("invalid local relay".into()),
+        ));
+        assert_eq!(local.stage(), ContactStage::CarrierOpen);
+        assert_eq!(local.provenance(), ContactProvenance::Local);
+        assert_eq!(local.disposition(), ContactDisposition::Terminal);
+        assert_eq!(local.reason(), ContactReason::LocalInvariant);
+
+        let unauthorized = native_iroh_carrier_open_outcome(&NodeError::Carrier(
+            CarrierError::UnauthorizedPeer(aster_iroh::SecretKey::generate().public()),
+        ));
+        assert_eq!(unauthorized.stage(), ContactStage::CarrierOpen);
+        assert_eq!(
+            unauthorized.provenance(),
+            ContactProvenance::UnauthenticatedRemote
+        );
+        assert_eq!(unauthorized.disposition(), ContactDisposition::RetryLater);
+        assert_eq!(unauthorized.reason(), ContactReason::IdentityMismatch);
+
+        let interrupted = native_iroh_carrier_open_outcome(&NodeError::Carrier(
+            CarrierError::Transport("connect interrupted".into()),
+        ));
+        assert_eq!(interrupted.disposition(), ContactDisposition::RetryLater);
+        assert_eq!(interrupted.reason(), ContactReason::TransportInterrupted);
+
+        let timed_out =
+            native_iroh_carrier_open_outcome(&NodeError::Carrier(CarrierError::Timeout("connect")));
+        assert_eq!(timed_out.disposition(), ContactDisposition::RetryLater);
+        assert_eq!(timed_out.reason(), ContactReason::TransportTimeout);
+
+        for error in [
+            CarrierError::Protocol("invalid peer preamble".into()),
+            CarrierError::RemoteFrameTooLarge {
+                actual: 2,
+                maximum: 1,
+            },
+            CarrierError::RemoteTurnTooLarge {
+                actual: 2,
+                maximum: 1,
+            },
+        ] {
+            let outcome = native_iroh_carrier_open_outcome(&NodeError::Carrier(error));
+            assert_eq!(outcome.stage(), ContactStage::CarrierOpen);
+            assert_eq!(
+                outcome.provenance(),
+                ContactProvenance::UnauthenticatedRemote
+            );
+            assert_eq!(outcome.disposition(), ContactDisposition::RetryLater);
+            assert_eq!(outcome.reason(), ContactReason::ProtocolViolation);
+            assert!(!outcome.permits_reselection());
+        }
+    }
+
+    #[test]
+    fn authenticated_iroh_carrier_errors_only_reselect_link_loss_or_timeout() {
+        for error in [
+            CarrierError::Configuration("invalid local bound".into()),
+            CarrierError::Invariant("invalid local stream state".into()),
+            CarrierError::FrameTooLarge {
+                actual: 2,
+                maximum: 1,
+            },
+            CarrierError::TurnTooLarge {
+                actual: 2,
+                maximum: 1,
+            },
+        ] {
+            let failure = ordered_contact_failure(NodeError::Carrier(error), true);
+            assert!(!failure.outcome.permits_reselection());
+            assert_eq!(failure.outcome.provenance(), ContactProvenance::Local);
+            assert_eq!(failure.outcome.disposition(), ContactDisposition::Terminal);
+            assert_eq!(failure.outcome.reason(), ContactReason::LocalInvariant);
+        }
+
+        for error in [
+            CarrierError::Protocol("truncated authenticated frame".into()),
+            CarrierError::RemoteFrameTooLarge {
+                actual: 2,
+                maximum: 1,
+            },
+            CarrierError::RemoteTurnTooLarge {
+                actual: 2,
+                maximum: 1,
+            },
+        ] {
+            let failure = ordered_contact_failure(NodeError::Carrier(error), true);
+            assert!(!failure.outcome.permits_reselection());
+            assert_eq!(
+                failure.outcome.provenance(),
+                ContactProvenance::AuthenticatedMission
+            );
+            assert_eq!(failure.outcome.disposition(), ContactDisposition::Suppress);
+            assert_eq!(failure.outcome.reason(), ContactReason::ProtocolViolation);
+        }
+
+        for error in [
+            CarrierError::Transport("authenticated link closed".into()),
+            CarrierError::Timeout("authenticated turn"),
+        ] {
+            let failure = ordered_contact_failure(NodeError::Carrier(error), true);
+            assert!(failure.outcome.permits_reselection());
+        }
+    }
+
+    #[test]
+    fn ordered_contact_outcomes_preserve_local_and_remote_provenance() {
+        for kind in [
+            ContactErrorKind::Configuration,
+            ContactErrorKind::Invariant,
+            ContactErrorKind::Bounds,
+            ContactErrorKind::Unsupported,
+        ] {
+            let outcome = ordered_contact_transport_outcome(kind, true);
+            assert_eq!(outcome.provenance(), ContactProvenance::Local);
+            assert_eq!(outcome.disposition(), ContactDisposition::Terminal);
+            assert_eq!(outcome.reason(), ContactReason::LocalInvariant);
+        }
+
+        let outcome = ordered_contact_transport_outcome(ContactErrorKind::RemoteBounds, true);
+        assert_eq!(
+            outcome.provenance(),
+            ContactProvenance::AuthenticatedMission
+        );
+        assert_eq!(outcome.disposition(), ContactDisposition::Suppress);
+        assert_eq!(outcome.reason(), ContactReason::ProtocolViolation);
+        assert!(!outcome.permits_reselection());
+    }
+
+    #[tokio::test]
+    async fn uncoordinated_iroh_v8_contact_completes() {
+        let test_root = root("uncoordinated-iroh-v8");
+        let left_state = test_root.join("left");
+        let right_state = test_root.join("right");
+        for state in [&left_state, &right_state] {
+            fs::create_dir_all(state).expect("uncoordinated v8 state");
+            #[cfg(unix)]
+            fs::set_permissions(state, fs::Permissions::from_mode(0o700))
+                .expect("owner-only uncoordinated v8 state");
+        }
+        let left_carrier = NodeIdentity::load_or_create(&left_state)
+            .expect("uncoordinated v8 left carrier")
+            .id();
+        let right_carrier = NodeIdentity::load_or_create(&right_state)
+            .expect("uncoordinated v8 right carrier")
+            .id();
+        let mut issued = issue_missions(2);
+        let left = issued.remove(0);
+        let right = issued.remove(0);
+        let placeholder = SocketAddr::from(([127, 0, 0, 1], 0));
+        let left_config = NodeConfig {
+            state: left_state,
+            bind: placeholder,
+            mission: left.credentials,
+            peers: vec![MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: right_carrier,
+                    address: placeholder,
+                },
+                mission: right.identity,
+            }],
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_millis(20),
+            run_for: None,
+            application: NodeApplication::Relay,
+        };
+        let right_config = NodeConfig {
+            state: right_state,
+            bind: placeholder,
+            mission: right.credentials,
+            peers: vec![MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: left_carrier,
+                    address: placeholder,
+                },
+                mission: left.identity,
+            }],
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_millis(20),
+            run_for: None,
+            application: NodeApplication::Relay,
+        };
+
+        let (left_node, right_node) = with_test_semantic_version(
+            SEMANTIC_PROTOCOL_V8,
+            start_test_pair(left_config, right_config, left_carrier, right_carrier),
+        )
+        .await;
+        wait_for_authenticated_contacts(&left_node.selected_events(), 1, "v8 left").await;
+        wait_for_authenticated_contacts(&right_node.selected_events(), 1, "v8 right").await;
+
+        let (left_receipt, right_receipt) =
+            tokio::join!(left_node.shutdown(), right_node.shutdown());
+        assert_direct_contact_receipt(left_receipt, "uncoordinated v8 left");
+        assert_direct_contact_receipt(right_receipt, "uncoordinated v8 right");
+        fs::remove_dir_all(test_root).expect("uncoordinated v8 cleanup");
+    }
+
+    #[tokio::test]
+    async fn coordinated_iroh_v8_is_rejected_by_the_actor_contact_path() {
+        let local_state = root("coordinated-iroh-v8-local");
+        let peer_state = root("coordinated-iroh-v8-peer");
+        let local_cleanup = local_state.clone();
+        let peer_cleanup = peer_state.clone();
+        for state in [&local_state, &peer_state] {
+            fs::create_dir_all(state).expect("coordinated v8 state");
+            #[cfg(unix)]
+            fs::set_permissions(state, fs::Permissions::from_mode(0o700))
+                .expect("owner-only coordinated v8 state");
+        }
+        let local_carrier = NodeIdentity::load_or_create(&local_state)
+            .expect("coordinated v8 local carrier")
+            .id();
+        let peer_carrier = NodeIdentity::load_or_create(&peer_state)
+            .expect("coordinated v8 peer carrier")
+            .id();
+        let mut issued = issue_missions(2);
+        let local = issued.remove(0);
+        let peer = issued.remove(0);
+        let local_identity = local.identity;
+        let peer_identity = peer.identity;
+
+        let (peer_node, local_node) =
+            with_test_semantic_version(SEMANTIC_PROTOCOL_V8, async move {
+                let peer_node = start_supervised_node_with_forwarding_and_output_policy(
+                    NodeConfig {
+                        state: peer_state,
+                        bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                        mission: peer.credentials,
+                        peers: vec![MissionExpectedPeer {
+                            carrier: ExpectedPeer {
+                                id: local_carrier,
+                                address: SocketAddr::from(([127, 0, 0, 1], 9)),
+                            },
+                            mission: local_identity,
+                        }],
+                        mutable_interests: MutableSourceInterests::default(),
+                        sync_interval: Duration::from_secs(60),
+                        run_for: None,
+                        application: NodeApplication::Relay,
+                    },
+                    SelectedForwardingConfig::default()
+                        .with_emission_policy(EventEmissionPolicy::ReceiveOnly),
+                    NodeOperatorOutputPolicy::default(),
+                )
+                .await
+                .expect("start coordinated v8 peer");
+                let peer_address = peer_node
+                    .bound_sockets
+                    .iter()
+                    .copied()
+                    .find(SocketAddr::is_ipv4)
+                    .expect("coordinated v8 peer IPv4 socket");
+                let local_node = start_supervised_node_with_automatic_iroh_event_peer(
+                    NodeConfig {
+                        state: local_state,
+                        bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                        mission: local.credentials,
+                        peers: vec![MissionExpectedPeer {
+                            carrier: ExpectedPeer {
+                                id: peer_carrier,
+                                address: peer_address,
+                            },
+                            mission: peer_identity,
+                        }],
+                        mutable_interests: MutableSourceInterests::default(),
+                        sync_interval: Duration::from_secs(60),
+                        run_for: None,
+                        application: NodeApplication::Relay,
+                    },
+                    SelectedForwardingConfig::default(),
+                    NodeOperatorOutputPolicy::default(),
+                    peer_identity,
+                )
+                .await
+                .expect("start coordinated v8 local node");
+                (peer_node, local_node)
+            })
+            .await;
+
+        assert!(peer_node.open_transport_admission());
+        let automatic = local_node.automatic_event_transports();
+        let (_btle_control, _btle_attempts) = automatic
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Unavailable,
+                true,
+                DEFAULT_IROH_EVENT_PRIORITY + 1,
+            ))
+            .expect("register unavailable coordinated v8 BTLE adapter");
+        assert_eq!(
+            automatic.replace_eligibility(vec![
+                EventPeerEligibility::provisioned_exact_peer(
+                    local_node.selected_events().mission_authority(),
+                    peer_identity,
+                    EventTransportKind::IROH_QUIC_V1,
+                    true,
+                    1,
+                    0,
+                    None,
+                ),
+                EventPeerEligibility::provisioned_exact_peer(
+                    local_node.selected_events().mission_authority(),
+                    peer_identity,
+                    EventTransportKind::BLE_L2CAP_V1,
+                    true,
+                    1,
+                    0,
+                    None,
+                ),
+            ]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+        assert!(local_node.open_transport_admission());
+
+        let outcome = timeout(
+            Duration::from_secs(5),
+            automatic.run_peer_attempt(peer_identity),
+        )
+        .await
+        .expect("coordinated v8 actor contact deadline");
+        let AutomaticEventAttemptOutcome::Completed(Err(outcome)) = outcome else {
+            panic!("coordinated v8 must fail through the production actor path: {outcome:?}")
+        };
+        assert_eq!(outcome.stage(), ContactStage::AuthenticatedSession);
+        assert_eq!(
+            outcome.provenance(),
+            ContactProvenance::AuthenticatedMission
+        );
+        assert_eq!(outcome.disposition(), ContactDisposition::Suppress);
+        assert_eq!(outcome.reason(), ContactReason::ProtocolViolation);
+
+        local_node
+            .shutdown()
+            .await
+            .expect("coordinated v8 local shutdown");
+        peer_node
+            .shutdown()
+            .await
+            .expect("coordinated v8 peer shutdown");
+        fs::remove_dir_all(local_cleanup).expect("coordinated v8 local cleanup");
+        fs::remove_dir_all(peer_cleanup).expect("coordinated v8 peer cleanup");
     }
 
     #[tokio::test]
@@ -44483,7 +46695,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordered_contact_overlap_fails_closed_without_queueing() {
+    async fn ordered_contact_overlap_waits_until_terminal_admission() {
         let test_root = root("ordered-overlap");
         fs::create_dir_all(&test_root).expect("overlap state");
         #[cfg(unix)]
@@ -44528,25 +46740,29 @@ mod tests {
         .await
         .expect("first ordered contact becomes active");
 
-        let rejected = Arc::new(StalledOrderedContact::default());
-        let error = timeout(
-            Duration::from_millis(100),
-            handle.run(
-                OrderedEventContactRole::Responder,
-                rejected.clone(),
-                expectation,
-            ),
-        )
-        .await
-        .expect("overlap must fail without waiting")
-        .expect_err("overlap must be rejected");
-        assert_eq!(error.reason(), ContactReason::AdmissionBusy);
-        assert!(!error.permits_reselection());
-        assert_eq!(rejected.operations(), 0);
-        assert_eq!(rejected.closes(), 1);
+        let waiting = Arc::new(StalledOrderedContact::default());
+        let mut waiting_task = Box::pin(handle.run(
+            OrderedEventContactRole::Responder,
+            waiting.clone(),
+            expectation,
+        ));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            std::future::Future::poll(waiting_task.as_mut(), &mut context).is_pending(),
+            "the overlap queues fairly"
+        );
+        assert_eq!(waiting.operations(), 0);
+        assert_eq!(waiting.closes(), 0);
 
         node.shutdown().await.expect("overlap shutdown");
         assert!(active_task.await.expect("active ordered caller").is_err());
+        let error = waiting_task
+            .await
+            .expect_err("terminal admission rejects the queued overlap");
+        assert_eq!(error.reason(), ContactReason::AdmissionClosed);
+        assert!(!error.permits_reselection());
+        assert_eq!(waiting.operations(), 0);
+        assert_eq!(waiting.closes(), 1);
         fs::remove_dir_all(test_root).expect("overlap cleanup");
     }
 
@@ -47399,6 +49615,7 @@ mod tests {
                 automatic_event_transports: None,
                 #[cfg(unix)]
                 embedded_zeroization: None,
+                automatic_iroh_event_peer: None,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -47549,6 +49766,7 @@ mod tests {
                 automatic_event_transports: None,
                 #[cfg(unix)]
                 embedded_zeroization: None,
+                automatic_iroh_event_peer: None,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -48118,6 +50336,7 @@ mod tests {
                 automatic_event_transports: None,
                 #[cfg(unix)]
                 embedded_zeroization: None,
+                automatic_iroh_event_peer: None,
                 application_receiver,
                 application_admission,
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -48283,6 +50502,7 @@ mod tests {
                 automatic_event_transports: None,
                 #[cfg(unix)]
                 embedded_zeroization: None,
+                automatic_iroh_event_peer: None,
                 application_receiver,
                 application_admission,
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -48450,6 +50670,7 @@ mod tests {
                 automatic_event_transports: None,
                 #[cfg(unix)]
                 embedded_zeroization: None,
+                automatic_iroh_event_peer: None,
                 application_receiver,
                 application_admission,
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -49925,6 +52146,7 @@ mod tests {
                 automatic_event_transports: None,
                 #[cfg(unix)]
                 embedded_zeroization: None,
+                automatic_iroh_event_peer: None,
                 application_receiver: receiver,
                 application_admission: admission,
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -54229,6 +56451,7 @@ mod tests {
                 automatic_event_transports: None,
                 #[cfg(unix)]
                 embedded_zeroization: None,
+                automatic_iroh_event_peer: None,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 transport_admission: Arc::new(TransportAdmission::open()),

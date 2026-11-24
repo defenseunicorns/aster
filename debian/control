@@ -2,7 +2,7 @@ Source: aster
 Section: net
 Priority: optional
 Maintainer: Eugeny Shcheglov <e.shcheglov@astertech.io>
-Build-Depends: debhelper-compat (= 13), build-essential, pkg-config, python3, ca-certificates
+Build-Depends: debhelper-compat (= 13), build-essential, pkg-config, python3, ca-certificates, libdbus-1-dev
 Standards-Version: 4.6.2
 Rules-Requires-Root: no
 Homepage: https://github.com/edgesoftops/astertech
@@ -10,6 +10,7 @@ Homepage: https://github.com/edgesoftops/astertech
 Package: aster
 Architecture: amd64 arm64
 Depends: ${shlibs:Depends}, ${misc:Depends}, systemd (>= 255.4), acl, adduser
+Suggests: bluez
 Description: Aster Event agent and node
  Offline-first Event node, local ConnectRPC agent, asterctl RPC client, and stopped-service
  provisioning administration. Requires operator provisioning before startup.

@@ -5,16 +5,58 @@ mission peer per process, and semantic-v9 Event data. The transport-neutral
 node starts before its Linux/BlueZ supervisor and remains usable while BTLE is
 absent. This is evaluation, not a production deployment.
 
-This explicit-controller evaluator remains separate from the packaged agent.
-The current local agent may retain prepared optional BTLE custody and register
-a `BLE_L2CAP_V1` lane, but that lane is fixed `Unavailable`, never selected,
-and performs no BlueZ, Bluetooth, or controller work. Package sources specify
-a custody-only tmpfiles anchor; the base service does not bind the BTLE roster
-or gain `AF_BLUETOOTH` or Linux capabilities, and the package adds no BlueZ,
-D-Bus, or Polkit policy. This does not prove that the service identity cannot
-reach the system bus. The disposable-VM package assertions have not been
-executed, and this runbook does not close the automatic-controller,
-support-matrix, exact-confinement, or physical production gates.
+This explicit-controller evaluator remains separate from both the current
+source-level automatic agent composition and the packaged agent. Under
+`Normal`, the source composition can start at most one rostered operational
+epoch; the selector does not see `Available` until its listener,
+advertisement, and scan owners are ready. No controller or transport is
+required for node readiness or durable publication. See the
+[carrier guide](../transports.md#automatic-linux-btle-event-composition)
+for current policy, resolver behavior, and package status.
+
+For the exact packaged-service, rostered-discovery setup selected for the
+initial two-node evaluation, use the
+[two-node Linux BTLE procedure](btle-linux-two-node.md). This evaluator remains
+the lower-level fixed-controller and rostered diagnostic path; passing it does
+not substitute for the packaged two-node procedure.
+
+The Debian source profile can compose BTLE when complete policy and the optional
+encrypted roster credential are present; it remains unqualified. This runbook
+does not execute the package service identity or close the package-confinement,
+support-matrix, or physical qualification gates; the carrier guide records the
+specific service-profile gaps. `bluez` is only a Debian `Suggests`: Aster does
+not depend on or start it, though package managers configured to install
+suggested packages may install it.
+
+## Verify the source-level automatic composition
+
+These deterministic source tests cover automatic registration, readiness with
+an injected unavailable supervisor, injected coarse availability and loss
+propagation, shutdown ownership, and `ReceiveOnly` without using a controller
+or emitting RF. The driver resolver suite separately covers a stable empty
+controller inventory. The final focused driver test covers lifecycle
+publication of `Available` after the operational owners start:
+
+```console
+cargo test --locked -p aster-agent --features sdk-test-support btle --lib
+cargo test --locked -p aster-agent --features sdk-test-support \
+  --test customer_runtime unavailable_supervisor_keeps_node_ready_and_publication_durable
+cargo test --locked -p aster-agent --features sdk-test-support \
+  --test customer_runtime composition_boundary_propagates_availability_and_loss
+cargo test --locked -p aster-agent --features sdk-test-support \
+  --test customer_runtime runtime_shutdown_cancels_btle_before_node
+cargo test --locked -p aster-agent --features sdk-test-support \
+  --test customer_runtime receive_only_keeps_btle_unavailable_without_operational_activation
+cargo test --locked -p aster-ble-linux controller_resolver --lib
+cargo test --locked -p aster-ble-linux \
+  operational_event_path_publishes_available_once --lib
+```
+
+They do not run the Debian unit, validate the package service identity, or
+qualify hardware. The agent emits one coalesced allowlisted current-status
+record; detailed driver lifecycle edges remain internal. Do not expect status
+or logs to expose controller names, addresses, PSMs, peer IDs, credentials, or
+detailed probe state.
 
 ## Modes and limits
 
@@ -22,10 +64,10 @@ support-matrix, exact-confinement, or physical production gates.
 - `--transport rostered`: authenticated transient discovery and a
   kernel-allocated listener PSM.
 
-Modes are explicit and mutually exclusive. Failure never starts the other mode
-or an IP carrier. There is no pairing workflow, automatic controller choice,
-multi-peer operation, daemon mode, State/Record/Blob transfer, requirement
-credit, support promise, or production authorization.
+Evaluator modes are explicit and mutually exclusive. Failure never starts the
+other mode or an IP carrier. This evaluator has no pairing workflow, automatic
+controller choice, multi-peer operation, daemon mode, State/Record/Blob
+transfer, requirement credit, support promise, or production authorization.
 
 The lower complete 32-byte mission `NodeId` initiates; the higher listens. This
 Linux role rule is not protocol behavior and there is no `--role` option.
@@ -212,11 +254,18 @@ deduplication evidence.
 
 ## Evidence and claim boundary
 
-Retain source/artifact identity; Linux, kernel, BlueZ, controller/firmware, and
-driver versions; mode, address types, PSM, role, MTUs, Event size, cadence;
-availability/contact/recovery/shutdown timestamps; application receipt; and
-sanitized cleanup/resource observations. Keep addresses, mission IDs, paths,
-credentials, and payloads out of shared records.
+For an explicit evaluator run, retain source/artifact identity; OS and
+architecture, kernel and BlueZ, controller vendor/product/revision, and
+firmware/driver when exposed; mode, address-type class, role, MTUs, Event size,
+and cadence; availability/contact/recovery/shutdown timestamps; application
+receipt; and sanitized cleanup/resource observations. Keep hostname, machine
+ID, addresses, adapter names or indexes, serials, transient paths, allocated
+PSMs, mission or peer IDs, credentials, and payloads out of shared records.
+
+There is no current compatibility-report command, export, or customer-status
+surface. The field guidance above is for a future explicitly authorized manual
+evidence workflow only; it is not runtime authority and cannot create a support
+row.
 
 See the concise [Ring-1 Event](../validation/evidence/2026-11-05-cm4-btle-ring1-event-validation.md),
 [affected-kernel diagnostic](../validation/evidence/2026-11-06-cm4-btle-clean-restart-diagnostic.md),

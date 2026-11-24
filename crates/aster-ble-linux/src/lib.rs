@@ -5,6 +5,10 @@
 
 mod config;
 mod controller;
+mod controller_fingerprint;
+mod controller_probe;
+mod controller_resolver;
+mod controller_selection;
 mod discovery;
 mod discovery_record;
 mod lifecycle;
@@ -15,16 +19,25 @@ mod rostered_lifecycle;
 mod stream;
 
 pub use config::{
-    AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH, ContactLimits, ControllerConfig, DriverConfig,
+    AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH, AutomaticRosteredSupervisorConfig,
+    BTLE_EVENT_MINIMUM_DIRECTIONAL_MTU_BYTES, ContactLimits, ControllerConfig, DriverConfig,
     FixedRole, LinkConfig, OpenRequest, RING1_MAXIMUM_DEADLINE, RING1_MAXIMUM_EXCHANGE_BYTES,
     RING1_MAXIMUM_FRAME_BYTES, RosteredAdapterConfig, RosteredDiscoveryConfig,
-    RosteredSupervisorConfig, SupervisorConfig, ValidatedConfig, ValidatedContactLimits,
-    ValidatedControllerConfig, ValidatedLinkConfig, ValidatedRosteredDiscoveryConfig,
-    ValidatedRosteredSupervisorConfig, ValidatedSupervisorConfig,
+    RosteredSupervisorConfig, SupervisorConfig, ValidatedAutomaticRosteredSupervisorConfig,
+    ValidatedConfig, ValidatedContactLimits, ValidatedControllerConfig, ValidatedLinkConfig,
+    ValidatedRosteredDiscoveryConfig, ValidatedRosteredSupervisorConfig, ValidatedSupervisorConfig,
 };
 pub use controller::{
-    AvailabilityReason, BTLE_OPERATOR_OUTPUT_CAPACITY, BtleAvailability, BtleOperatorEvent,
-    BtleOperatorOutput,
+    AvailabilityReason, BTLE_OPERATOR_OUTPUT_CAPACITY, BtleAvailability, BtleCurrentStatus,
+    BtleOperatorEvent, BtleOperatorOutput, BtleSupport,
+};
+pub use controller_probe::ControllerProbeLimits;
+pub(crate) use controller_selection::{
+    ControllerAdmission, ControllerCandidate, ControllerSnapshot, ProbeDisposition, ProbeReason,
+    SupportTag,
+};
+pub use controller_selection::{
+    ControllerAdmissionPolicy, ControllerFingerprint, ControllerSupportRow, ControllerUnsafeRule,
 };
 pub use discovery::{
     AttemptKind, CanonicalLocator, CanonicalLocatorError, DiscoveryAdmission, DiscoveryCandidate,
@@ -41,10 +54,11 @@ pub use platform::{
     BluezSocketFactory, OpenFuture, OpenedContact, SocketFactory, open_contact,
     open_contact_with_factory,
 };
+pub(crate) use policy::LifecycleCancellation;
 pub use rostered_lifecycle::{
     AutomaticBtleRegistrationError, LinuxRosteredBtleEventSupervisor,
-    spawn_automatic_linux_rostered_btle_event_supervisor,
     spawn_linux_rostered_btle_event_supervisor,
+    spawn_resolving_linux_rostered_btle_event_supervisor,
 };
 pub use stream::{NegotiatedMtu, SocketOpen};
 
@@ -74,7 +88,7 @@ pub enum DriverErrorKind {
     Cancelled,
     /// An unexpected transport or BlueZ failure occurred.
     Transport,
-    /// A listener rejected a connection from a non-provisioned locator.
+    /// An unauthenticated connection failed local peer or link admission.
     PeerRejected,
 }
 

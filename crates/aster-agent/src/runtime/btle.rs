@@ -4,6 +4,29 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(any(feature = "systemd-provider", test))]
+use std::time::Duration;
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+const BTLE_STATUS_CONSUMER_JOIN_DEADLINE: Duration = Duration::from_secs(1);
+
+#[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+mod schedule;
+
+#[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+use aster_ble_linux::{
+    AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH, AutomaticRosteredSupervisorConfig, ContactLimits,
+    ControllerAdmissionPolicy, ControllerProbeLimits, DiscoveryCredential, DiscoveryGeneration,
+    DiscoverySecret, FixedRole, LeasedDiscoveryCredentialSet, RING1_MAXIMUM_DEADLINE,
+    RING1_MAXIMUM_EXCHANGE_BYTES, RING1_MAXIMUM_FRAME_BYTES, RosteredDiscoveryConfig,
+    ValidatedAutomaticRosteredSupervisorConfig,
+};
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+use aster_ble_linux::{
+    LinuxRosteredBtleEventSupervisor, spawn_resolving_linux_rostered_btle_event_supervisor,
+};
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+use aster_host::DiscoveryCredentialMaterialParts;
 #[cfg(feature = "systemd-provider")]
 use aster_host::{
     ActiveDiscoveryCredentialAuthority, DiscoveryCredentialArtifactProvider,
@@ -11,17 +34,18 @@ use aster_host::{
 };
 #[cfg(feature = "sdk-test-support")]
 use aster_node::RunningAutomaticEventTransportHandle;
-use aster_node::RunningNode;
-#[cfg(any(feature = "systemd-provider", feature = "sdk-test-support"))]
+#[cfg(any(test, feature = "sdk-test-support", feature = "systemd-provider"))]
 use aster_node::{
     EventAdapterControl, EventAdapterSnapshot, EventAdapterState, EventAttemptReceiver,
-    EventTransportKind,
 };
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+use aster_node::{EventAdapterRegistration, EventEmissionPolicy, OrderedEventContactHandle};
+use aster_node::{EventPeerEligibility, EventTransportKind, RunningNode};
+#[cfg(feature = "systemd-provider")]
+use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use tokio::task::JoinHandle;
 
-#[cfg(any(feature = "systemd-provider", feature = "sdk-test-support"))]
-use super::{LifecycleState, emit_lifecycle};
 use crate::config::ValidatedBtlePolicy;
 
 /// Fixed failure categories for the BTLE-specific runtime owner.
@@ -29,11 +53,11 @@ use crate::config::ValidatedBtlePolicy;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BtleRuntimeOwnerError {
     /// The owner could not be created after node startup.
-    #[cfg(any(feature = "systemd-provider", feature = "sdk-test-support", test))]
     Startup,
     /// The active owner could not confirm bounded cleanup.
-    #[cfg(any(feature = "sdk-test-support", test))]
     Cleanup,
+    /// The immutable credential epoch ended cleanly and requires process restart.
+    RestartRequired,
 }
 
 impl fmt::Display for BtleRuntimeOwnerError {
@@ -43,6 +67,13 @@ impl fmt::Display for BtleRuntimeOwnerError {
 }
 
 impl Error for BtleRuntimeOwnerError {}
+
+#[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+type EventScheduleRole = FixedRole;
+
+#[cfg(not(all(target_os = "linux", feature = "systemd-provider")))]
+#[derive(Clone, Copy)]
+enum EventScheduleRole {}
 
 /// Active BTLE-specific lifecycle owned by the agent process.
 ///
@@ -61,15 +92,57 @@ pub trait BtleRuntimeOwner: Send {
     /// blocking or performing platform I/O.
     fn cancel(&self);
 
+    /// Fences and publishes the adapter unavailable before authority cleanup.
+    /// Owners without an availability publisher are already unavailable.
+    fn park_unavailable(&self) -> Result<(), BtleRuntimeOwnerError> {
+        Ok(())
+    }
+
+    /// Fences and publishes discovery-authority loss before cleanup.
+    fn park_authority_unavailable(&self) -> Result<(), BtleRuntimeOwnerError> {
+        self.park_unavailable()
+    }
+
     /// Consumes the owner and joins its bounded cleanup path.
     fn join(self: Box<Self>) -> BoxFuture<'static, Result<(), BtleRuntimeOwnerError>>;
 }
 
-type BtleRuntimeStart = Box<
-    dyn FnOnce(&RunningNode) -> Result<Box<dyn BtleRuntimeOwner>, BtleRuntimeOwnerError> + Send,
+struct StartedBtleRuntime {
+    owner: Box<dyn BtleRuntimeOwner>,
+    schedule_role: Option<EventScheduleRole>,
+}
+
+impl StartedBtleRuntime {
+    fn without_schedule(owner: Box<dyn BtleRuntimeOwner>) -> Self {
+        Self {
+            owner,
+            schedule_role: None,
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+    fn with_event_schedule(owner: Box<dyn BtleRuntimeOwner>, role: FixedRole) -> Self {
+        Self {
+            owner,
+            schedule_role: Some(role),
+        }
+    }
+}
+
+type BtleRuntimeStart =
+    Box<dyn FnOnce(&RunningNode) -> Result<StartedBtleRuntime, BtleRuntimeOwnerError> + Send>;
+
+#[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+type AutomaticLinuxSupervisorStart = Box<
+    dyn FnOnce(
+            ValidatedAutomaticRosteredSupervisorConfig,
+            OrderedEventContactHandle,
+            EventAdapterRegistration,
+        ) -> Result<Box<dyn BtleRuntimeOwner>, BtleRuntimeOwnerError>
+        + Send,
 >;
 
-#[cfg(any(feature = "systemd-provider", feature = "sdk-test-support"))]
+#[cfg(feature = "sdk-test-support")]
 type PreparedNodeValidation<P> =
     Box<dyn FnOnce(&P, &RunningNode) -> Result<(), BtleRuntimeOwnerError> + Send>;
 
@@ -91,7 +164,7 @@ type PreparedNodeValidation<P> =
 /// use std::path::Path;
 ///
 /// fn cannot_bypass_prepared_authority(policy: ValidatedBtlePolicy) {
-///     let _ = BtleRuntimeStartup::radio_inert((), policy, Path::new("/var/lib/aster-agent"));
+///     let _ = BtleRuntimeStartup::automatic_linux((), policy, Path::new("/var/lib/aster-agent"));
 /// }
 /// ```
 #[cfg_attr(
@@ -105,6 +178,7 @@ pub struct BtleRuntimeStartup {
     policy: Option<ValidatedBtlePolicy>,
     authority_state_root: Option<PathBuf>,
     start: Option<BtleRuntimeStart>,
+    installs_peer_eligibility: bool,
     #[cfg(feature = "sdk-test-support")]
     node_shutdown_observer: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     #[cfg(feature = "sdk-test-support")]
@@ -118,6 +192,7 @@ impl BtleRuntimeStartup {
             policy: None,
             authority_state_root: None,
             start: None,
+            installs_peer_eligibility: false,
             #[cfg(feature = "sdk-test-support")]
             node_shutdown_observer: None,
             #[cfg(feature = "sdk-test-support")]
@@ -144,7 +219,9 @@ impl BtleRuntimeStartup {
             authority_state_root: None,
             start: Some(Box::new(move |node| {
                 start(prepared, node.automatic_event_transports())
+                    .map(StartedBtleRuntime::without_schedule)
             })),
+            installs_peer_eligibility: false,
             node_shutdown_observer: None,
             cleanup_retired_observer: None,
         }
@@ -173,12 +250,9 @@ impl BtleRuntimeStartup {
         self
     }
 
-    /// Validates the prepared credential's policy/state binding, immediately
-    /// retires its unused key material, and retains exclusive authority custody
-    /// in a radio-inert owner. This is the only enabled profile until qualified
-    /// automatic controller selection and confinement are composed.
-    #[cfg(feature = "systemd-provider")]
-    pub fn radio_inert<L, C>(
+    /// Composes the production automatic Linux BTLE owner.
+    #[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+    pub fn automatic_linux<L, C>(
         prepared: PreparedDiscoveryCredential<L, C>,
         policy: ValidatedBtlePolicy,
         state_root: &Path,
@@ -187,37 +261,68 @@ impl BtleRuntimeStartup {
         L: DiscoveryCredentialArtifactProvider + Send + 'static,
         C: TrustedClock + Send + 'static,
     {
-        if !prepared
-            .matches_binding(*policy.deployment_scope_id(), state_root)
-            .map_err(|_| BtleRuntimeOwnerError::Startup)?
-        {
-            return Err(BtleRuntimeOwnerError::Startup);
-        }
-        let scope = *policy.deployment_scope_id();
-        let authority = prepared.retire_material();
-        let validate: PreparedNodeValidation<ActiveDiscoveryCredentialAuthority<L, C>> =
-            Box::new(move |authority, node| {
-                if authority
-                    .matches_pinned_binding(scope, node.state_root())
-                    .map_err(|_| BtleRuntimeOwnerError::Startup)?
-                {
-                    Ok(())
-                } else {
-                    Err(BtleRuntimeOwnerError::Startup)
-                }
-            });
-        Ok(Self::radio_inert_inner(
-            authority,
+        Self::automatic_linux_inner(
+            prepared,
             policy,
-            Some(state_root.to_path_buf()),
-            Some(validate),
+            state_root,
+            Box::new(|config, contacts, registration| {
+                let (supervisor, status) = spawn_resolving_linux_rostered_btle_event_supervisor(
+                    config,
+                    contacts,
+                    registration,
+                )
+                .map_err(|_| BtleRuntimeOwnerError::Startup)?;
+                Ok(Box::new(LinuxSupervisorRuntimeOwner::start(
+                    supervisor, status,
+                )))
+            }),
             #[cfg(feature = "sdk-test-support")]
             None,
-        ))
+        )
     }
 
-    /// Creates the exact production radio-inert owner plus its real selector
-    /// handle for integration observation.
+    /// Composes the production boundary with a deterministic test supervisor.
+    #[cfg(all(
+        feature = "sdk-test-support",
+        feature = "systemd-provider",
+        target_os = "linux"
+    ))]
+    #[doc(hidden)]
+    pub fn automatic_linux_with_test_supervisor<L, C, F>(
+        prepared: PreparedDiscoveryCredential<L, C>,
+        policy: ValidatedBtlePolicy,
+        state_root: &Path,
+        start_supervisor: F,
+    ) -> Result<
+        (
+            Self,
+            tokio::sync::oneshot::Receiver<RunningAutomaticEventTransportHandle>,
+        ),
+        BtleRuntimeOwnerError,
+    >
+    where
+        L: DiscoveryCredentialArtifactProvider + Send + 'static,
+        C: TrustedClock + Send + 'static,
+        F: FnOnce(
+                ValidatedAutomaticRosteredSupervisorConfig,
+                OrderedEventContactHandle,
+                EventAdapterRegistration,
+            ) -> Result<Box<dyn BtleRuntimeOwner>, BtleRuntimeOwnerError>
+            + Send
+            + 'static,
+    {
+        let (observe, observed) = tokio::sync::oneshot::channel();
+        let startup = Self::automatic_linux_inner(
+            prepared,
+            policy,
+            state_root,
+            Box::new(start_supervisor),
+            Some(observe),
+        )?;
+        Ok((startup, observed))
+    }
+
+    /// Creates a test-only unavailable owner plus its real selector handle.
     #[cfg(feature = "sdk-test-support")]
     #[doc(hidden)]
     pub fn radio_inert_with_test_observer<P>(
@@ -237,7 +342,106 @@ impl BtleRuntimeStartup {
         )
     }
 
-    #[cfg(any(feature = "systemd-provider", feature = "sdk-test-support"))]
+    #[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+    fn automatic_linux_inner<L, C>(
+        prepared: PreparedDiscoveryCredential<L, C>,
+        policy: ValidatedBtlePolicy,
+        state_root: &Path,
+        start_supervisor: AutomaticLinuxSupervisorStart,
+        #[cfg(feature = "sdk-test-support")] observer: Option<
+            tokio::sync::oneshot::Sender<RunningAutomaticEventTransportHandle>,
+        >,
+    ) -> Result<Self, BtleRuntimeOwnerError>
+    where
+        L: DiscoveryCredentialArtifactProvider + Send + 'static,
+        C: TrustedClock + Send + 'static,
+    {
+        let scope = *policy.deployment_scope_id();
+        if !prepared
+            .matches_binding(scope, state_root)
+            .map_err(|_| BtleRuntimeOwnerError::Startup)?
+        {
+            return Err(BtleRuntimeOwnerError::Startup);
+        }
+        let configured_priority = policy.configured_priority();
+        let authority_state_root = state_root.to_path_buf();
+        Ok(Self {
+            policy: Some(policy),
+            authority_state_root: Some(authority_state_root),
+            start: Some(Box::new(move |node| {
+                let automatic = node.automatic_event_transports();
+                let registration = automatic
+                    .register_paired(EventAdapterSnapshot::new(
+                        EventTransportKind::BLE_L2CAP_V1,
+                        AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH,
+                        EventAdapterState::Unavailable,
+                        true,
+                        configured_priority,
+                    ))
+                    .ok_or(BtleRuntimeOwnerError::Startup)?;
+                if matches!(policy.emission_policy(), EventEmissionPolicy::ReceiveOnly) {
+                    let authority = prepared.retire_material();
+                    validate_active_authority(&authority, scope, node)?;
+                    let (_, adapter, attempts) = registration.into_parts();
+                    #[cfg(feature = "sdk-test-support")]
+                    if let Some(observer) = observer {
+                        let _ = observer.send(automatic);
+                    }
+                    super::emit_btle_status(receive_only_status());
+                    let owner = unavailable_owner(adapter, attempts, ());
+                    return Ok(StartedBtleRuntime::without_schedule(Box::new(
+                        AuthorityBtleRuntimeOwner::start(owner, policy, authority),
+                    )));
+                }
+
+                let (material, authority) = prepared.into_parts();
+                validate_active_authority(&authority, scope, node)?;
+                let credentials = adopt_discovery_credentials(material)?;
+                let selected_events = node.selected_events();
+                let config = AutomaticRosteredSupervisorConfig {
+                    controller_policy: ControllerAdmissionPolicy::default(),
+                    controller_probe_limits: ControllerProbeLimits::new(
+                        Duration::from_secs(1),
+                        Duration::from_secs(2),
+                        Duration::from_secs(8),
+                    ),
+                    discovery: RosteredDiscoveryConfig { credentials },
+                    local_mission_id: selected_events.identity(),
+                    local_mission_authority_id: selected_events.mission_authority(),
+                    peer_mission_id: policy.peer(),
+                    contact_cadence: schedule::EVENT_CONTACT_CADENCE,
+                    contact_limits: ContactLimits {
+                        maximum_frame_bytes: RING1_MAXIMUM_FRAME_BYTES,
+                        maximum_exchange_bytes: RING1_MAXIMUM_EXCHANGE_BYTES,
+                        open_timeout: Duration::from_secs(5),
+                        operation_timeout: RING1_MAXIMUM_DEADLINE,
+                    },
+                }
+                .validate()
+                .map_err(|_| BtleRuntimeOwnerError::Startup)?;
+                let role = config.role();
+                let supervisor =
+                    start_supervisor(config, node.ordered_event_contacts(), registration)?;
+                #[cfg(feature = "sdk-test-support")]
+                if let Some(observer) = observer {
+                    let _ = observer.send(automatic);
+                }
+                Ok(StartedBtleRuntime::with_event_schedule(
+                    Box::new(AuthorityBtleRuntimeOwner::start(
+                        supervisor, policy, authority,
+                    )),
+                    role,
+                ))
+            })),
+            installs_peer_eligibility: true,
+            #[cfg(feature = "sdk-test-support")]
+            node_shutdown_observer: None,
+            #[cfg(feature = "sdk-test-support")]
+            cleanup_retired_observer: None,
+        })
+    }
+
+    #[cfg(feature = "sdk-test-support")]
     fn radio_inert_inner<P>(
         prepared: P,
         policy: ValidatedBtlePolicy,
@@ -273,23 +477,13 @@ impl BtleRuntimeStartup {
                 if let Some(observer) = observer {
                     let _ = observer.send(automatic);
                 }
-                let (completion_send, completion) = tokio::sync::watch::channel(false);
-                emit_lifecycle(
-                    LifecycleState::Starting,
-                    "btle_availability",
-                    "unqualified_package",
-                    false,
-                    503,
-                );
-                Ok(Box::new(RadioInertBtleRuntimeOwner {
-                    _adapter_registration: adapter,
-                    _attempt_mailbox: attempts,
-                    _completion_guard: completion_send,
-                    completion,
-                    _policy_authority: policy,
-                    _authority_guard: prepared,
-                }))
+                Ok(StartedBtleRuntime::without_schedule(unavailable_owner(
+                    adapter,
+                    attempts,
+                    (policy, prepared),
+                )))
             })),
+            installs_peer_eligibility: false,
             #[cfg(feature = "sdk-test-support")]
             node_shutdown_observer: None,
             #[cfg(feature = "sdk-test-support")]
@@ -321,17 +515,39 @@ impl BtleRuntimeStartup {
         node: &RunningNode,
     ) -> Result<ActiveBtleRuntime, BtleRuntimeOwnerError> {
         let Self {
-            policy: _,
+            policy,
             authority_state_root: _,
             start,
+            installs_peer_eligibility,
             #[cfg(feature = "sdk-test-support")]
             node_shutdown_observer,
             #[cfg(feature = "sdk-test-support")]
             cleanup_retired_observer,
         } = self;
-        let owner = start.map(|start| start(node)).transpose()?;
+        let started = start.map(|start| start(node)).transpose()?;
+        let (owner, schedule_role) = started.map_or((None, None), |started| {
+            (Some(started.owner), started.schedule_role)
+        });
+        let eligibility = policy
+            .filter(|_| installs_peer_eligibility)
+            .zip(schedule_role)
+            .map(|(policy, role)| {
+                let mission = node.selected_events().mission_authority();
+                let entries = automatic_event_peer_eligibility(
+                    mission,
+                    policy.peer(),
+                    node.automatic_iroh_event_peer() == Some(policy.peer()),
+                );
+                PendingAutomaticEventRoster {
+                    automatic: node.automatic_event_transports(),
+                    peer: policy.peer(),
+                    role,
+                    entries,
+                }
+            });
         Ok(ActiveBtleRuntime::new(
             owner,
+            eligibility,
             #[cfg(feature = "sdk-test-support")]
             node_shutdown_observer,
             #[cfg(feature = "sdk-test-support")]
@@ -340,11 +556,101 @@ impl BtleRuntimeStartup {
     }
 }
 
+fn automatic_event_peer_eligibility(
+    mission: aster_mesh::NodeId,
+    peer: aster_mesh::NodeId,
+    include_iroh: bool,
+) -> Vec<EventPeerEligibility> {
+    let mut entries = vec![EventPeerEligibility::provisioned_exact_peer(
+        mission,
+        peer,
+        EventTransportKind::BLE_L2CAP_V1,
+        true,
+        1,
+        0,
+        None,
+    )];
+    if include_iroh {
+        entries.push(EventPeerEligibility::provisioned_exact_peer(
+            mission,
+            peer,
+            EventTransportKind::IROH_QUIC_V1,
+            true,
+            1,
+            0,
+            None,
+        ));
+    }
+    entries
+}
+
+struct PendingAutomaticEventRoster {
+    automatic: aster_node::RunningAutomaticEventTransportHandle,
+    entries: Vec<EventPeerEligibility>,
+    peer: aster_mesh::NodeId,
+    role: EventScheduleRole,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventScheduleExit {
+    AdmissionClosed,
+    PeerUnavailable,
+}
+
+impl PendingAutomaticEventRoster {
+    fn install(self) -> Result<InstalledAutomaticEventSchedule, BtleRuntimeOwnerError> {
+        let Self {
+            automatic,
+            entries,
+            peer,
+            role,
+        } = self;
+        automatic
+            .replace_eligibility(entries)
+            .ok_or(BtleRuntimeOwnerError::Startup)?;
+        Ok(InstalledAutomaticEventSchedule {
+            automatic,
+            peer,
+            role,
+        })
+    }
+}
+
+struct InstalledAutomaticEventSchedule {
+    automatic: aster_node::RunningAutomaticEventTransportHandle,
+    peer: aster_mesh::NodeId,
+    role: EventScheduleRole,
+}
+
+impl InstalledAutomaticEventSchedule {
+    fn start(self) -> Option<JoinHandle<EventScheduleExit>> {
+        let Self {
+            automatic,
+            peer,
+            role,
+        } = self;
+        #[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+        {
+            schedule::spawn_event_schedule(automatic, peer, role)
+        }
+        #[cfg(not(all(target_os = "linux", feature = "systemd-provider")))]
+        {
+            let _ = (automatic, peer, role);
+            None
+        }
+    }
+}
+
 /// Running BTLE owner and its terminal signal, kept together so orchestration
 /// cannot cancel, join, or observe one without the other.
 pub(super) struct ActiveBtleRuntime {
     owner: Option<Box<dyn BtleRuntimeOwner>>,
     completion: Option<tokio::sync::watch::Receiver<bool>>,
+    eligibility: Option<PendingAutomaticEventRoster>,
+    schedule_start: Option<InstalledAutomaticEventSchedule>,
+    schedule: Option<JoinHandle<EventScheduleExit>>,
+    unexpected_schedule_exit: bool,
+    cleanup_runtime: Option<tokio::runtime::Handle>,
     #[cfg(feature = "sdk-test-support")]
     node_shutdown_observer: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     #[cfg(feature = "sdk-test-support")]
@@ -356,6 +662,11 @@ impl ActiveBtleRuntime {
         Self {
             owner: None,
             completion: None,
+            eligibility: None,
+            schedule_start: None,
+            schedule: None,
+            unexpected_schedule_exit: false,
+            cleanup_runtime: None,
             #[cfg(feature = "sdk-test-support")]
             node_shutdown_observer: None,
             #[cfg(feature = "sdk-test-support")]
@@ -365,6 +676,7 @@ impl ActiveBtleRuntime {
 
     fn new(
         owner: Option<Box<dyn BtleRuntimeOwner>>,
+        eligibility: Option<PendingAutomaticEventRoster>,
         #[cfg(feature = "sdk-test-support")] node_shutdown_observer: Option<
             std::sync::Arc<dyn Fn() + Send + Sync>,
         >,
@@ -376,6 +688,11 @@ impl ActiveBtleRuntime {
         Self {
             owner,
             completion,
+            eligibility,
+            schedule_start: None,
+            schedule: None,
+            unexpected_schedule_exit: false,
+            cleanup_runtime: tokio::runtime::Handle::try_current().ok(),
             #[cfg(feature = "sdk-test-support")]
             node_shutdown_observer,
             #[cfg(feature = "sdk-test-support")]
@@ -387,18 +704,77 @@ impl ActiveBtleRuntime {
         self.completion.is_some()
     }
 
+    pub(super) fn install_eligibility(&mut self) -> Result<(), BtleRuntimeOwnerError> {
+        if self.schedule_start.is_some() || self.schedule.is_some() {
+            return Ok(());
+        }
+        let Some(eligibility) = self.eligibility.take() else {
+            return Ok(());
+        };
+        self.schedule_start = Some(eligibility.install()?);
+        Ok(())
+    }
+
+    pub(super) fn start_schedule(&mut self) {
+        if self.schedule.is_none()
+            && let Some(schedule) = self.schedule_start.take()
+        {
+            self.schedule = schedule.start();
+        }
+    }
+
     pub(super) fn is_terminal(&mut self) -> bool {
-        completion_is_terminal_after_read(&mut self.completion, || {})
+        if self.unexpected_schedule_exit {
+            return true;
+        }
+        if completion_is_terminal_after_read(&mut self.completion, || {}) {
+            return true;
+        }
+        false
     }
 
     pub(super) async fn wait_terminal(&mut self) {
-        let Some(completion) = self.completion.as_mut() else {
-            std::future::pending::<()>().await;
-            return;
-        };
+        enum TerminalObservation {
+            Owner(bool),
+            Schedule(Result<EventScheduleExit, tokio::task::JoinError>),
+        }
+
         loop {
-            if *completion.borrow_and_update() || completion.changed().await.is_err() {
+            if self.is_terminal() {
                 return;
+            }
+            let observation = {
+                let completion = &mut self.completion;
+                let schedule = &mut self.schedule;
+                tokio::select! {
+                    biased;
+                    owner_terminal = async {
+                        let Some(completion) = completion.as_mut() else {
+                            return std::future::pending::<bool>().await;
+                        };
+                        if *completion.borrow_and_update() {
+                            return true;
+                        }
+                        completion.changed().await.is_err() || *completion.borrow_and_update()
+                    } => TerminalObservation::Owner(owner_terminal),
+                    result = async {
+                        let Some(schedule) = schedule.as_mut() else {
+                            return std::future::pending().await;
+                        };
+                        schedule.await
+                    } => TerminalObservation::Schedule(result),
+                }
+            };
+            match observation {
+                TerminalObservation::Owner(true) => return,
+                TerminalObservation::Owner(false) => {}
+                TerminalObservation::Schedule(result) => {
+                    self.schedule.take();
+                    if !matches!(result, Ok(EventScheduleExit::AdmissionClosed)) {
+                        self.unexpected_schedule_exit = true;
+                        return;
+                    }
+                }
             }
         }
     }
@@ -406,10 +782,45 @@ impl ActiveBtleRuntime {
     pub(super) fn begin_cleanup(
         &mut self,
     ) -> Option<JoinHandle<Result<(), BtleRuntimeOwnerError>>> {
-        let owner = self.owner.take()?;
-        Some(tokio::spawn(async move {
+        let schedule = self.schedule.take();
+        let had_schedule = schedule.is_some();
+        let unexpected_schedule_exit = self.unexpected_schedule_exit;
+        let owner = self.owner.take();
+        if !had_schedule && let Some(owner) = &owner {
             owner.cancel();
-            owner.join().await
+        }
+        if !had_schedule && owner.is_none() && !unexpected_schedule_exit {
+            return None;
+        }
+        let custody = tokio::spawn(async move {
+            let schedule_clean = if unexpected_schedule_exit {
+                if let Some(schedule) = schedule {
+                    let _ = schedule.await;
+                }
+                false
+            } else {
+                stop_event_schedule(schedule).await
+            };
+            if had_schedule && let Some(owner) = &owner {
+                owner.cancel();
+            }
+            let owner = match owner {
+                Some(owner) => owner.join().await,
+                None => Ok(()),
+            };
+            if schedule_clean {
+                owner
+            } else {
+                Err(BtleRuntimeOwnerError::Cleanup)
+            }
+        });
+        // The inner task owns custody; the returned task is only an abortable result waiter.
+        Some(tokio::spawn(async move {
+            match custody.await {
+                Ok(result) => result,
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                Err(_) => Err(BtleRuntimeOwnerError::Cleanup),
+            }
         }))
     }
 
@@ -423,6 +834,55 @@ impl ActiveBtleRuntime {
         &self,
     ) -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
         self.cleanup_retired_observer.clone()
+    }
+}
+
+impl Drop for ActiveBtleRuntime {
+    fn drop(&mut self) {
+        let schedule = self.schedule.take();
+        let had_schedule = schedule.is_some();
+        let owner = self.owner.take();
+        let cleanup_runtime = self
+            .cleanup_runtime
+            .take()
+            .or_else(|| tokio::runtime::Handle::try_current().ok());
+        if let Some(owner) = &owner {
+            let _ = owner.park_unavailable();
+            if !had_schedule {
+                owner.cancel();
+            }
+        }
+        if let Some(runtime) = cleanup_runtime {
+            runtime.spawn(async move {
+                let _ = stop_event_schedule(schedule).await;
+                if had_schedule && let Some(owner) = &owner {
+                    owner.cancel();
+                }
+                if let Some(owner) = owner {
+                    let _ = owner.join().await;
+                }
+            });
+        } else if let Some(owner) = owner {
+            if let Some(schedule) = schedule {
+                schedule.abort();
+            }
+            std::mem::forget(owner);
+        }
+    }
+}
+
+async fn stop_event_schedule(schedule: Option<JoinHandle<EventScheduleExit>>) -> bool {
+    let Some(schedule) = schedule else {
+        return true;
+    };
+    if schedule.is_finished() {
+        return matches!(schedule.await, Ok(EventScheduleExit::AdmissionClosed));
+    }
+    schedule.abort();
+    match schedule.await {
+        Ok(EventScheduleExit::AdmissionClosed) => true,
+        Ok(EventScheduleExit::PeerUnavailable) => false,
+        Err(error) => error.is_cancelled(),
     }
 }
 
@@ -447,18 +907,435 @@ pub(super) fn completion_is_terminal_after_read(
     }
 }
 
-#[cfg(any(feature = "systemd-provider", feature = "sdk-test-support"))]
-struct RadioInertBtleRuntimeOwner<P> {
+#[cfg(feature = "systemd-provider")]
+fn validate_active_authority<L, C>(
+    authority: &ActiveDiscoveryCredentialAuthority<L, C>,
+    scope: [u8; 32],
+    node: &RunningNode,
+) -> Result<(), BtleRuntimeOwnerError>
+where
+    L: DiscoveryCredentialArtifactProvider,
+    C: TrustedClock,
+{
+    if authority
+        .matches_pinned_binding(scope, node.state_root())
+        .map_err(|_| BtleRuntimeOwnerError::Startup)?
+    {
+        Ok(())
+    } else {
+        Err(BtleRuntimeOwnerError::Startup)
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+fn adopt_discovery_credentials(
+    material: DiscoveryCredentialMaterialParts,
+) -> Result<LeasedDiscoveryCredentialSet, BtleRuntimeOwnerError> {
+    let (emitting, overlap, expires_at) = material.into_adapter_parts();
+    let emitting = adopt_discovery_credential(emitting)?;
+    let overlap = overlap.map(adopt_discovery_credential).transpose()?;
+    LeasedDiscoveryCredentialSet::new(emitting, overlap, expires_at)
+        .map_err(|_| BtleRuntimeOwnerError::Startup)
+}
+
+#[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+fn adopt_discovery_credential(
+    (generation, secret): (u32, zeroize::Zeroizing<[u8; 32]>),
+) -> Result<DiscoveryCredential, BtleRuntimeOwnerError> {
+    let generation =
+        DiscoveryGeneration::new(generation).map_err(|_| BtleRuntimeOwnerError::Startup)?;
+    let secret =
+        DiscoverySecret::from_zeroizing(secret).map_err(|_| BtleRuntimeOwnerError::Startup)?;
+    Ok(DiscoveryCredential::new(generation, secret))
+}
+
+#[cfg(feature = "systemd-provider")]
+// A one-minute sample bounds detection well inside the authority's five-minute
+// wall/monotonic divergence allowance without making clock reads a hot path.
+const BTLE_CLOCK_CONTINUITY_INTERVAL: Duration = Duration::from_secs(60);
+
+#[cfg(feature = "systemd-provider")]
+trait DiscoveryAuthorityContinuity: Send {
+    fn resample_clock(&mut self) -> Result<(), ()>;
+}
+
+#[cfg(feature = "systemd-provider")]
+impl<L, C> DiscoveryAuthorityContinuity for ActiveDiscoveryCredentialAuthority<L, C>
+where
+    L: DiscoveryCredentialArtifactProvider + Send,
+    C: TrustedClock + Send,
+{
+    fn resample_clock(&mut self) -> Result<(), ()> {
+        ActiveDiscoveryCredentialAuthority::resample_clock(self).map_err(|_| ())
+    }
+}
+
+#[cfg(feature = "systemd-provider")]
+struct AuthorityBtleRuntimeOwner {
+    cancellation: tokio::sync::watch::Sender<bool>,
+    completion: tokio::sync::watch::Receiver<bool>,
+    supervisor: std::sync::Arc<RuntimeOwnerCustody>,
+    task: Option<JoinHandle<Result<(), BtleRuntimeOwnerError>>>,
+}
+
+#[cfg(feature = "systemd-provider")]
+struct RuntimeOwnerCustody(std::sync::Mutex<Option<Box<dyn BtleRuntimeOwner>>>);
+
+#[cfg(feature = "systemd-provider")]
+impl AuthorityBtleRuntimeOwner {
+    fn start<A>(
+        supervisor: Box<dyn BtleRuntimeOwner>,
+        policy: ValidatedBtlePolicy,
+        authority: A,
+    ) -> Self
+    where
+        A: DiscoveryAuthorityContinuity + 'static,
+    {
+        Self::start_with_interval(
+            supervisor,
+            policy,
+            Box::new(authority),
+            BTLE_CLOCK_CONTINUITY_INTERVAL,
+        )
+    }
+
+    fn start_with_interval<P>(
+        supervisor: Box<dyn BtleRuntimeOwner>,
+        policy: P,
+        mut authority: Box<dyn DiscoveryAuthorityContinuity>,
+        interval: Duration,
+    ) -> Self
+    where
+        P: Send + 'static,
+    {
+        let (cancellation, mut cancellation_observer) = tokio::sync::watch::channel(false);
+        let (completion_guard, completion) = tokio::sync::watch::channel(false);
+        let mut supervisor_completion = supervisor.completion();
+        let supervisor =
+            std::sync::Arc::new(RuntimeOwnerCustody(std::sync::Mutex::new(Some(supervisor))));
+        let task_supervisor = supervisor.clone();
+        let task = tokio::spawn(async move {
+            let _completion = RuntimeCompletionOnDrop(completion_guard);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = wait_for_runtime_cancellation(&mut cancellation_observer) => {
+                        let supervisor = task_supervisor.take();
+                        supervisor.cancel();
+                        let result = join_runtime_owner(supervisor).await;
+                        drop((policy, authority));
+                        return result;
+                    }
+                    () = wait_for_runtime_completion(&mut supervisor_completion) => {
+                        let supervisor = task_supervisor.take();
+                        supervisor.cancel();
+                        let result = join_runtime_owner(supervisor).await;
+                        drop((policy, authority));
+                        return match result {
+                            Err(BtleRuntimeOwnerError::RestartRequired) => result,
+                            Ok(()) | Err(_) => Err(BtleRuntimeOwnerError::Cleanup),
+                        };
+                    }
+                    () = tokio::time::sleep(interval) => {
+                        if authority.resample_clock().is_ok() {
+                            continue;
+                        }
+                        let supervisor = task_supervisor.take();
+                        let publication = supervisor.park_authority_unavailable();
+                        supervisor.cancel();
+                        let cleanup = join_runtime_owner(supervisor).await;
+                        let parked_result = publication.and(cleanup);
+                        wait_for_runtime_cancellation(&mut cancellation_observer).await;
+                        drop((policy, authority));
+                        return parked_result;
+                    }
+                }
+            }
+        });
+        Self {
+            cancellation,
+            completion,
+            supervisor,
+            task: Some(task),
+        }
+    }
+}
+
+#[cfg(feature = "systemd-provider")]
+impl BtleRuntimeOwner for AuthorityBtleRuntimeOwner {
+    fn completion(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.completion.clone()
+    }
+
+    fn cancel(&self) {
+        self.supervisor.cancel();
+        self.cancellation.send_replace(true);
+    }
+
+    fn park_unavailable(&self) -> Result<(), BtleRuntimeOwnerError> {
+        self.supervisor.park_unavailable()
+    }
+
+    fn park_authority_unavailable(&self) -> Result<(), BtleRuntimeOwnerError> {
+        self.supervisor.park_authority_unavailable()
+    }
+
+    fn join(mut self: Box<Self>) -> BoxFuture<'static, Result<(), BtleRuntimeOwnerError>> {
+        self.cancel();
+        let task = self.task.take().expect("authority monitor task retained");
+        Box::pin(async move {
+            drop(self);
+            match task.await {
+                Ok(result) => result,
+                Err(_) => Err(BtleRuntimeOwnerError::Cleanup),
+            }
+        })
+    }
+}
+
+#[cfg(feature = "systemd-provider")]
+impl Drop for AuthorityBtleRuntimeOwner {
+    fn drop(&mut self) {
+        self.supervisor.cancel();
+        self.cancellation.send_replace(true);
+        if let Some(task) = self.task.take() {
+            retain_runtime_task(task);
+        }
+    }
+}
+
+#[cfg(feature = "systemd-provider")]
+impl RuntimeOwnerCustody {
+    fn cancel(&self) {
+        if let Some(supervisor) = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            supervisor.cancel();
+        }
+    }
+
+    fn park_unavailable(&self) -> Result<(), BtleRuntimeOwnerError> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or(Ok(()), |supervisor| supervisor.park_unavailable())
+    }
+
+    fn park_authority_unavailable(&self) -> Result<(), BtleRuntimeOwnerError> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or(Ok(()), |supervisor| supervisor.park_authority_unavailable())
+    }
+
+    fn take(&self) -> Box<dyn BtleRuntimeOwner> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("authority supervisor retained")
+    }
+}
+
+#[cfg(feature = "systemd-provider")]
+async fn join_runtime_owner(
+    supervisor: Box<dyn BtleRuntimeOwner>,
+) -> Result<(), BtleRuntimeOwnerError> {
+    let mut completion = supervisor.completion();
+    let result = std::panic::AssertUnwindSafe(supervisor.join())
+        .catch_unwind()
+        .await;
+    if !matches!(result, Ok(Ok(()))) {
+        wait_for_runtime_completion(&mut completion).await;
+    }
+    result.unwrap_or(Err(BtleRuntimeOwnerError::Cleanup))
+}
+
+#[cfg(feature = "systemd-provider")]
+async fn wait_for_runtime_cancellation(cancellation: &mut tokio::sync::watch::Receiver<bool>) {
+    while !*cancellation.borrow_and_update() && cancellation.changed().await.is_ok() {}
+}
+
+#[cfg(feature = "systemd-provider")]
+async fn wait_for_runtime_completion(completion: &mut tokio::sync::watch::Receiver<bool>) {
+    while !*completion.borrow_and_update() && completion.changed().await.is_ok() {}
+}
+
+#[cfg(feature = "systemd-provider")]
+struct RuntimeCompletionOnDrop(tokio::sync::watch::Sender<bool>);
+
+#[cfg(feature = "systemd-provider")]
+impl Drop for RuntimeCompletionOnDrop {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
+}
+
+#[cfg(feature = "systemd-provider")]
+fn retain_runtime_task(task: JoinHandle<Result<(), BtleRuntimeOwnerError>>) {
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(async move {
+            let _ = task.await;
+        });
+    }
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+struct LinuxSupervisorRuntimeOwner {
+    supervisor: LinuxRosteredBtleEventSupervisor,
+    status_stop: tokio::sync::oneshot::Sender<()>,
+    status_task: JoinHandle<()>,
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+impl LinuxSupervisorRuntimeOwner {
+    fn start(
+        supervisor: LinuxRosteredBtleEventSupervisor,
+        status: tokio::sync::watch::Receiver<aster_ble_linux::BtleCurrentStatus>,
+    ) -> Self {
+        let (status_stop, stop_requested) = tokio::sync::oneshot::channel();
+        let status_task = tokio::spawn(consume_btle_status(
+            status,
+            stop_requested,
+            super::emit_btle_status,
+        ));
+        Self {
+            supervisor,
+            status_stop,
+            status_task,
+        }
+    }
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+async fn consume_btle_status(
+    mut status: tokio::sync::watch::Receiver<aster_ble_linux::BtleCurrentStatus>,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+    mut emit: impl FnMut(aster_ble_linux::BtleCurrentStatus),
+) {
+    let mut last = *status.borrow_and_update();
+    emit(last);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut stop => {
+                let next = *status.borrow_and_update();
+                if next != last {
+                    emit(next);
+                }
+                break;
+            }
+            changed = status.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let next = *status.borrow_and_update();
+                if next != last {
+                    emit(next);
+                    last = next;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+const fn receive_only_status() -> aster_ble_linux::BtleCurrentStatus {
+    aster_ble_linux::BtleCurrentStatus::Unavailable {
+        reason: aster_ble_linux::AvailabilityReason::ReceiveOnlyPolicy,
+        support: aster_ble_linux::BtleSupport::NotEvaluated,
+    }
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+impl BtleRuntimeOwner for LinuxSupervisorRuntimeOwner {
+    fn completion(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.supervisor.completion()
+    }
+
+    fn cancel(&self) {
+        self.supervisor.cancel();
+    }
+
+    fn park_unavailable(&self) -> Result<(), BtleRuntimeOwnerError> {
+        self.supervisor
+            .park_unavailable()
+            .map_err(|_| BtleRuntimeOwnerError::Cleanup)
+    }
+
+    fn park_authority_unavailable(&self) -> Result<(), BtleRuntimeOwnerError> {
+        self.supervisor
+            .park_authority_unavailable()
+            .map_err(|_| BtleRuntimeOwnerError::Cleanup)
+    }
+
+    fn join(self: Box<Self>) -> BoxFuture<'static, Result<(), BtleRuntimeOwnerError>> {
+        Box::pin(async move {
+            let Self {
+                supervisor,
+                status_stop,
+                status_task,
+            } = *self;
+            let supervisor_result = match supervisor.shutdown().await {
+                Ok(()) => Ok(()),
+                Err(aster_ble_linux::SupervisorError::CredentialExpired) => {
+                    Err(BtleRuntimeOwnerError::RestartRequired)
+                }
+                Err(_) => Err(BtleRuntimeOwnerError::Cleanup),
+            };
+            let _ = status_stop.send(());
+            let mut status_task = status_task;
+            let status_result =
+                match tokio::time::timeout(BTLE_STATUS_CONSUMER_JOIN_DEADLINE, &mut status_task)
+                    .await
+                {
+                    Ok(result) => result.map_err(|_| BtleRuntimeOwnerError::Cleanup),
+                    Err(_) => {
+                        status_task.abort();
+                        let _ = status_task.await;
+                        Err(BtleRuntimeOwnerError::Cleanup)
+                    }
+                };
+            supervisor_result.and(status_result)
+        })
+    }
+}
+
+#[cfg(any(feature = "sdk-test-support", feature = "systemd-provider"))]
+struct UnavailableBtleRuntimeOwner<P> {
     _adapter_registration: EventAdapterControl,
     _attempt_mailbox: EventAttemptReceiver,
     _completion_guard: tokio::sync::watch::Sender<bool>,
     completion: tokio::sync::watch::Receiver<bool>,
-    _policy_authority: ValidatedBtlePolicy,
-    _authority_guard: P,
+    _custody: P,
 }
 
-#[cfg(any(feature = "systemd-provider", feature = "sdk-test-support"))]
-impl<P> BtleRuntimeOwner for RadioInertBtleRuntimeOwner<P>
+#[cfg(any(feature = "sdk-test-support", feature = "systemd-provider"))]
+fn unavailable_owner<P>(
+    adapter: EventAdapterControl,
+    attempts: EventAttemptReceiver,
+    custody: P,
+) -> Box<dyn BtleRuntimeOwner>
+where
+    P: Send + 'static,
+{
+    let (completion_guard, completion) = tokio::sync::watch::channel(false);
+    Box::new(UnavailableBtleRuntimeOwner {
+        _adapter_registration: adapter,
+        _attempt_mailbox: attempts,
+        _completion_guard: completion_guard,
+        completion,
+        _custody: custody,
+    })
+}
+
+#[cfg(any(feature = "sdk-test-support", feature = "systemd-provider"))]
+impl<P> BtleRuntimeOwner for UnavailableBtleRuntimeOwner<P>
 where
     P: Send + 'static,
 {
@@ -489,24 +1366,453 @@ impl fmt::Debug for BtleRuntimeStartup {
 mod tests {
     use super::*;
 
-    #[test]
-    fn startup_debug_does_not_expose_prepared_authority() {
-        let prepared = "prepared-secret-canary".to_owned();
-        let startup = BtleRuntimeStartup {
-            policy: None,
-            authority_state_root: None,
-            start: Some(Box::new(move |_| {
-                drop(prepared);
-                Err(BtleRuntimeOwnerError::Startup)
-            })),
-            #[cfg(feature = "sdk-test-support")]
-            node_shutdown_observer: None,
-            #[cfg(feature = "sdk-test-support")]
-            cleanup_retired_observer: None,
+    #[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+    #[tokio::test]
+    async fn status_consumer_emits_initial_and_latest_then_joins_on_stop() {
+        // Break caught: a detached or edge-queue consumer can miss the latest
+        // state or outlive the Linux supervisor that owns its publisher.
+        let initial = aster_ble_linux::BtleCurrentStatus::Unavailable {
+            reason: aster_ble_linux::AvailabilityReason::BluezUnavailable,
+            support: aster_ble_linux::BtleSupport::NotEvaluated,
         };
+        let latest = aster_ble_linux::BtleCurrentStatus::Available {
+            support: aster_ble_linux::BtleSupport::Qualified,
+        };
+        let (updates, status) = tokio::sync::watch::channel(initial);
+        let (stop, stop_requested) = tokio::sync::oneshot::channel();
+        let (observed, mut observations) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(consume_btle_status(status, stop_requested, move |status| {
+            observed.send(status).unwrap();
+        }));
 
-        let rendered = format!("{startup:?}");
-        assert_eq!(rendered, "BtleRuntimeStartup { enabled: true, .. }");
-        assert!(!rendered.contains("prepared-secret-canary"));
+        assert_eq!(observations.recv().await, Some(initial));
+        updates.send_replace(latest);
+        assert_eq!(observations.recv().await, Some(latest));
+        stop.send(()).unwrap();
+
+        task.await.unwrap();
+        drop(updates);
+        assert_eq!(
+            observations.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_consumer_stop_cannot_be_starved_by_ready_updates() {
+        let first = aster_ble_linux::BtleCurrentStatus::Unavailable {
+            reason: aster_ble_linux::AvailabilityReason::BluezUnavailable,
+            support: aster_ble_linux::BtleSupport::NotEvaluated,
+        };
+        let second = aster_ble_linux::BtleCurrentStatus::Available {
+            support: aster_ble_linux::BtleSupport::Qualified,
+        };
+        let (updates, status) = tokio::sync::watch::channel(first);
+        let (stop, stop_requested) = tokio::sync::oneshot::channel();
+        stop.send(()).unwrap();
+        let mut next = second;
+        let task = tokio::spawn(consume_btle_status(status, stop_requested, move |_| {
+            updates.send_replace(next);
+            next = if next == first { second } else { first };
+        }));
+
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("stop must win over a continuously ready status source")
+            .unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+    #[test]
+    fn receive_only_status_is_fixed_and_not_evaluated() {
+        // Break caught: receive-only policy being reported as a controller or
+        // qualification failure sends operators toward the wrong remedy.
+        assert_eq!(
+            receive_only_status(),
+            aster_ble_linux::BtleCurrentStatus::Unavailable {
+                reason: aster_ble_linux::AvailabilityReason::ReceiveOnlyPolicy,
+                support: aster_ble_linux::BtleSupport::NotEvaluated,
+            }
+        );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+    #[test]
+    fn automatic_btle_credential_adapter_rejects_invalid_material() {
+        // Break caught: forwarding an invalid generation or all-zero secret
+        // into the Linux driver would bypass fail-closed host composition.
+        assert_eq!(
+            adopt_discovery_credential((0, zeroize::Zeroizing::new([0x11; 32]))).unwrap_err(),
+            BtleRuntimeOwnerError::Startup
+        );
+        assert_eq!(
+            adopt_discovery_credential((7, zeroize::Zeroizing::new([0; 32]))).unwrap_err(),
+            BtleRuntimeOwnerError::Startup
+        );
+    }
+
+    struct StalledCleanupOwner {
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+        completion: tokio::sync::watch::Receiver<bool>,
+    }
+
+    impl Drop for StalledCleanupOwner {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    impl BtleRuntimeOwner for StalledCleanupOwner {
+        fn completion(&self) -> tokio::sync::watch::Receiver<bool> {
+            self.completion.clone()
+        }
+
+        fn cancel(&self) {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        fn join(mut self: Box<Self>) -> BoxFuture<'static, Result<(), BtleRuntimeOwnerError>> {
+            let release = self.release.take().expect("single cleanup join");
+            Box::pin(async move {
+                let _owner = self;
+                let _ = release.await;
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_cancels_synchronously_and_waiter_abort_retains_owner() {
+        // Break caught: an immediate force can abort an unpolled cleanup task,
+        // skipping cancellation and dropping authority while RF work is live.
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (release_send, release_receive) = tokio::sync::oneshot::channel();
+        let (_completion_send, completion) = tokio::sync::watch::channel(false);
+        let owner = StalledCleanupOwner {
+            cancelled: cancelled.clone(),
+            dropped: dropped.clone(),
+            release: Some(release_receive),
+            completion,
+        };
+        let mut active = ActiveBtleRuntime::new(
+            Some(Box::new(owner)),
+            None,
+            #[cfg(feature = "sdk-test-support")]
+            None,
+            #[cfg(feature = "sdk-test-support")]
+            None,
+        );
+
+        let mut waiter = active.begin_cleanup().expect("cleanup owner");
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+        waiter.abort();
+        let _ = (&mut waiter).await;
+        assert!(!dropped.load(std::sync::atomic::Ordering::Acquire));
+
+        release_send.send(()).expect("release actual cleanup");
+        for _ in 0..16 {
+            if dropped.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("owner custody was not released after actual cleanup terminated");
+    }
+
+    #[tokio::test]
+    async fn dropping_active_runtime_cancels_and_retains_owner_until_cleanup_finishes() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (release_send, release_receive) = tokio::sync::oneshot::channel();
+        let (_completion_send, completion) = tokio::sync::watch::channel(false);
+        let owner = StalledCleanupOwner {
+            cancelled: cancelled.clone(),
+            dropped: dropped.clone(),
+            release: Some(release_receive),
+            completion,
+        };
+        let active = ActiveBtleRuntime::new(
+            Some(Box::new(owner)),
+            None,
+            #[cfg(feature = "sdk-test-support")]
+            None,
+            #[cfg(feature = "sdk-test-support")]
+            None,
+        );
+
+        drop(active);
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!dropped.load(std::sync::atomic::Ordering::Acquire));
+
+        release_send.send(()).expect("release actual cleanup");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drop custody must retain the owner until cleanup finishes");
+    }
+
+    #[cfg(feature = "systemd-provider")]
+    struct FailingContinuity {
+        resampled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(feature = "systemd-provider")]
+    impl DiscoveryAuthorityContinuity for FailingContinuity {
+        fn resample_clock(&mut self) -> Result<(), ()> {
+            self.resampled
+                .store(true, std::sync::atomic::Ordering::Release);
+            Err(())
+        }
+    }
+
+    #[cfg(feature = "systemd-provider")]
+    impl Drop for FailingContinuity {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    #[cfg(feature = "systemd-provider")]
+    struct ImmediateRuntimeOwner {
+        parked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        authority_parked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        _completion_guard: tokio::sync::watch::Sender<bool>,
+        completion: tokio::sync::watch::Receiver<bool>,
+        join_result: Result<(), BtleRuntimeOwnerError>,
+    }
+
+    #[cfg(feature = "systemd-provider")]
+    impl Drop for ImmediateRuntimeOwner {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    #[cfg(feature = "systemd-provider")]
+    impl BtleRuntimeOwner for ImmediateRuntimeOwner {
+        fn completion(&self) -> tokio::sync::watch::Receiver<bool> {
+            self.completion.clone()
+        }
+
+        fn cancel(&self) {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        fn park_unavailable(&self) -> Result<(), BtleRuntimeOwnerError> {
+            self.parked
+                .store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        }
+
+        fn park_authority_unavailable(&self) -> Result<(), BtleRuntimeOwnerError> {
+            self.authority_parked
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.park_unavailable()
+        }
+
+        fn join(self: Box<Self>) -> BoxFuture<'static, Result<(), BtleRuntimeOwnerError>> {
+            Box::pin(async move {
+                let result = self.join_result;
+                drop(self);
+                result
+            })
+        }
+    }
+
+    #[cfg(feature = "systemd-provider")]
+    #[tokio::test(start_paused = true)]
+    async fn clock_discontinuity_parks_unavailable_and_retains_authority_until_shutdown() {
+        let resampled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let authority_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let authority_parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let supervisor_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (completion_guard, completion) = tokio::sync::watch::channel(false);
+        let supervisor = ImmediateRuntimeOwner {
+            parked: parked.clone(),
+            authority_parked: authority_parked.clone(),
+            cancelled: cancelled.clone(),
+            dropped: supervisor_dropped.clone(),
+            _completion_guard: completion_guard,
+            completion,
+            join_result: Ok(()),
+        };
+        let owner = AuthorityBtleRuntimeOwner::start_with_interval(
+            Box::new(supervisor),
+            (),
+            Box::new(FailingContinuity {
+                resampled: resampled.clone(),
+                dropped: authority_dropped.clone(),
+            }),
+            BTLE_CLOCK_CONTINUITY_INTERVAL,
+        );
+        let mut owner_completion = owner.completion();
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(BTLE_CLOCK_CONTINUITY_INTERVAL - Duration::from_secs(1)).await;
+        assert!(!resampled.load(std::sync::atomic::Ordering::Acquire));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        while !supervisor_dropped.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(resampled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(parked.load(std::sync::atomic::Ordering::Acquire));
+        assert!(authority_parked.load(std::sync::atomic::Ordering::Acquire));
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!authority_dropped.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!*owner_completion.borrow_and_update());
+
+        owner.cancel();
+        Box::new(owner)
+            .join()
+            .await
+            .expect("parked authority shutdown");
+        assert!(authority_dropped.load(std::sync::atomic::Ordering::Acquire));
+        assert!(*owner_completion.borrow_and_update());
+    }
+
+    #[cfg(feature = "systemd-provider")]
+    #[tokio::test]
+    async fn terminal_supervisor_completion_reaches_process_owner_after_cleanup() {
+        let resampled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let authority_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let authority_parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let supervisor_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (completion_guard, completion) = tokio::sync::watch::channel(false);
+        let terminal = completion_guard.clone();
+        let supervisor = ImmediateRuntimeOwner {
+            parked,
+            authority_parked,
+            cancelled: cancelled.clone(),
+            dropped: supervisor_dropped.clone(),
+            _completion_guard: completion_guard,
+            completion,
+            join_result: Err(BtleRuntimeOwnerError::RestartRequired),
+        };
+        let owner = AuthorityBtleRuntimeOwner::start_with_interval(
+            Box::new(supervisor),
+            (),
+            Box::new(FailingContinuity {
+                resampled: resampled.clone(),
+                dropped: authority_dropped.clone(),
+            }),
+            BTLE_CLOCK_CONTINUITY_INTERVAL,
+        );
+        let mut owner_completion = owner.completion();
+
+        terminal.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !*owner_completion.borrow_and_update() {
+                owner_completion.changed().await.expect("owner completion");
+            }
+        })
+        .await
+        .expect("terminal supervisor reaches process owner");
+
+        assert!(!resampled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(supervisor_dropped.load(std::sync::atomic::Ordering::Acquire));
+        assert!(authority_dropped.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            Box::new(owner).join().await,
+            Err(BtleRuntimeOwnerError::RestartRequired)
+        );
+    }
+
+    #[cfg(feature = "systemd-provider")]
+    #[tokio::test]
+    async fn dropping_authority_wrapper_retains_authority_until_supervisor_cleanup_finishes() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let supervisor_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let authority_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (release_send, release_receive) = tokio::sync::oneshot::channel();
+        let (_completion_send, completion) = tokio::sync::watch::channel(false);
+        let supervisor = StalledCleanupOwner {
+            cancelled: cancelled.clone(),
+            dropped: supervisor_dropped.clone(),
+            release: Some(release_receive),
+            completion,
+        };
+        let owner = AuthorityBtleRuntimeOwner::start_with_interval(
+            Box::new(supervisor),
+            (),
+            Box::new(FailingContinuity {
+                resampled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                dropped: authority_dropped.clone(),
+            }),
+            BTLE_CLOCK_CONTINUITY_INTERVAL,
+        );
+
+        drop(owner);
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!supervisor_dropped.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!authority_dropped.load(std::sync::atomic::Ordering::Acquire));
+
+        release_send.send(()).expect("release supervisor cleanup");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !authority_dropped.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("authority must remain in cleanup custody until supervisor exits");
+        assert!(supervisor_dropped.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    struct PanickingCleanupOwner {
+        completion: tokio::sync::watch::Receiver<bool>,
+    }
+
+    impl BtleRuntimeOwner for PanickingCleanupOwner {
+        fn completion(&self) -> tokio::sync::watch::Receiver<bool> {
+            self.completion.clone()
+        }
+
+        fn cancel(&self) {}
+
+        fn join(self: Box<Self>) -> BoxFuture<'static, Result<(), BtleRuntimeOwnerError>> {
+            Box::pin(async { panic!("fixed test cleanup panic") })
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_join_panic_remains_a_task_failure() {
+        // Break caught: losing the detached custody task must not convert a
+        // cleanup panic into an ordinary fixed owner error.
+        let (_completion_send, completion) = tokio::sync::watch::channel(false);
+        let mut active = ActiveBtleRuntime::new(
+            Some(Box::new(PanickingCleanupOwner { completion })),
+            None,
+            #[cfg(feature = "sdk-test-support")]
+            None,
+            #[cfg(feature = "sdk-test-support")]
+            None,
+        );
+
+        let result = active
+            .begin_cleanup()
+            .expect("cleanup owner")
+            .await
+            .expect_err("cleanup panic must remain a task failure");
+        assert!(result.is_panic());
     }
 }

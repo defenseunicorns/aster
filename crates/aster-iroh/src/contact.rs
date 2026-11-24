@@ -8,11 +8,16 @@ use crate::{CarrierError, Connection};
 fn map_carrier_error(error: CarrierError) -> ContactError {
     let kind = match error {
         CarrierError::Configuration(_) => ContactErrorKind::Configuration,
+        CarrierError::Invariant(_) => ContactErrorKind::Invariant,
+        CarrierError::Protocol(_) => ContactErrorKind::Protocol,
         CarrierError::Transport(_) => ContactErrorKind::Transport,
         CarrierError::Timeout(_) => ContactErrorKind::Timeout,
         CarrierError::UnauthorizedPeer(_) => ContactErrorKind::Unauthorized,
         CarrierError::FrameTooLarge { .. } | CarrierError::TurnTooLarge { .. } => {
             ContactErrorKind::Bounds
+        }
+        CarrierError::RemoteFrameTooLarge { .. } | CarrierError::RemoteTurnTooLarge { .. } => {
+            ContactErrorKind::RemoteBounds
         }
     };
     ContactError::new(kind, error.to_string())
@@ -54,7 +59,7 @@ impl OrderedContact for Connection {
                 Connection::request_with_total_limit_checked(self, request, total_limit, || {
                     before_write().map_err(|error| {
                         preflight_error = Some(error);
-                        CarrierError::Transport("ordered contact preflight rejected write".into())
+                        CarrierError::Invariant("ordered contact preflight rejected write".into())
                     })
                 })
                 .await;
@@ -77,7 +82,7 @@ impl OrderedContact for Connection {
             let result = Connection::respond_once_with_total_limit(self, total_limit, |request| {
                 handler(request).map_err(|error| {
                     handler_error = Some(error);
-                    CarrierError::Transport("ordered contact handler rejected request".into())
+                    CarrierError::Invariant("ordered contact handler rejected request".into())
                 })
             })
             .await;
@@ -329,6 +334,34 @@ mod tests {
 
         client_contact.close();
         server_contact.close();
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn ordered_contact_preserves_remote_bound_provenance() {
+        let (server, client, server_contact, client_contact) = contact_pair().await;
+        let requester = tokio::spawn(async move {
+            <Connection as OrderedContact>::request_with_total_limit(
+                &client_contact,
+                b"remote-oversized-request",
+                usize::MAX,
+            )
+            .await
+        });
+        let handler: ContactRequestHandler<'_> =
+            Box::new(|_| panic!("an oversized remote request must be rejected before its handler"));
+        let error = <Connection as OrderedContact>::respond_once_with_total_limit(
+            &server_contact,
+            4,
+            handler,
+        )
+        .await
+        .expect_err("remote request exceeds the responder-owned bound");
+        assert_eq!(error.kind(), ContactErrorKind::RemoteBounds);
+
+        server_contact.close();
+        let _ = requester.await.expect("requester task");
         client.close().await;
         server.close().await;
     }
