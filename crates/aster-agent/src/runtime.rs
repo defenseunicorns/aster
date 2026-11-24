@@ -1126,15 +1126,11 @@ fn btle_status_record(status: aster_ble_linux::BtleCurrentStatus) -> serde_json:
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let (availability, reason, support) = match status {
-        BtleCurrentStatus::Available { support } => {
-            ("available", "available", btle_support_name(support))
+    let (availability, reason) = match status {
+        BtleCurrentStatus::Available { .. } => ("available", "available"),
+        BtleCurrentStatus::Unavailable { reason, .. } => {
+            ("unavailable", btle_status_reason_name(reason))
         }
-        BtleCurrentStatus::Unavailable { reason, support } => (
-            "unavailable",
-            btle_status_reason_name(reason),
-            btle_support_name(support),
-        ),
     };
     serde_json::json!({
         "timestamp": timestamp,
@@ -1142,17 +1138,7 @@ fn btle_status_record(status: aster_ble_linux::BtleCurrentStatus) -> serde_json:
         "adapter_kind": "ble_l2cap_v1",
         "availability": availability,
         "reason": reason,
-        "support": support,
     })
-}
-
-#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
-const fn btle_support_name(support: aster_ble_linux::BtleSupport) -> &'static str {
-    match support {
-        aster_ble_linux::BtleSupport::NotEvaluated => "not_evaluated",
-        aster_ble_linux::BtleSupport::Qualified => "qualified",
-        aster_ble_linux::BtleSupport::Unqualified => "unqualified",
-    }
 }
 
 #[cfg(all(feature = "systemd-provider", target_os = "linux"))]
@@ -1350,7 +1336,7 @@ mod tests {
             }),
             btle_status_record(aster_ble_linux::BtleCurrentStatus::Unavailable {
                 reason: aster_ble_linux::AvailabilityReason::CredentialExpired,
-                support: aster_ble_linux::BtleSupport::NotEvaluated,
+                support: aster_ble_linux::BtleSupport::Unqualified,
             }),
         ];
         let expected_fields = [
@@ -1359,7 +1345,6 @@ mod tests {
             "adapter_kind",
             "availability",
             "reason",
-            "support",
         ];
 
         for record in &records {
@@ -1373,14 +1358,13 @@ mod tests {
             );
             assert_eq!(record["operation"], "btle_status");
             assert_eq!(record["adapter_kind"], "ble_l2cap_v1");
+            assert!(record.get("support").is_none());
         }
 
         assert_eq!(records[0]["availability"], "available");
         assert_eq!(records[0]["reason"], "available");
-        assert_eq!(records[0]["support"], "qualified");
         assert_eq!(records[1]["availability"], "unavailable");
         assert_eq!(records[1]["reason"], "credential_expired");
-        assert_eq!(records[1]["support"], "not_evaluated");
     }
 
     #[cfg(all(feature = "systemd-provider", target_os = "linux"))]
