@@ -175,6 +175,7 @@ pub(super) fn pack_has_pending_upload_write(
 }
 
 const UPLOAD_MAGIC: &[u8; 8] = b"ASTRUP01";
+#[cfg(test)]
 const LEGACY_UPLOAD_VERSION: u8 = 1;
 const UPLOAD_VERSION: u8 = 2;
 const PROFILE5_UPLOAD_VERSION: u8 = 5;
@@ -710,10 +711,7 @@ impl DurableBlobUpload {
             return Err(schema_error());
         }
         let format_version = cursor.u8()?;
-        if format_version != LEGACY_UPLOAD_VERSION
-            && format_version != UPLOAD_VERSION
-            && format_version != PROFILE5_UPLOAD_VERSION
-        {
+        if format_version != UPLOAD_VERSION && format_version != PROFILE5_UPLOAD_VERSION {
             return Err(schema_error());
         }
         let owner_key = cursor.short()?.to_vec();
@@ -894,13 +892,7 @@ impl DurableBlobUpload {
             }
         }
         let (expected_capacity, expected_staging, expected_conversion) =
-            if format_version == LEGACY_UPLOAD_VERSION {
-                (
-                    super::depot::legacy_blob_upload_capacity(total_len)?,
-                    super::depot::legacy_blob_upload_staging_charge(total_len)?,
-                    super::depot::blob_upload_conversion_overhead(total_len)?,
-                )
-            } else if format_version == PROFILE5_UPLOAD_VERSION {
+            if format_version == PROFILE5_UPLOAD_VERSION {
                 let capacity = profile5_upload_capacity(total_len)?;
                 (capacity, capacity.bytes, 0)
             } else {
@@ -1971,7 +1963,7 @@ impl Store {
                 .map(|value| value.value().to_vec())
         };
         if let Some(encoded) = existing_encoded {
-            let mut existing =
+            let existing =
                 DurableBlobUpload::decode(Arc::clone(&self.blob_completion_authority), &encoded)?;
             require_upload_not_cleaning(&pack_root, &existing.reservation.pack_identity())?;
             if existing.reservation.request != *request
@@ -1981,34 +1973,6 @@ impl Store {
             }
             if existing.reservation.control_policy != *policy {
                 return Err(blob_error(BlobStoreError::ReservationChanged));
-            }
-            if existing.format_version == LEGACY_UPLOAD_VERSION {
-                let upgraded_capacity = super::depot::blob_upload_capacity(request.total_len)?;
-                let upgraded_staging = super::depot::blob_upload_staging_charge(request.total_len)?;
-                let additional = upgraded_capacity
-                    .bytes
-                    .checked_sub(existing.reservation.total_capacity.bytes)
-                    .ok_or_else(schema_error)?;
-                let current = super::depot::depot_admission_usage_write(&write)?;
-                if current
-                    .reserved_bytes
-                    .checked_add(additional)
-                    .ok_or(StoreError::PayloadByteAccountingOverflow)?
-                    > self.blob_depot_limits.max_bytes()
-                {
-                    return Err(blob_error(BlobStoreError::DepotByteLimitExceeded {
-                        current: current.reserved_bytes,
-                        incoming: additional,
-                        limit: self.blob_depot_limits.max_bytes(),
-                    }));
-                }
-                existing.format_version = UPLOAD_VERSION;
-                existing.reservation.staging_charge_bytes = upgraded_staging;
-                existing.reservation.total_capacity = upgraded_capacity;
-                write
-                    .open_table(super::BLOB_UPLOADS)?
-                    .insert(owner_key.as_slice(), existing.encode()?.as_slice())?;
-                write.commit()?;
             }
             let verified = if let Some((_, _, build)) = profile5.as_mut() {
                 if existing.format_version != PROFILE5_UPLOAD_VERSION {

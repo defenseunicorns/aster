@@ -1567,17 +1567,6 @@ fn is_unanchored_lost_finite(record: &CustodyItemRecord) -> bool {
         && record.checkpoint.is_none()
 }
 
-fn is_canonical_lost_sentinel_for(
-    encoded: &[u8],
-    items: &BTreeMap<CustodyObjectKey, CustodyItemRecord>,
-) -> Result<bool, CustodyStoreError> {
-    let (generation, clock_id, due_tick_ms, object) = decode_custody_expiration_key(encoded)?;
-    Ok(generation == 0
-        && clock_id == [0; 16]
-        && due_tick_ms == 0
-        && items.get(&object).is_some_and(is_unanchored_lost_finite))
-}
-
 fn custody_retiring_key(key: CustodyObjectKey, record: &CustodyItemRecord) -> Option<Vec<u8>> {
     record.retiring.then(|| {
         let mut encoded = Vec::with_capacity(CUSTODY_RETIRING_KEY_LEN);
@@ -2501,36 +2490,6 @@ impl<'a> CustodyCursor<'a> {
     }
 }
 
-const CUSTODY_SCHEMA_V1_TABLE_NAMES: [&str; 11] = [
-    "aster.custody-items.v1",
-    "aster.custody-retirements.v1",
-    "aster.custody-retired-semantics.v1",
-    "aster.custody-transfer-leases.v1",
-    "aster.custody-peer-receipts.v1",
-    "aster.custody-peer-retries.v1",
-    "aster.custody-quotas.v1",
-    "aster.custody-scope-usage.v1",
-    "aster.custody-continuity.v1",
-    "aster.custody-domain.v1",
-    "aster.custody-metadata.v1",
-];
-
-const CUSTODY_SCHEMA_V2_TABLE_NAMES: [&str; 13] = [
-    "aster.custody-items.v1",
-    "aster.custody-expirations.v2",
-    "aster.custody-retiring.v2",
-    "aster.custody-retirements.v1",
-    "aster.custody-retired-semantics.v1",
-    "aster.custody-transfer-leases.v1",
-    "aster.custody-peer-receipts.v1",
-    "aster.custody-peer-retries.v1",
-    "aster.custody-quotas.v1",
-    "aster.custody-scope-usage.v1",
-    "aster.custody-continuity.v1",
-    "aster.custody-domain.v1",
-    "aster.custody-metadata.v1",
-];
-
 const CUSTODY_TABLE_NAMES: [&str; 14] = [
     "aster.custody-items.v1",
     "aster.custody-expirations.v2",
@@ -2547,25 +2506,6 @@ const CUSTODY_TABLE_NAMES: [&str; 14] = [
     "aster.custody-domain.v1",
     "aster.custody-metadata.v1",
 ];
-
-fn unsupported_predecessor_version(
-    regular: &BTreeSet<String>,
-    metadata_version: Option<u64>,
-) -> Option<u64> {
-    [
-        (1, &CUSTODY_SCHEMA_V1_TABLE_NAMES[..]),
-        (2, &CUSTODY_SCHEMA_V2_TABLE_NAMES[..]),
-    ]
-    .into_iter()
-    .find_map(|(version, names)| {
-        let exact = names.iter().all(|name| regular.contains(*name))
-            && CUSTODY_TABLE_NAMES
-                .iter()
-                .filter(|name| !names.contains(name))
-                .all(|name| !regular.contains(*name));
-        (exact && metadata_version == Some(version)).then_some(version)
-    })
-}
 
 fn preflight_custody_schema_write(write: &redb::WriteTransaction) -> Result<bool, StoreError> {
     let regular = write
@@ -2590,21 +2530,6 @@ fn preflight_custody_schema_write(write: &redb::WriteTransaction) -> Result<bool
         .filter(|name| regular.contains(**name))
         .count();
     if present != 0 && present != CUSTODY_TABLE_NAMES.len() {
-        let metadata_version = if regular.contains(CUSTODY_METADATA.name()) {
-            write
-                .open_table(CUSTODY_METADATA)?
-                .get(CUSTODY_SCHEMA_VERSION_KEY)?
-                .map(|value| value.value())
-        } else {
-            None
-        };
-        if let Some(found) = unsupported_predecessor_version(&regular, metadata_version) {
-            return Err(CustodyStoreError::UnsupportedSchemaVersion {
-                found,
-                supported: CUSTODY_SCHEMA_VERSION,
-            }
-            .into());
-        }
         return Err(CustodyStoreError::Invariant("custody schema group is incomplete").into());
     }
     Ok(present == CUSTODY_TABLE_NAMES.len())
@@ -2633,20 +2558,6 @@ fn custody_schema_present_read(read: &redb::ReadTransaction) -> Result<bool, Sto
         .filter(|name| regular.contains(**name))
         .count();
     if present != 0 && present != CUSTODY_TABLE_NAMES.len() {
-        let metadata_version = if regular.contains(CUSTODY_METADATA.name()) {
-            read.open_table(CUSTODY_METADATA)?
-                .get(CUSTODY_SCHEMA_VERSION_KEY)?
-                .map(|value| value.value())
-        } else {
-            None
-        };
-        if let Some(found) = unsupported_predecessor_version(&regular, metadata_version) {
-            return Err(CustodyStoreError::UnsupportedSchemaVersion {
-                found,
-                supported: CUSTODY_SCHEMA_VERSION,
-            }
-            .into());
-        }
         return Err(CustodyStoreError::Invariant("custody schema group is incomplete").into());
     }
     Ok(present == CUSTODY_TABLE_NAMES.len())
@@ -2657,256 +2568,24 @@ fn initialize_custody_schema(
     limits: StoreLimits,
     mission_authority: Option<NodeId>,
 ) -> Result<(), StoreError> {
-    // Unbound stores have no mission partition yet. Mission-bound migration
-    // performs the exact classified ordinary/control/tombstone check after its
-    // reconstructed custody counters are staged in this same atomic writer.
-    if mission_authority.is_none() {
-        require_aggregate_capacity(write, &write.open_table(METADATA)?, limits, 0, 0)?;
-    }
-    let mut backfill = Vec::<(CustodyObjectKey, CustodyItemRecord)>::new();
-    let mut total_bytes = 0u64;
-    let mut revision = 1u64;
-    let mut last_event_order = 0u64;
-    {
-        let events = write.open_table(EVENTS)?;
-        let event_bytes = write.open_table(EVENT_BYTES)?;
-        let markers = write.open_table(EVENT_ACCEPTANCE_MARKERS)?;
-        for row in events.iter()? {
-            let (key, value) = row?;
-            let transfer_id = parse_transfer_id("Event metadata table", key.value())?;
-            let metadata = decode_event_metadata(value.value())?;
-            let accounted_bytes = event_bytes
-                .get(key.value())?
-                .map(|bytes| u64::try_from(bytes.value().len()))
-                .transpose()
-                .map_err(|_| CustodyStoreError::CounterOverflow)?
-                .ok_or(CustodyStoreError::Invariant(
-                    "legacy Event is missing exact bytes during custody migration",
-                ))?;
-            let acceptance_order = markers
-                .get(key.value())?
-                .map(|marker| marker.value())
-                .ok_or(CustodyStoreError::Invariant(
-                    "legacy Event is missing its acceptance marker during custody migration",
-                ))?;
-            last_event_order = last_event_order.max(acceptance_order);
-            revision = next_counter(revision)?;
-            total_bytes = total_bytes
-                .checked_add(accounted_bytes)
-                .ok_or(CustodyStoreError::CounterOverflow)?;
-            backfill.push((
-                CustodyObjectKey::event(transfer_id),
-                CustodyItemRecord {
-                    semantic_id: *metadata.semantic_id.as_bytes(),
-                    topic: metadata.header.topic,
-                    scope: metadata.header.scope,
-                    source_publisher: metadata.header.stamp.dot.publisher,
-                    key_epoch: metadata.header.key_epoch,
-                    priority: metadata.header.priority,
-                    ttl_ms: metadata.header.ttl_ms,
-                    tombstone: metadata.header.tombstone,
-                    route_only: false,
-                    retiring: false,
-                    continuity_lost: metadata.header.ttl_ms.is_some() && !metadata.header.tombstone,
-                    protection: CustodyProtection::new(
-                        false,
-                        false,
-                        metadata.header.tombstone,
-                        false,
-                    ),
-                    accounted_bytes,
-                    cumulative_age_ms: 0,
-                    checkpoint: None,
-                    continuity_generation: 0,
-                    acceptance_order,
-                    revision,
-                },
-            ));
-        }
-    }
-    {
-        let cache = write.open_table(ROUTE_CACHE)?;
-        let claims = write.open_table(ROUTE_CACHE_CLAIMS)?;
-        let mut route_rank = 0u64;
-        for row in cache.iter()? {
-            let (key, bytes) = row?;
-            let transfer_id = parse_transfer_id("route Event cache", key.value())?;
-            let metadata = claims
-                .get(key.value())?
-                .map(|claim| decode_event_metadata(claim.value()))
-                .transpose()?
-                .ok_or(CustodyStoreError::Invariant(
-                    "legacy route Event is missing its claim during custody migration",
-                ))?;
-            let accounted_bytes = u64::try_from(bytes.value().len())
-                .map_err(|_| CustodyStoreError::CounterOverflow)?;
-            route_rank = next_counter(route_rank)?;
-            let acceptance_order = last_event_order
-                .checked_add(route_rank)
-                .ok_or(CustodyStoreError::CounterOverflow)?;
-            revision = next_counter(revision)?;
-            total_bytes = total_bytes
-                .checked_add(accounted_bytes)
-                .ok_or(CustodyStoreError::CounterOverflow)?;
-            backfill.push((
-                CustodyObjectKey::route_event(transfer_id),
-                CustodyItemRecord {
-                    semantic_id: *metadata.semantic_id.as_bytes(),
-                    topic: metadata.header.topic,
-                    scope: metadata.header.scope,
-                    source_publisher: metadata.header.stamp.dot.publisher,
-                    key_epoch: metadata.header.key_epoch,
-                    priority: metadata.header.priority,
-                    ttl_ms: metadata.header.ttl_ms,
-                    tombstone: metadata.header.tombstone,
-                    route_only: true,
-                    retiring: false,
-                    continuity_lost: metadata.header.ttl_ms.is_some() && !metadata.header.tombstone,
-                    protection: CustodyProtection::new(
-                        false,
-                        false,
-                        metadata.header.tombstone,
-                        false,
-                    ),
-                    accounted_bytes,
-                    cumulative_age_ms: 0,
-                    checkpoint: None,
-                    continuity_generation: 0,
-                    acceptance_order,
-                    revision,
-                },
-            ));
-        }
-    }
-    let item_count =
-        u64::try_from(backfill.len()).map_err(|_| CustodyStoreError::CounterOverflow)?;
-    let ordinary_item_count = u64::try_from(
-        backfill
-            .iter()
-            .filter(|(_, record)| !record.tombstone)
-            .count(),
-    )
-    .map_err(|_| CustodyStoreError::CounterOverflow)?;
-    let ordinary_total_bytes = backfill
-        .iter()
-        .filter(|(_, record)| !record.tombstone)
-        .try_fold(0u64, |total, (_, record)| {
-            total
-                .checked_add(record.accounted_bytes)
-                .ok_or(CustodyStoreError::CounterOverflow)
-        })?;
-    let tombstone_usage = CustodyUsage {
-        items: item_count
-            .checked_sub(ordinary_item_count)
-            .ok_or(CustodyStoreError::Invariant(
-                "ordinary items exceed total custody items during migration",
-            ))?,
-        bytes: total_bytes.checked_sub(ordinary_total_bytes).ok_or(
-            CustodyStoreError::Invariant(
-                "ordinary bytes exceed total custody bytes during migration",
-            ),
-        )?,
-    };
-    let (tombstone_max_items, tombstone_max_bytes) = custody_tombstone_allowance(limits);
-    require_quota_capacity(
-        tombstone_usage,
-        &CustodyQuota {
-            scope: None,
-            max_items: tombstone_max_items,
-            max_bytes: tombstone_max_bytes,
-        },
-        0,
-        0,
-    )?;
+    crate::require_new_store_write(write)?;
     let reserved_global = CustodyQuota::for_store_limits(limits)?;
-    let custody_item_limit = reserved_global.max_items;
-    let custody_byte_limit = reserved_global.max_bytes;
-    if ordinary_item_count > custody_item_limit || ordinary_total_bytes > custody_byte_limit {
-        return Err(CustodyStoreError::Invariant(
-            "legacy Event usage leaves no bounded control/tombstone reserve",
-        )
-        .into());
-    }
-    if ordinary_item_count > MAX_CUSTODY_RETIREMENTS {
-        return Err(CustodyStoreError::Invariant(
-            "legacy Event usage exceeds the permanent retirement-fence reserve",
-        )
-        .into());
-    }
-    {
-        let mut items = write.open_table(CUSTODY_ITEMS)?;
-        for (key, record) in &backfill {
-            let encoded = encode_item(record)?;
-            if items
-                .insert(key.encoded().as_slice(), encoded.as_slice())?
-                .is_some()
-            {
-                return Err(CustodyStoreError::Invariant(
-                    "legacy custody migration produced a duplicate transfer key",
-                )
-                .into());
-            }
-        }
-    }
+    let revision = 1;
+    let item_count = 0;
+    let total_bytes = 0;
+    let ordinary_item_count = 0;
+    let ordinary_total_bytes = 0;
+    write.open_table(CUSTODY_ITEMS)?;
     write.open_table(CUSTODY_EXPIRATIONS)?;
     write.open_table(CUSTODY_RETIRING)?;
     write.open_table(CUSTODY_RETIREMENT_REFERENCES)?;
-    let regular_tables = write
-        .list_tables()?
-        .map(|table| table.name().to_owned())
-        .collect::<BTreeSet<_>>();
-    if regular_tables.contains(EVENT_SUBSCRIPTION_PENDING.name()) {
-        for row in write.open_table(EVENT_SUBSCRIPTION_PENDING)?.iter()? {
-            let (key, value) = row?;
-            let pending = decode_event_pending_delivery_record(value.value())?;
-            insert_event_pending_retirement_reference_write(
-                write,
-                pending.semantic_id,
-                key.value(),
-            )?;
-        }
-    }
-    if regular_tables.contains(EVENT_DELIVERY_ACKNOWLEDGEMENTS.name()) {
-        for row in write.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?.iter()? {
-            let (key, value) = row?;
-            let (_, semantic_id) = parse_event_acknowledgement_key(key.value())?;
-            let _ = decode_event_acknowledgement_record(value.value())?;
-            insert_event_acknowledgement_retirement_reference_write(
-                write,
-                semantic_id,
-                key.value(),
-            )?;
-        }
-    }
-    for (key, record) in &backfill {
-        replace_custody_maintenance_indexes_write(write, *key, None, Some(record))?;
-    }
     write.open_table(CUSTODY_RETIREMENTS)?;
     write.open_table(CUSTODY_RETIRED_SEMANTICS)?;
     write.open_table(CUSTODY_LEASES)?;
     write.open_table(CUSTODY_PEER_RECEIPTS)?;
     write.open_table(CUSTODY_RETRIES)?;
     write.open_table(CUSTODY_CONTINUITY)?;
-    {
-        let mut scope_usages = BTreeMap::<String, CustodyUsage>::new();
-        for (_, record) in &backfill {
-            if record.tombstone {
-                continue;
-            }
-            let usage = scope_usages
-                .entry(record.scope.as_str().to_owned())
-                .or_default();
-            usage.items = next_counter(usage.items)?;
-            usage.bytes = usage
-                .bytes
-                .checked_add(record.accounted_bytes)
-                .ok_or(CustodyStoreError::CounterOverflow)?;
-        }
-        let mut table = write.open_table(CUSTODY_SCOPE_USAGE)?;
-        for (scope, usage) in scope_usages {
-            table.insert(scope.as_str(), encode_scope_usage(usage).as_slice())?;
-        }
-    }
+    write.open_table(CUSTODY_SCOPE_USAGE)?;
     let global = reserved_global;
     write
         .open_table(CUSTODY_QUOTAS)?
@@ -9350,12 +9029,10 @@ pub(crate) fn audit_custody_tables_write(
     let mut ordinary_total_bytes = 0u64;
     let mut items = BTreeMap::new();
     let mut scope_usages = BTreeMap::<String, CustodyUsage>::new();
-    let mut legacy_item_repairs = Vec::new();
     for row in write.open_table(CUSTODY_ITEMS)?.iter()? {
         let (key, value) = row?;
-        let encoded_key = key.value().to_vec();
         let key = CustodyObjectKey::decode(key.value())?;
-        let mut record = decode_item(value.value())?;
+        let record = decode_item(value.value())?;
         if record.route_only != (key.class == CustodyObjectClass::RouteEvent) {
             return Err(CustodyStoreError::Invariant(
                 "custody route-only flag differs from its class",
@@ -9371,8 +9048,10 @@ pub(crate) fn audit_custody_tables_write(
             .into());
         }
         if is_unanchored_lost_finite(&record) && record.continuity_generation != 0 {
-            record.continuity_generation = 0;
-            legacy_item_repairs.push((encoded_key, encode_item(&record)?));
+            return Err(CustodyStoreError::Invariant(
+                "custody item has a noncanonical continuity generation",
+            )
+            .into());
         }
         validate_item_backing_write(write, key, &record)?;
         item_count = next_counter(item_count)?;
@@ -9395,12 +9074,6 @@ pub(crate) fn audit_custody_tables_write(
         }
         items.insert(key, record);
     }
-    if !legacy_item_repairs.is_empty() {
-        let mut item_table = write.open_table(CUSTODY_ITEMS)?;
-        for (key, value) in &legacy_item_repairs {
-            item_table.insert(key.as_slice(), value.as_slice())?;
-        }
-    }
     let (expected_expirations, expected_retiring) = expected_custody_maintenance_indexes(&items)?;
     let mut durable_expirations = BTreeSet::new();
     for row in write.open_table(CUSTODY_EXPIRATIONS)?.iter()? {
@@ -9422,26 +9095,11 @@ pub(crate) fn audit_custody_tables_write(
         .difference(&expected_expirations)
         .next()
         .is_some();
-    let repairable_missing = missing_expirations
-        .iter()
-        .map(|encoded| is_canonical_lost_sentinel_for(encoded, &items))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .all(|repairable| repairable);
-    if has_extra_expirations || !repairable_missing {
+    if has_extra_expirations || !missing_expirations.is_empty() {
         return Err(CustodyStoreError::Invariant(
             "custody expiration index differs from live items",
         )
         .into());
-    }
-    if !missing_expirations.is_empty() {
-        let mut expirations = write.open_table(CUSTODY_EXPIRATIONS)?;
-        for encoded in &missing_expirations {
-            expirations.insert(encoded.as_slice(), &[][..])?;
-        }
-    }
-    if !legacy_item_repairs.is_empty() || !missing_expirations.is_empty() {
-        advance_revision(write, false)?;
     }
     let mut durable_retiring = BTreeSet::new();
     let mut retirement_cleanups = BTreeMap::new();
@@ -9586,7 +9244,6 @@ pub(crate) fn audit_custody_tables_write(
     }
 
     let mut receipt_count = 0u64;
-    let mut legacy_receipt_keys = Vec::new();
     let receipts = write.open_table(CUSTODY_PEER_RECEIPTS)?;
     for row in receipts.iter()? {
         let (key, value) = row?;
@@ -9608,7 +9265,10 @@ pub(crate) fn audit_custody_tables_write(
             .into());
         }
         if receipt.peer_selector_revision.is_none() {
-            legacy_receipt_keys.push(key.value().to_vec());
+            return Err(CustodyStoreError::Invariant(
+                "custody receipt lacks its peer selector revision",
+            )
+            .into());
         }
         require_retirement_reference_write(
             write,
@@ -9743,36 +9403,6 @@ pub(crate) fn audit_custody_tables_write(
     // Version-1 receipts predate authenticated peer selector generations and
     // cannot safely suppress even canonical revision zero. After exact audit,
     // writable reopen drops those bounded hints and repairs their counter.
-    if !legacy_receipt_keys.is_empty() {
-        let mut receipts = write.open_table(CUSTODY_PEER_RECEIPTS)?;
-        for key in &legacy_receipt_keys {
-            if receipts.remove(key.as_slice())?.is_none() {
-                return Err(CustodyStoreError::Invariant(
-                    "legacy custody receipt disappeared during migration",
-                )
-                .into());
-            }
-            remove_peer_retirement_reference_write(
-                write,
-                RETIREMENT_REFERENCE_RECEIPT,
-                key.as_slice(),
-                "legacy receipt retirement reference disappeared",
-            )?;
-        }
-        drop(receipts);
-        let removed = u64::try_from(legacy_receipt_keys.len())
-            .map_err(|_| CustodyStoreError::CounterOverflow)?;
-        receipt_count = receipt_count
-            .checked_sub(removed)
-            .ok_or(CustodyStoreError::Invariant(
-                "legacy custody receipt accounting underflow",
-            ))?;
-        write
-            .open_table(CUSTODY_METADATA)?
-            .insert(CUSTODY_RECEIPT_COUNT_KEY, receipt_count)?;
-        advance_revision(write, false)?;
-    }
-
     // Leases coordinate one live process and cannot survive a crash as send
     // authority.  The exact writer lock makes writable reopen the recovery
     // boundary: audit every row above, then atomically clear the abandoned set.
@@ -10061,11 +9691,10 @@ pub(crate) fn inspect_custody_tables_read(
     let mut ordinary_item_count = 0u64;
     let mut ordinary_total_bytes = 0u64;
     let mut scope_usages = BTreeMap::<String, CustodyUsage>::new();
-    let mut legacy_item_encoding = false;
     for row in read.open_table(CUSTODY_ITEMS)?.iter()? {
         let (key, value) = row?;
         let key = CustodyObjectKey::decode(key.value())?;
-        let mut record = decode_item(value.value())?;
+        let record = decode_item(value.value())?;
         if record.route_only != (key.class == CustodyObjectClass::RouteEvent)
             || continuity.is_some_and(|clock| record.continuity_generation > clock.generation)
         {
@@ -10075,8 +9704,10 @@ pub(crate) fn inspect_custody_tables_read(
             .into());
         }
         if is_unanchored_lost_finite(&record) && record.continuity_generation != 0 {
-            record.continuity_generation = 0;
-            legacy_item_encoding = true;
+            return Err(CustodyStoreError::Invariant(
+                "custody item has a noncanonical continuity generation",
+            )
+            .into());
         }
         validate_item_backing_read(read, key, &record)?;
         item_count = next_counter(item_count)?;
@@ -10119,18 +9750,6 @@ pub(crate) fn inspect_custody_tables_read(
         .difference(&expected_expirations)
         .next()
         .is_some();
-    let repairable_missing = missing_expirations
-        .iter()
-        .map(|encoded| is_canonical_lost_sentinel_for(encoded, &items))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .all(|repairable| repairable);
-    if !has_extra_expirations
-        && repairable_missing
-        && (legacy_item_encoding || !missing_expirations.is_empty())
-    {
-        return Err(CustodyStoreError::LegacyCustodyMigrationRequired.into());
-    }
     if has_extra_expirations || !missing_expirations.is_empty() {
         return Err(CustodyStoreError::Invariant(
             "custody expiration index differs from live items",

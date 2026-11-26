@@ -1070,19 +1070,17 @@ pub(crate) fn audit_numbered_tables_write(
         )
         .into());
     }
+    if present == 0 {
+        crate::require_new_store_write(write)?;
+    }
     let clients = write.open_table(CLIENTS)?;
     let results = write.open_table(RESULTS)?;
     let reverse = write.open_table(RESULT_BY_EVENT)?;
     let numbered_rows = clients.len()? != 0 || results.len()? != 0 || reverse.len()? != 0;
-    let legacy_rows = write.open_table(EVENT_OPERATION_LEDGER_V3)?.len()? != 0
-        || write.open_table(ACTIVE_OPERATION_BY_EVENT_V1)?.len()? != 0;
     let mode = write
         .open_table(METADATA)?
         .get(MODE)?
         .map(|value| value.value());
-    if legacy_rows && (numbered_rows || mode == Some(1)) {
-        return Err(NumberedEventOperationError::LegacyStoreRequiresFreshState.into());
-    }
     match mode {
         None if numbered_rows => {
             return Err(NumberedEventOperationError::Invariant(
@@ -1280,18 +1278,11 @@ pub(crate) fn audit_numbered_tables_read(
         )
         .into());
     }
-    let legacy_rows = (regular.contains(EVENT_OPERATION_LEDGER_V3.name())
-        && read.open_table(EVENT_OPERATION_LEDGER_V3)?.len()? != 0)
-        || (regular.contains(ACTIVE_OPERATION_BY_EVENT_V1.name())
-            && read.open_table(ACTIVE_OPERATION_BY_EVENT_V1)?.len()? != 0);
     let mode = read
         .open_table(METADATA)?
         .get(MODE)?
         .map(|value| value.value());
     if present == 0 {
-        if legacy_rows && mode == Some(1) {
-            return Err(NumberedEventOperationError::LegacyStoreRequiresFreshState.into());
-        }
         if let Some(value) = mode
             && value != 1
         {
@@ -1335,9 +1326,6 @@ pub(crate) fn audit_numbered_tables_read(
     let results = read.open_table(RESULTS)?;
     let reverse = read.open_table(RESULT_BY_EVENT)?;
     let numbered_rows = clients.len()? != 0 || results.len()? != 0 || reverse.len()? != 0;
-    if legacy_rows && (numbered_rows || mode == Some(1)) {
-        return Err(NumberedEventOperationError::LegacyStoreRequiresFreshState.into());
-    }
     match mode {
         None if numbered_rows => {
             return Err(NumberedEventOperationError::Invariant(

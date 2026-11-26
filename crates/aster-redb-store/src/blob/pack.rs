@@ -1051,18 +1051,6 @@ impl BlobPackRoot {
         self.open_upload_digests(false)
     }
 
-    fn remove_upload_digests(&self) -> Result<(), BlobPackError> {
-        match self {
-            Self::Pinned(root, _) => root.remove_if_exists(UPLOAD_DIGEST_FILE, false)?,
-            Self::Path(root) => match fs::remove_file(root.join(UPLOAD_DIGEST_FILE)) {
-                Ok(()) => File::open(root)?.sync_all()?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            },
-        }
-        Ok(())
-    }
-
     fn open_data(&self, create_new: bool) -> Result<File, BlobPackError> {
         match self {
             Self::Path(root) => Ok(OpenOptions::new()
@@ -1709,7 +1697,6 @@ pub struct BlobUploadDigestWriter {
     pending_len: usize,
     commitment: Sha256,
     whole_plaintext: Sha256,
-    legacy_rebuild_allowed: bool,
 }
 
 impl BlobUploadDigestWriter {
@@ -1732,22 +1719,23 @@ impl BlobUploadDigestWriter {
         identity: BlobPackIdentity,
         projected: Option<&BlobPackCheckpoint>,
     ) -> Result<Self, BlobPackError> {
-        let legacy_rebuild_allowed = projected.is_none()
-            || projected.is_some_and(|checkpoint| {
-                checkpoint.format_version == PACK_VERSION && checkpoint.upload_digests.is_none()
-            });
+        if projected.is_some_and(|checkpoint| checkpoint.upload_digests.is_none()) {
+            return Err(BlobPackError::Invalid(
+                "projected upload lacks its digest artifact",
+            ));
+        }
         let header = upload_digest_header(identity);
         let mut data = match pack_root.open_existing_upload_digests()? {
             Some(mut data) => match validate_upload_digest_header(&mut data, identity) {
                 Ok(()) => data,
-                Err(_) if legacy_rebuild_allowed => {
-                    drop(data);
-                    pack_root.remove_upload_digests()?;
-                    pack_root.install_upload_digests_atomic(&header)?
-                }
                 Err(error) => return Err(error),
             },
-            None => pack_root.install_upload_digests_atomic(&header)?,
+            None if projected.is_none() => pack_root.install_upload_digests_atomic(&header)?,
+            None => {
+                return Err(BlobPackError::Invalid(
+                    "projected upload digest artifact is missing",
+                ));
+            }
         };
         let (plaintext_offset, count, commitment, whole_plaintext, file_len) = match projected
             .and_then(|checkpoint| {
@@ -1787,30 +1775,11 @@ impl BlobUploadDigestWriter {
             pending_len: 0,
             commitment,
             whole_plaintext,
-            legacy_rebuild_allowed,
         })
     }
 
     pub const fn plaintext_offset(&self) -> u64 {
         self.plaintext_offset
-    }
-
-    /// Exact one-time plaintext bytes which a pre-artifact checkpoint must
-    /// replay to establish the v1 digest sidecar. A v3 projected frontier
-    /// always returns zero; a partial/misaligned artifact fails closed.
-    pub fn migration_rebuild_bytes(
-        &self,
-        durable_plaintext_offset: u64,
-    ) -> Result<u64, BlobPackError> {
-        if self.plaintext_offset == durable_plaintext_offset {
-            Ok(0)
-        } else if self.plaintext_offset == 0 && self.legacy_rebuild_allowed {
-            Ok(durable_plaintext_offset)
-        } else {
-            Err(BlobPackError::Invalid(
-                "Blob upload digest artifact differs from durable frontier",
-            ))
-        }
     }
 
     pub fn append(&mut self, bytes: &[u8]) -> Result<(), BlobPackError> {

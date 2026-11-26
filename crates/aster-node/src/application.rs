@@ -2748,7 +2748,9 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::ProcessExclusiveLockUnavailable
         | StoreError::StoreInUse
         | StoreError::StoreZeroized(_) => ApplicationErrorKind::StateUnavailable,
-        StoreError::SemanticVerification(_)
+        StoreError::MissingStoreFormatVersion
+        | StoreError::UnsupportedStoreFormatVersion { .. }
+        | StoreError::SemanticVerification(_)
         | StoreError::StateVerification(_)
         | StoreError::RecordVerification(_)
         | StoreError::InvalidStoredIdLength { .. }

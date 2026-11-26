@@ -6380,14 +6380,6 @@ fn verify_stored_control_claim(
     verified: &VerifiedControlEnvelope,
     stored: &StoredControl,
 ) -> Result<(), NodeError> {
-    verify_stored_control_claim_with_legacy_recipient_backfill(verified, stored, false)
-}
-
-fn verify_stored_control_claim_with_legacy_recipient_backfill(
-    verified: &VerifiedControlEnvelope,
-    stored: &StoredControl,
-    allow_legacy_recipient_backfill: bool,
-) -> Result<(), NodeError> {
     verified.verify_exact_sealed(&stored.sealed)?;
     let predecessor = verified.previous_control().map(ControlTransferId::new);
     let effect_matches = match (&stored.effect, verified.kind()) {
@@ -6411,13 +6403,8 @@ fn verify_stored_control_claim_with_legacy_recipient_backfill(
         }
         _ => false,
     };
-    let recipient_claim_matches = if stored.scope_rekey_recipient_metadata_authenticated {
-        verified.scope_rekey_recipient_nodes() == stored.scope_rekey_recipients.as_deref()
-    } else {
-        allow_legacy_recipient_backfill
-            && matches!(&stored.effect, StoredControlEffect::ScopeEpoch { .. })
-            && stored.scope_rekey_recipients.is_none()
-    };
+    let recipient_claim_matches = stored.scope_rekey_recipient_metadata_authenticated
+        && verified.scope_rekey_recipient_nodes() == stored.scope_rekey_recipients.as_deref();
     if ControlTransferId::new(verified.envelope_id()) != stored.transfer_id
         || verified.mission_authority_id() != stored.authority
         || verified.signer() != stored.signer
@@ -6634,22 +6621,6 @@ pub(crate) fn open_replayed_verifier(
     store: &Store,
     credentials: &UnprotectedReferenceMission,
 ) -> Result<ReferenceEnvelopeSealer, NodeError> {
-    let recipient_backfills = store.scope_rekey_recipient_backfill_controls()?;
-    if !recipient_backfills.is_empty() {
-        let mut migration_verifier = ReferenceEnvelopeSealer::open(credentials.fresh_bundle()?)?;
-        let mut verified_backfills = Vec::with_capacity(recipient_backfills.len());
-        for stored in &recipient_backfills {
-            let verified = migration_verifier.verify_control(&stored.sealed)?;
-            verify_stored_control_claim_with_legacy_recipient_backfill(&verified, stored, true)?;
-            verified_backfills.push(verified);
-        }
-        let authenticated_backfills = verified_backfills
-            .iter()
-            .zip(&recipient_backfills)
-            .map(|(verified, stored)| (verified, stored.sealed.as_slice()))
-            .collect::<Vec<_>>();
-        store.backfill_scope_rekey_recipients_batch(&authenticated_backfills)?;
-    }
     let mut verifier = ReferenceEnvelopeSealer::open(credentials.fresh_bundle()?)?;
     replay_applied_controls(store, &mut verifier)?;
     Ok(verifier)

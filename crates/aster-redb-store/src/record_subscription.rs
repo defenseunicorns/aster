@@ -2003,7 +2003,7 @@ pub(crate) fn record_subscription_schema_wholly_absent_read(
 
 pub(crate) fn audit_record_subscription_tables(
     write: &redb::WriteTransaction,
-    exact_legacy_record_extensions: bool,
+    initializing_record: bool,
 ) -> Result<RecordSubscriptionStats, StoreError> {
     if write
         .list_multimap_tables()?
@@ -2038,7 +2038,7 @@ pub(crate) fn audit_record_subscription_tables(
     };
     let metadata_present = metadata_presence.iter().filter(|present| **present).count();
     if tables_present == 0 && metadata_present == 0 {
-        if !exact_legacy_record_extensions {
+        if !initializing_record {
             return Err(StoreError::RecordInvariant(
                 "Record subscription schema group is incomplete",
             ));

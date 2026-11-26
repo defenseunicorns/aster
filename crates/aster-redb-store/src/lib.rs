@@ -84,11 +84,16 @@ use redb::{
 };
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
 const ITEMS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("aster.items.v1");
 // These identifiers are the already-persisted v1 schema. Keep their bytes stable even
 // though the public API now uses the more accurate "acceptance marker" vocabulary.
+#[cfg(test)]
 const ACCEPTANCE_MARKERS: TableDefinition<&[u8], u64> = TableDefinition::new("aster.effects.v1");
 const METADATA: TableDefinition<&str, u64> = TableDefinition::new("aster.metadata.v1");
+/// The only supported Aster store format. Existing unversioned stores are not upgraded.
+pub const STORE_FORMAT_VERSION: u64 = 1;
+const STORE_FORMAT_VERSION_KEY: &str = "store_format_version";
 
 // Event tables extend the same redb transaction authority without sharing a
 // caller-controlled key namespace with legacy opaque ITEMS. EVENT_BYTES and
@@ -278,6 +283,7 @@ const EVENT_SUBSCRIPTION_VERSION: u8 = 2;
 const EVENT_PENDING_DELIVERY_VERSION: u8 = 1;
 const EVENT_ACKNOWLEDGEMENT_VERSION: u8 = 1;
 const EVENT_SUBSCRIPTION_ID_DOMAIN: &[u8] = b"aster/client-event-subscription-id/v2";
+#[cfg(test)]
 const LEGACY_CONTROL_METADATA_VERSION: u8 = 1;
 const CONTROL_METADATA_VERSION: u8 = 2;
 const CONTROL_RESERVATION_VERSION: u8 = 1;
@@ -3308,6 +3314,13 @@ impl SecurityProfilePolicyBinding {
 /// Failures from the durable accepted-item authority.
 #[derive(Debug)]
 pub enum StoreError {
+    /// An existing store does not declare its format.
+    MissingStoreFormatVersion,
+    /// An existing store declares a format this binary does not support.
+    UnsupportedStoreFormatVersion {
+        /// The declared format version.
+        found: u64,
+    },
     /// The storage engine rejected an operation.
     Backend(redb::Error),
     /// Blob publication metadata, policy, or physical-depot failure.
@@ -3772,6 +3785,13 @@ impl fmt::Display for StoreError {
             Self::Bridge(error) => write!(formatter, "{error}"),
             Self::Custody(error) => write!(formatter, "{error}"),
             Self::StorePath(error) => write!(formatter, "store path error: {error}"),
+            Self::MissingStoreFormatVersion => {
+                formatter.write_str("existing store has no format version; create a fresh store")
+            }
+            Self::UnsupportedStoreFormatVersion { found } => write!(
+                formatter,
+                "unsupported store format version {found}; supported version is {STORE_FORMAT_VERSION}"
+            ),
             Self::StoreBackingInvariant(reason) => {
                 write!(formatter, "store backing-file invariant failed: {reason}")
             }
@@ -5104,96 +5124,35 @@ fn open_existing_store_backing(path: &Path) -> Result<OpenedStoreBacking, StoreE
     validate_nonempty_store_backing(open_store_backing_file(path, false, false)?)
 }
 
-struct PublicationPreflightTemporary(Option<PathBuf>);
-
-impl Drop for PublicationPreflightTemporary {
-    fn drop(&mut self) {
-        if let Some(path) = &self.0 {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-fn reject_legacy_publication_read(read: &redb::ReadTransaction) -> Result<(), StoreError> {
-    let names = read
-        .list_tables()?
-        .map(|table| table.name().to_owned())
-        .collect::<std::collections::BTreeSet<_>>();
-    if read.list_multimap_tables()?.any(|table| {
-        [
-            ITEMS.name(),
-            ACCEPTANCE_MARKERS.name(),
-            EVENT_OPERATIONS.name(),
-            EVENT_OPERATION_WITNESSES.name(),
-            event_operation::EVENT_OPERATION_LEDGER_V3.name(),
-            event_operation::ACTIVE_OPERATION_BY_EVENT_V1.name(),
-        ]
-        .contains(&table.name())
-    }) {
-        return Err(StoreError::SemanticInvariant(
-            "retired store ledger has the wrong table kind",
-        ));
-    }
-    for definition in [
-        EVENT_OPERATIONS,
-        EVENT_OPERATION_WITNESSES,
-        event_operation::EVENT_OPERATION_LEDGER_V3,
-        event_operation::ACTIVE_OPERATION_BY_EVENT_V1,
-    ] {
-        if names.contains(definition.name()) && read.open_table(definition)?.len()? != 0 {
-            return Err(NumberedEventOperationError::LegacyStoreRequiresFreshState.into());
-        }
-    }
-    if names.contains(ITEMS.name()) && read.open_table(ITEMS)?.len()? != 0
-        || names.contains(ACCEPTANCE_MARKERS.name())
-            && read.open_table(ACCEPTANCE_MARKERS)?.len()? != 0
+fn require_new_store_write(write: &redb::WriteTransaction) -> Result<(), StoreError> {
+    if write
+        .open_table(METADATA)?
+        .get(STORE_FORMAT_VERSION_KEY)?
+        .is_some()
     {
-        return Err(NumberedEventOperationError::LegacyStoreRequiresFreshState.into());
-    }
-    reject_legacy_subscriptions_read(read)
-}
-
-fn reject_legacy_subscriptions_read(read: &redb::ReadTransaction) -> Result<(), StoreError> {
-    let names = read
-        .list_tables()?
-        .map(|table| table.name().to_owned())
-        .collect::<std::collections::BTreeSet<_>>();
-    if read.list_multimap_tables()?.any(|table| {
-        [
-            EVENT_SUBSCRIPTIONS.name(),
-            EVENT_SUBSCRIPTION_PENDING.name(),
-            EVENT_DELIVERY_ACKNOWLEDGEMENTS.name(),
-        ]
-        .contains(&table.name())
-    }) {
         return Err(StoreError::SemanticInvariant(
-            "Event subscription schema has the wrong table kind",
+            "supported store is missing required schema or metadata",
         ));
-    }
-    for definition in [EVENT_SUBSCRIPTION_PENDING, EVENT_DELIVERY_ACKNOWLEDGEMENTS] {
-        if !names.contains(EVENT_SUBSCRIPTIONS.name())
-            && names.contains(definition.name())
-            && read.open_table(definition)?.len()? != 0
-        {
-            return Err(StoreError::SemanticInvariant(
-                "Event delivery state has no owned subscription table",
-            ));
-        }
-    }
-    if names.contains(EVENT_SUBSCRIPTIONS.name()) {
-        let rows = read.open_table(EVENT_SUBSCRIPTIONS)?;
-        if rows.len()? > MAX_EVENT_SUBSCRIPTIONS {
-            return Err(StoreError::SemanticInvariant(
-                "Event subscriptions exceed their safety cap",
-            ));
-        }
-        for row in rows.iter()? {
-            let (_, value) = row?;
-            let record = decode_event_subscription_record(value.value())?;
-            numbered_event_operation::require_owner_registered_read(read, &record.owner)?;
-        }
     }
     Ok(())
+}
+
+fn require_store_format_read(read: &redb::ReadTransaction) -> Result<(), StoreError> {
+    let metadata = match read.open_table(METADATA) {
+        Ok(metadata) => metadata,
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            return Err(StoreError::MissingStoreFormatVersion);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    match metadata
+        .get(STORE_FORMAT_VERSION_KEY)?
+        .map(|value| value.value())
+    {
+        Some(STORE_FORMAT_VERSION) => Ok(()),
+        Some(found) => Err(StoreError::UnsupportedStoreFormatVersion { found }),
+        None => Err(StoreError::MissingStoreFormatVersion),
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -5291,16 +5250,72 @@ fn sync_store_parent(parent: &std::fs::File, path: &Path) -> std::io::Result<()>
     parent.sync_all()
 }
 
+// The owner acquires an exclusive whole-storage lock before constructing this
+// view and retains it through both preflight and writer use. Leave redb's lock
+// methods and close at their non-owning defaults: a read-only open must neither
+// downgrade the lock on the shared file description nor release it on close.
+#[derive(Clone, Debug)]
+struct LockedStoreBackend(std::sync::Arc<FileBackend>);
+
+impl redb::StorageBackend for LockedStoreBackend {
+    fn len(&self) -> std::io::Result<u64> {
+        self.0.len()
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+        self.0.read(offset, out)
+    }
+
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.0.set_len(len)
+    }
+
+    fn sync_data(&self) -> std::io::Result<()> {
+        self.0.sync_data()
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        self.0.write(offset, data)
+    }
+}
+
+fn check_store_backing(
+    backing: &OpenedStoreBacking,
+    check: fn(&redb::ReadTransaction) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let file = backing.file.try_clone().map_err(StoreError::StorePath)?;
+    let database = redb::Builder::new().open_read_only_with_backend(FileBackend::new(file)?)?;
+    check(&database.begin_read()?)
+}
+
 fn database_from_store_backing(
     backing: OpenedStoreBacking,
-) -> Result<(Database, StoreBackingIdentity, ProcessWriterLock), StoreError> {
+) -> Result<(Database, StoreBackingIdentity, ProcessWriterLock, bool), StoreError> {
+    use redb::StorageBackend as _;
+    use std::ops::Bound::Unbounded;
+
+    let process_writer_lock = acquire_process_writer_lock(&backing.file)?;
+    let backend = std::sync::Arc::new(FileBackend::new(backing.file)?);
+    if !backend
+        .try_lock_range(Unbounded, Unbounded)
+        .map_err(redb::StorageError::from)?
+    {
+        return Err(StoreError::StoreInUse);
+    }
+    // Keep the same exclusive lock across the read-only check and writer open.
+    // ReadOnlyDatabase enforces read-only I/O; neither view manages this lock.
+    let backend = LockedStoreBackend(backend);
+    let newly_created = backing.newly_created;
+    if !newly_created {
+        let database = redb::Builder::new().open_read_only_with_backend(backend.clone())?;
+        require_store_format_read(&database.begin_read()?)?;
+    }
     let identity = backing.identity;
     #[cfg(unix)]
     let parent_directory = backing.parent_directory;
     #[cfg(unix)]
     let path = backing.path;
-    let process_writer_lock = acquire_process_writer_lock(&backing.file)?;
-    let database = match Database::builder().create_with_backend(FileBackend::new(backing.file)?) {
+    let database = match Database::builder().create_with_backend(backend) {
         Ok(database) => database,
         Err(redb::DatabaseError::DatabaseAlreadyOpen) => return Err(StoreError::StoreInUse),
         Err(error) => return Err(error.into()),
@@ -5312,18 +5327,18 @@ fn database_from_store_backing(
             return Err(StoreError::StorePath(error));
         }
     }
-    Ok((database, identity, process_writer_lock))
+    Ok((database, identity, process_writer_lock, newly_created))
 }
 
 fn open_existing_store_database(
     path: &Path,
-) -> Result<(Database, StoreBackingIdentity, ProcessWriterLock), StoreError> {
+) -> Result<(Database, StoreBackingIdentity, ProcessWriterLock, bool), StoreError> {
     database_from_store_backing(open_existing_store_backing(path)?)
 }
 
 fn open_or_create_store_database(
     path: &Path,
-) -> Result<(Database, StoreBackingIdentity, ProcessWriterLock), StoreError> {
+) -> Result<(Database, StoreBackingIdentity, ProcessWriterLock, bool), StoreError> {
     database_from_store_backing(open_or_create_store_backing(path)?)
 }
 
@@ -5345,9 +5360,9 @@ fn require_exact_writer_exclusion(
         Ok(()) => Err(StoreError::ProcessExclusiveLockUnavailable),
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    match Database::builder().create_with_backend(FileBackend::new(backing.file)?) {
-        Err(redb::DatabaseError::DatabaseAlreadyOpen) => Ok(ProcessExclusiveLockProof(())),
-        Err(error) => Err(error.into()),
+    match database_from_store_backing(backing) {
+        Err(StoreError::StoreInUse) => Ok(ProcessExclusiveLockProof(())),
+        Err(error) => Err(error),
         Ok(second_writer) => {
             drop(second_writer);
             Err(StoreError::ProcessExclusiveLockUnavailable)
@@ -5774,8 +5789,8 @@ impl Store {
         Ok(store)
     }
 
-    /// Normal numbered-only node open. Read-only preflight precedes repair or migration,
-    /// and the exact acquired writer repeats the legacy-table refusal before any mutation.
+    /// Opens a numbered-only store. The exact locked backing is format-checked
+    /// before redb recovery or application writes.
     pub fn open_numbered_for_mission(
         path: impl AsRef<Path>,
         limits: StoreLimits,
@@ -5818,26 +5833,25 @@ impl Store {
         )
     }
 
-    /// Refuses pre-numbered Event publication ledgers without modifying their bytes.
-    /// Call before a normal node open, schema migration, maintenance, identity or network startup.
-    /// Retired opaque and Event ledgers are rejected before opening a writer.
+    /// Refuses missing or unsupported store formats without modifying their bytes.
+    /// Call before normal startup, maintenance, identity or network startup.
     pub fn require_numbered_publication_compatible(
         path: impl AsRef<Path>,
     ) -> Result<(), StoreError> {
-        Self::require_store_compatible(path, reject_legacy_publication_read)
+        Self::require_store_compatible(path, require_store_format_read)
     }
 
-    /// Rejects terminal or retired state before normal-operation writer recovery.
-    /// Terminal truth takes priority over publication compatibility. An unclean
-    /// store is inspected through a repaired disposable copy, not the original.
+    /// Rejects unsupported formats and terminal or retired state before writer open.
+    /// Read-only errors, including a required repair, are returned without recovery.
     /// Zeroization-only recovery deliberately does not use this admission check.
     pub fn require_normal_operation_compatible(path: impl AsRef<Path>) -> Result<(), StoreError> {
         Self::require_store_compatible(path, |read| {
+            require_store_format_read(read)?;
             let status = inspect_zeroization_read(read)?;
             if status.state().is_terminal() {
                 return Err(StoreError::StoreZeroized(status.state()));
             }
-            reject_legacy_publication_read(read)
+            Ok(())
         })
     }
 
@@ -5851,58 +5865,8 @@ impl Store {
             Err(error) => return Err(StoreError::StorePath(error)),
             Ok(_) => {}
         }
-        let mut backing = open_read_only_store_backing(path)?;
-        // Only one database uses this open file description. Keep the original
-        // descriptor solely to copy its bytes if the read-only open needs repair;
-        // never use the duplicate to open a second database handle.
-        let file = backing.file.try_clone().map_err(StoreError::StorePath)?;
-        match redb::Builder::new().open_read_only_with_backend(FileBackend::new(file)?) {
-            Ok(database) => check(&database.begin_read()?)?,
-            Err(error) => {
-                let error = StoreError::from(error);
-                if !error.is_read_only_repair_required() {
-                    return Err(error);
-                }
-                // An unclean redb allocator cannot be inspected through a read-only
-                // handle. Repair an owner-only disposable copy, never the original,
-                // so crash recovery does not bypass the legacy refusal boundary.
-                let mut nonce = [0_u8; 16];
-                getrandom::fill(&mut nonce).map_err(|_| {
-                    StoreError::StoreBackingInvariant(
-                        "publication preflight random source unavailable",
-                    )
-                })?;
-                let suffix = nonce
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>();
-                let temporary_path =
-                    std::env::temp_dir().join(format!("aster-publication-preflight-{suffix}.redb"));
-                let mut temporary = open_store_backing_file(&temporary_path, true, false)?;
-                let mut cleanup = PublicationPreflightTemporary(Some(temporary_path.clone()));
-                #[cfg(unix)]
-                {
-                    std::fs::remove_file(&temporary_path).map_err(StoreError::StorePath)?;
-                    cleanup.0 = None;
-                }
-                std::io::Seek::rewind(&mut backing.file).map_err(StoreError::StorePath)?;
-                let copied = std::io::copy(
-                    &mut std::io::Read::take(&mut backing.file, backing.length.saturating_add(1)),
-                    &mut temporary.file,
-                )
-                .map_err(StoreError::StorePath)?;
-                if copied != backing.length {
-                    return Err(StoreError::StoreBackingInvariant(
-                        "publication preflight source length changed",
-                    ));
-                }
-                let database =
-                    redb::Builder::new().create_with_backend(FileBackend::new(temporary.file)?)?;
-                check(&database.begin_read()?)?;
-                drop(database);
-                drop(cleanup);
-            }
-        }
+        let backing = open_read_only_store_backing(path)?;
+        check_store_backing(&backing, check)?;
         if backing.identity != open_read_only_store_backing(path)?.identity {
             return Err(StoreError::StoreBackingInvariant(
                 "publication preflight backing identity changed",
@@ -5963,7 +5927,7 @@ impl Store {
         path: impl AsRef<Path>,
     ) -> Result<StoreZeroizationStatus, StoreError> {
         let path = std::path::absolute(path).map_err(StoreError::StorePath)?;
-        let (database, _, _process_writer_lock) = open_existing_store_database(&path)?;
+        let (database, _, _process_writer_lock, _) = open_existing_store_database(&path)?;
         inspect_zeroization_readable(&database)
     }
 
@@ -5978,7 +5942,7 @@ impl Store {
     /// becomes usable.
     pub fn open_for_zeroization(path: impl AsRef<Path>) -> Result<ZeroizationStore, StoreError> {
         let path = std::path::absolute(path).map_err(StoreError::StorePath)?;
-        let (database, backing_identity, process_writer_lock) =
+        let (database, backing_identity, process_writer_lock, _) =
             open_existing_store_database(&path)?;
         let status = inspect_zeroization_readable(&database)?;
         if status.mission_authority.is_none() {
@@ -5996,9 +5960,8 @@ impl Store {
     /// Opens or creates a store and applies explicit admission limits.
     ///
     /// Opening scans the accepted-item table and audits every item/acceptance-marker pair.
-    /// Absent accounting fields are reconstructed for migration and committed;
-    /// present counters or marker high-water values must exactly match item-table
-    /// truth or opening fails closed. Existing data is preserved even if a newly
+    /// Accounting is initialized only for new stores. Existing counters and
+    /// marker high-water values must match item-table truth or opening fails closed. Existing data is preserved even if a newly
     /// supplied limit is lower; subsequent new-item admission remains closed until
     /// usage is within the configured limit.
     pub fn open_with_limits(
@@ -6029,7 +5992,7 @@ impl Store {
         expected_security_profile_policy: Option<SecurityProfilePolicyExpectation>,
     ) -> Result<Self, StoreError> {
         let path = std::path::absolute(path).map_err(StoreError::StorePath)?;
-        Self::require_store_compatible(&path, reject_legacy_publication_read)?;
+        Self::require_store_compatible(&path, require_store_format_read)?;
         if path.exists() {
             match reject_terminal_normal_open(&path) {
                 Ok(()) => match inspect_control_state_read_only(&path) {
@@ -6041,28 +6004,11 @@ impl Store {
                 Err(error) => return Err(error),
             }
         }
-        let (database, backing_identity, process_writer_lock) =
+        let (database, backing_identity, process_writer_lock, newly_created) =
             open_or_create_store_database(&path)?;
 
         let write = database.begin_write()?;
-        {
-            let names = write
-                .list_tables()?
-                .map(|table| table.name().to_owned())
-                .collect::<std::collections::BTreeSet<_>>();
-            for definition in [
-                EVENT_OPERATIONS,
-                EVENT_OPERATION_WITNESSES,
-                event_operation::EVENT_OPERATION_LEDGER_V3,
-                event_operation::ACTIVE_OPERATION_BY_EVENT_V1,
-            ] {
-                if names.contains(definition.name()) && write.open_table(definition)?.len()? != 0 {
-                    return Err(NumberedEventOperationError::LegacyStoreRequiresFreshState.into());
-                }
-            }
-        }
-        // Recheck under the exact writer transaction before opening any table.
-        // This closes the gap between the read-only startup check and migration.
+        // Existing stores were admitted from this exact descriptor before redb recovery.
         enforce_live_write(&write)?;
         if let Some(expected) = expected_mission_authority {
             check_expected_mission_binding(&write, expected)?;
@@ -6168,6 +6114,11 @@ impl Store {
             return Err(StoreError::SemanticInvariant(
                 "injected Blob lifecycle migration abort",
             ));
+        }
+        if newly_created {
+            write
+                .open_table(METADATA)?
+                .insert(STORE_FORMAT_VERSION_KEY, STORE_FORMAT_VERSION)?;
         }
         write.commit()?;
 
@@ -7785,196 +7736,6 @@ impl Store {
         self.require_live()?;
         let prepared = PreparedControl::from_verified(control, sealed)?;
         self.commit_prepared_control(&prepared, None, None)
-    }
-
-    /// Returns metadata-v1 scope controls that require authenticated recipient backfill.
-    ///
-    /// Rows are bounded by the control item cap and returned in chain sequence order.
-    /// Loading them confers no authority; callers must freshly verify each exact sealed
-    /// envelope before passing its capability to [`Self::backfill_scope_rekey_recipients`].
-    pub fn scope_rekey_recipient_backfill_controls(
-        &self,
-    ) -> Result<Vec<StoredControl>, StoreError> {
-        self.require_bound_mission()?;
-        let read = self.database.begin_read()?;
-        let ids = {
-            let records = read.open_table(CONTROL_RECORDS)?;
-            let mut ids = Vec::new();
-            for row in records.iter()? {
-                let (key, encoded) = row?;
-                if !decode_control_record(encoded.value())?
-                    .scope_rekey_recipient_metadata_authenticated
-                {
-                    ids.push(parse_control_transfer_id(
-                        "mission control record table",
-                        key.value(),
-                    )?);
-                }
-            }
-            ids
-        };
-        let mut controls = Vec::with_capacity(ids.len());
-        for transfer_id in ids {
-            controls.push(load_control_read(&read, transfer_id)?.ok_or(
-                StoreError::ControlInvariant("recipient backfill row disappeared"),
-            )?);
-        }
-        controls.sort_by_key(|control| control.sequence);
-        Ok(controls)
-    }
-
-    /// Transactionally backfills authenticated recipient IDs for one metadata-v1 scope row.
-    ///
-    /// The strong core capability must have been freshly derived from the row's exact sealed
-    /// bytes. Every stored claim and any local publication intent are rechecked. A pending
-    /// suffix whose authenticated recipient is already revoked is removed in this transaction;
-    /// an unsafe applied history fails closed.
-    pub fn backfill_scope_rekey_recipients(
-        &self,
-        control: &VerifiedControlEnvelope,
-        sealed: &[u8],
-    ) -> Result<(), StoreError> {
-        self.backfill_scope_rekey_recipients_batch(&[(control, sealed)])
-    }
-
-    /// Transactionally backfills a bounded, freshly authenticated migration batch.
-    ///
-    /// Inputs may mix metadata-v1 rows with already-current exact rows after an
-    /// interrupted migration. The batch is canonicalized by control sequence,
-    /// all retained claims and local intents are checked, and the complete
-    /// mutation is audited and committed once. If an earlier unsafe pending row
-    /// purges its dependent suffix, later authenticated inputs from the original
-    /// one-pass source list are skipped only within that exact purged range.
-    pub fn backfill_scope_rekey_recipients_batch(
-        &self,
-        controls: &[(&VerifiedControlEnvelope, &[u8])],
-    ) -> Result<(), StoreError> {
-        let authority = self.require_bound_mission()?;
-        if controls.is_empty() {
-            return Ok(());
-        }
-        if controls.len()
-            > usize::try_from(MAX_CONTROL_ITEMS).expect("control item limit fits usize")
-        {
-            return Err(StoreError::InvalidControl(
-                "recipient backfill batch exceeds the control item limit",
-            ));
-        }
-
-        let mut prepared = Vec::with_capacity(controls.len());
-        for (control, sealed) in controls {
-            if control.authority_id() != authority {
-                return Err(StoreError::MissionAuthorityMismatch {
-                    bound: authority,
-                    received: control.authority_id(),
-                });
-            }
-            let control = PreparedControl::from_verified(control, sealed)?;
-            if !matches!(
-                &control.record.effect,
-                StoredControlEffect::ScopeEpoch { .. }
-            ) {
-                return Err(StoreError::InvalidControl(
-                    "recipient backfill requires a scope-epoch control",
-                ));
-            }
-            prepared.push(control);
-        }
-        prepared.sort_by_key(|control| control.record.sequence);
-        if prepared
-            .windows(2)
-            .any(|pair| pair[0].record.sequence == pair[1].record.sequence)
-        {
-            return Err(StoreError::InvalidControl(
-                "recipient backfill batch contains a duplicate sequence",
-            ));
-        }
-
-        let write = self.database.begin_write()?;
-        enforce_live_write(&write)?;
-        let mut purged_from = None;
-        for prepared in prepared {
-            let Some(stored) = load_control_write(&write, prepared.record.transfer_id)? else {
-                if purged_from.is_some_and(|first| prepared.record.sequence >= first) {
-                    continue;
-                }
-                return Err(StoreError::ControlInvariant(
-                    "recipient backfill control is not retained",
-                ));
-            };
-            let claims_match = stored.transfer_id == prepared.record.transfer_id
-                && stored.authority == prepared.record.authority
-                && stored.signer == prepared.record.signer
-                && stored.sequence == prepared.record.sequence
-                && stored.previous_control == prepared.record.previous_control
-                && stored.effect == prepared.record.effect
-                && stored.sealed == prepared.sealed;
-            if !claims_match {
-                return Err(StoreError::ControlFork);
-            }
-            if stored.scope_rekey_recipient_metadata_authenticated {
-                if stored.scope_rekey_recipients != prepared.record.scope_rekey_recipients {
-                    return Err(StoreError::ControlFork);
-                }
-                continue;
-            }
-
-            let existing_intent = write
-                .open_table(CONTROL_PUBLICATION_INTENTS)?
-                .get(prepared.record.transfer_id.as_bytes().as_slice())?
-                .map(|value| decode_scope_rekey_publication_intent(value.value()))
-                .transpose()?;
-            if let Some(intent) = existing_intent.as_ref() {
-                let reservation = write
-                    .open_table(CONTROL_RESERVATIONS)?
-                    .get(prepared.record.transfer_id.as_bytes().as_slice())?
-                    .map(|value| decode_control_reservation(value.value()))
-                    .transpose()?
-                    .ok_or(StoreError::ControlInvariant(
-                        "legacy local rekey intent lost its reservation receipt",
-                    ))?;
-                validate_control_publication_intent(
-                    Some(intent),
-                    Some(&reservation),
-                    &prepared.record,
-                )
-                .map_err(|_| {
-                    StoreError::ControlInvariant(
-                        "authenticated legacy rekey recipients differ from local intent",
-                    )
-                })?;
-            }
-
-            write.open_table(CONTROL_RECORDS)?.insert(
-                prepared.record.transfer_id.as_bytes().as_slice(),
-                prepared.encoded.as_slice(),
-            )?;
-            let rejection = if !stored.applied {
-                if let Some(recipient) = first_revoked_scope_rekey_recipient_write(
-                    &write,
-                    prepared.record.scope_rekey_recipients.as_deref(),
-                )? {
-                    Some(ControlRejectionReason::ScopeRekeyRecipientRevoked(
-                        recipient,
-                    ))
-                } else if prepared.record.scope_rekey_recipients.is_none()
-                    && write.open_table(CONTROL_REVOCATIONS)?.len()? != 0
-                {
-                    Some(ControlRejectionReason::LegacyRecipientSetUnavailable)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            if let Some(reason) = rejection {
-                purge_pending_control_suffix(&write, stored.sequence, reason)?;
-                purged_from = Some(stored.sequence);
-            }
-        }
-        audit_control_tables(&write)?;
-        write.commit()?;
-        Ok(())
     }
 
     /// Proves that an applied scope rekey is an exact retry of one local publication intent.
@@ -15875,6 +15636,7 @@ fn inspect_zeroization_readable(
     database: &impl ReadableDatabase,
 ) -> Result<StoreZeroizationStatus, StoreError> {
     let read = database.begin_read()?;
+    require_store_format_read(&read)?;
     inspect_zeroization_read(&read)
 }
 
@@ -16303,6 +16065,7 @@ fn inspect_security_profile_policy_read_only(
 ) -> Result<Option<SecurityProfilePolicyBinding>, StoreError> {
     let database = redb::Builder::new().open_read_only(path)?;
     let read = database.begin_read()?;
+    require_store_format_read(&read)?;
     let mission_authority = if read
         .list_tables()?
         .any(|table| table.name() == SEMANTIC_DOMAIN.name())
@@ -16354,6 +16117,7 @@ fn bind_security_profile_policy_write(
 fn inspect_mission_binding_read_only(path: &Path) -> Result<Option<NodeId>, StoreError> {
     let database = redb::Builder::new().open_read_only(path)?;
     let read = database.begin_read()?;
+    require_store_format_read(&read)?;
     let table_names = read
         .list_tables()?
         .map(|table| table.name().to_owned())
@@ -16445,6 +16209,7 @@ fn inspect_mission_binding_read_only(path: &Path) -> Result<Option<NodeId>, Stor
 fn inspect_control_state_read_only(path: &Path) -> Result<(), StoreError> {
     let database = redb::Builder::new().open_read_only(path)?;
     let read = database.begin_read()?;
+    require_store_format_read(&read)?;
     let table_names = read
         .list_tables()?
         .map(|table| table.name().to_owned())
@@ -16625,6 +16390,12 @@ fn audit_event_page_attempt_cursors_write(
             "Event-page attempt cursor table has the wrong table kind",
         ));
     }
+    if !write
+        .list_tables()?
+        .any(|table| table.name() == EVENT_PAGE_ATTEMPT_CURSORS.name())
+    {
+        require_new_store_write(write)?;
+    }
     let table = write.open_table(EVENT_PAGE_ATTEMPT_CURSORS)?;
     audit_event_page_attempt_cursor_rows(&table, mission_authority)
 }
@@ -16743,6 +16514,12 @@ fn audit_mutable_transfer_cursors_write(
             "mutable-transfer cursor table has the wrong table kind",
         ));
     }
+    if !write
+        .list_tables()?
+        .any(|table| table.name() == MUTABLE_TRANSFER_CURSORS.name())
+    {
+        require_new_store_write(write)?;
+    }
     let table = write.open_table(MUTABLE_TRANSFER_CURSORS)?;
     audit_mutable_transfer_cursor_rows(&table, mission_authority)
 }
@@ -16816,7 +16593,7 @@ struct StateAuditSnapshot {
 fn audit_state_tables(
     write: &redb::WriteTransaction,
 ) -> Result<(StateAuditSnapshot, bool), StoreError> {
-    let exact_legacy_current_extensions = preflight_state_schema_group(write)?;
+    let initializing_state = preflight_state_schema_group(write)?;
     if write
         .list_multimap_tables()?
         .any(|table| table.name() == STATE_ACCEPTANCE_ORDER.name())
@@ -16838,7 +16615,7 @@ fn audit_state_tables(
     let states = write.open_table(STATES)?;
     let state_bytes = write.open_table(STATE_BYTES)?;
     let state_markers = write.open_table(STATE_ACCEPTANCE_MARKERS)?;
-    let mut state_acceptance_order = write.open_table(STATE_ACCEPTANCE_ORDER)?;
+    let state_acceptance_order = write.open_table(STATE_ACCEPTANCE_ORDER)?;
     let state_semantic_items = write.open_table(STATE_SEMANTIC_ITEMS)?;
     let state_groups = write.open_table(STATE_GROUP_VERSIONS)?;
     let state_operations = write.open_table(STATE_OPERATIONS)?;
@@ -16913,20 +16690,10 @@ fn audit_state_tables(
                     ));
                 }
             }
-            None if acceptance_order_existed => {
+            None => {
                 return Err(StoreError::StateInvariant(
                     "State acceptance-order index is missing an accepted State",
                 ));
-            }
-            None => {
-                if state_acceptance_order
-                    .insert(marker, transfer_id.as_bytes().as_slice())?
-                    .is_some()
-                {
-                    return Err(StoreError::StateInvariant(
-                        "State acceptance marker is already indexed to another transfer",
-                    ));
-                }
             }
         }
         let indexed_transfer = state_semantic_items
@@ -17195,7 +16962,7 @@ fn audit_state_tables(
         audit_or_initialize_counter(&mut metadata, STATE_OPERATION_COUNT, operation_count)?;
         audit_or_initialize_counter(&mut metadata, STATE_OPERATION_TOTAL_BYTES, operation_bytes)?;
     }
-    Ok((snapshot, exact_legacy_current_extensions))
+    Ok((snapshot, initializing_state))
 }
 
 fn preflight_state_schema_group(write: &redb::WriteTransaction) -> Result<bool, StoreError> {
@@ -17237,6 +17004,7 @@ fn preflight_state_schema_group(write: &redb::WriteTransaction) -> Result<bool, 
     let subscription_schema_absent =
         state_subscription::state_subscription_schema_wholly_absent_write(write)?;
     if present_tables == 0 && present_metadata == 0 {
+        require_new_store_write(write)?;
         if acceptance_order_present || !subscription_schema_absent {
             return Err(StoreError::StateInvariant(
                 "mission-scoped State schema group is incomplete",
@@ -17262,7 +17030,9 @@ fn preflight_state_schema_group(write: &redb::WriteTransaction) -> Result<bool, 
         ));
     }
     match (acceptance_order_present, subscription_schema_absent) {
-        (false, true) => Ok(true),
+        (false, true) => Err(StoreError::SemanticInvariant(
+            "supported store lacks required acceptance-order and subscription schema",
+        )),
         (true, false) => Ok(false),
         (true, true) => Err(StoreError::StateInvariant(
             "State subscription schema group is incomplete",
@@ -17312,6 +17082,7 @@ fn preflight_record_schema_group(write: &redb::WriteTransaction) -> Result<bool,
     let subscription_schema_absent =
         record_subscription::record_subscription_schema_wholly_absent_write(write)?;
     if present_tables == 0 && present_metadata == 0 {
+        require_new_store_write(write)?;
         if acceptance_order_present || !subscription_schema_absent {
             return Err(StoreError::RecordInvariant(
                 "mission-scoped Record schema group is incomplete",
@@ -17337,7 +17108,9 @@ fn preflight_record_schema_group(write: &redb::WriteTransaction) -> Result<bool,
         ));
     }
     match (acceptance_order_present, subscription_schema_absent) {
-        (false, true) => Ok(true),
+        (false, true) => Err(StoreError::SemanticInvariant(
+            "supported store lacks required acceptance-order and subscription schema",
+        )),
         (true, false) => Ok(false),
         (true, true) => Err(StoreError::RecordInvariant(
             "Record subscription schema group is incomplete",
@@ -17352,11 +17125,11 @@ fn audit_record_tables(
     write: &redb::WriteTransaction,
     shared: &mut StateAuditSnapshot,
 ) -> Result<bool, StoreError> {
-    let exact_legacy_record_extensions = preflight_record_schema_group(write)?;
+    let initializing_record = preflight_record_schema_group(write)?;
     let records = write.open_table(RECORDS)?;
     let record_bytes = write.open_table(RECORD_BYTES)?;
     let markers = write.open_table(RECORD_ACCEPTANCE_MARKERS)?;
-    let mut acceptance_order = write.open_table(RECORD_ACCEPTANCE_ORDER)?;
+    let acceptance_order = write.open_table(RECORD_ACCEPTANCE_ORDER)?;
     let semantic_items = write.open_table(RECORD_SEMANTIC_ITEMS)?;
     let groups = write.open_table(RECORD_GROUP_VERSIONS)?;
     let operations = write.open_table(RECORD_OPERATIONS)?;
@@ -17429,20 +17202,10 @@ fn audit_record_tables(
                     ));
                 }
             }
-            None if !exact_legacy_record_extensions => {
+            None => {
                 return Err(StoreError::RecordInvariant(
                     "Record acceptance-order index is missing an accepted Record",
                 ));
-            }
-            None => {
-                if acceptance_order
-                    .insert(marker, transfer_id.as_bytes().as_slice())?
-                    .is_some()
-                {
-                    return Err(StoreError::RecordInvariant(
-                        "Record acceptance marker is indexed to another transfer",
-                    ));
-                }
             }
         }
         let indexed = semantic_items
@@ -17677,18 +17440,16 @@ fn audit_record_tables(
     audit_or_initialize_counter(&mut metadata, LAST_RECORD_ACCEPTANCE_MARKER, last_marker)?;
     audit_or_initialize_counter(&mut metadata, RECORD_OPERATION_COUNT, operation_count)?;
     audit_or_initialize_counter(&mut metadata, RECORD_OPERATION_TOTAL_BYTES, operation_bytes)?;
-    Ok(exact_legacy_record_extensions)
+    Ok(initializing_record)
 }
 
 fn audit_semantic_tables(
     write: &redb::WriteTransaction,
     _limits: StoreLimits,
 ) -> Result<(BlobStoreStats, bool), StoreError> {
-    // Opening every table here is the non-destructive schema extension for old
-    // stores. Existing v1 opaque item/effect bytes remain untouched and use a
-    // disjoint caller-controlled key namespace.
-    let (mut state_audit, exact_legacy_state_extensions) = audit_state_tables(write)?;
-    let exact_legacy_record_extensions = audit_record_tables(write, &mut state_audit)?;
+    // Initialize new-store tables or audit the supported schema without upgrading it.
+    let (mut state_audit, initializing_state) = audit_state_tables(write)?;
+    let initializing_record = audit_record_tables(write, &mut state_audit)?;
     let blob_audit = blob::audit_blob_tables_write(write, &mut state_audit)?;
     let wrong_multimap_tables = write
         .list_multimap_tables()?
@@ -17704,13 +17465,16 @@ fn audit_semantic_tables(
             "Event operation-witness index has the wrong table kind",
         ));
     }
-    let acceptance_order_existed = write
+    if !write
         .list_tables()?
-        .any(|table| table.name() == EVENT_ACCEPTANCE_ORDER.name());
+        .any(|table| table.name() == EVENT_ACCEPTANCE_ORDER.name())
+    {
+        require_new_store_write(write)?;
+    }
     let events = write.open_table(EVENTS)?;
     let event_bytes = write.open_table(EVENT_BYTES)?;
     let event_markers = write.open_table(EVENT_ACCEPTANCE_MARKERS)?;
-    let mut event_acceptance_order = write.open_table(EVENT_ACCEPTANCE_ORDER)?;
+    let event_acceptance_order = write.open_table(EVENT_ACCEPTANCE_ORDER)?;
     let semantic_items = write.open_table(SEMANTIC_ITEMS)?;
     let state_semantic_items = write.open_table(STATE_SEMANTIC_ITEMS)?;
     let accepted_dots = write.open_table(ACCEPTED_DOTS)?;
@@ -17791,20 +17555,10 @@ fn audit_semantic_tables(
                     ));
                 }
             }
-            None if acceptance_order_existed => {
+            None => {
                 return Err(StoreError::SemanticInvariant(
                     "Event acceptance-order index is missing an accepted Event",
                 ));
-            }
-            None => {
-                if event_acceptance_order
-                    .insert(marker, transfer_id.as_bytes().as_slice())?
-                    .is_some()
-                {
-                    return Err(StoreError::SemanticInvariant(
-                        "Event acceptance marker is already indexed to another transfer",
-                    ));
-                }
             }
         }
         reconstructed_event_history_count = reconstructed_event_history_count
@@ -18199,8 +17953,8 @@ fn audit_semantic_tables(
     drop(route_claims);
     drop(_domain);
     audit_event_subscription_tables(write)?;
-    state_subscription::audit_state_subscription_tables(write, exact_legacy_state_extensions)?;
-    record_subscription::audit_record_subscription_tables(write, exact_legacy_record_extensions)?;
+    state_subscription::audit_state_subscription_tables(write, initializing_state)?;
+    record_subscription::audit_record_subscription_tables(write, initializing_record)?;
     blob_subscription::audit_blob_subscription_tables(write)?;
     Ok((blob_audit.stats, blob_audit.deletion_schema_migrated))
 }
@@ -18259,9 +18013,9 @@ fn audit_event_subscription_tables(write: &redb::WriteTransaction) -> Result<(),
         .collect::<std::collections::BTreeSet<_>>();
     let subscription_table_present = table_names.contains(EVENT_SUBSCRIPTIONS.name());
     let pending_table_present = table_names.contains(EVENT_SUBSCRIPTION_PENDING.name());
-    let mut acknowledgement_table_present =
+    let acknowledgement_table_present =
         table_names.contains(EVENT_DELIVERY_ACKNOWLEDGEMENTS.name());
-    let mut metadata_presence = {
+    let metadata_presence = {
         let metadata = write.open_table(METADATA)?;
         [
             metadata.get(EVENT_SUBSCRIPTION_COUNT)?.is_some(),
@@ -18276,6 +18030,7 @@ fn audit_event_subscription_tables(write: &redb::WriteTransaction) -> Result<(),
         && !acknowledgement_table_present
         && present_metadata == 0
     {
+        require_new_store_write(write)?;
         write.open_table(EVENT_SUBSCRIPTIONS)?;
         write.open_table(EVENT_SUBSCRIPTION_PENDING)?;
         write.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?;
@@ -18286,11 +18041,6 @@ fn audit_event_subscription_tables(write: &redb::WriteTransaction) -> Result<(),
         metadata.insert(EVENT_ACKNOWLEDGEMENT_COUNT, 0)?;
         return Ok(());
     }
-    let exact_legacy_group = subscription_table_present
-        && pending_table_present
-        && !acknowledgement_table_present
-        && metadata_presence[..3].iter().all(|present| *present)
-        && !metadata_presence[3];
     let subscription_rows = if subscription_table_present {
         write.open_table(EVENT_SUBSCRIPTIONS)?.len()?
     } else {
@@ -18317,42 +18067,6 @@ fn audit_event_subscription_tables(write: &redb::WriteTransaction) -> Result<(),
         return Err(StoreError::SemanticInvariant(
             "Event subscription tables exceed their bounded cardinality",
         ));
-    }
-    if exact_legacy_group {
-        let mut legacy_projections = std::collections::BTreeSet::new();
-        let legacy_subscription_count = {
-            let subscriptions = write.open_table(EVENT_SUBSCRIPTIONS)?;
-            for row in subscriptions.iter()? {
-                let (_, value) = row?;
-                let spec = decode_event_subscription_record(value.value())?.spec;
-                legacy_projections.insert((spec.topic, spec.scope, spec.include_descendant_scopes));
-            }
-            subscriptions.len()?
-        };
-        let legacy_revision = write
-            .open_table(METADATA)?
-            .get(EVENT_SELECTOR_REVISION)?
-            .ok_or(StoreError::MissingAccountingMetadata {
-                field: EVENT_SELECTOR_REVISION,
-            })?
-            .value();
-        let expected_legacy_revision = u64::try_from(legacy_projections.len())
-            .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
-        if legacy_revision != expected_legacy_revision {
-            return Err(StoreError::AccountingMismatch {
-                field: EVENT_SELECTOR_REVISION,
-                durable: legacy_revision,
-                reconstructed: expected_legacy_revision,
-            });
-        }
-        write.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?;
-        {
-            let mut metadata = write.open_table(METADATA)?;
-            metadata.insert(EVENT_ACKNOWLEDGEMENT_COUNT, 0)?;
-            metadata.insert(EVENT_SELECTOR_REVISION, legacy_subscription_count)?;
-        }
-        acknowledgement_table_present = true;
-        metadata_presence[3] = true;
     }
     if !subscription_table_present
         || !pending_table_present
@@ -19075,7 +18789,10 @@ fn audit_or_initialize_counter(
         }),
         Some(_) => Ok(()),
         None => {
-            metadata.insert(field, reconstructed)?;
+            if metadata.get(STORE_FORMAT_VERSION_KEY)?.is_some() || reconstructed != 0 {
+                return Err(StoreError::MissingAccountingMetadata { field });
+            }
+            metadata.insert(field, 0)?;
             Ok(())
         }
     }
@@ -20348,10 +20065,7 @@ fn encode_control_record(record: &ControlRecord) -> Result<Vec<u8>, StoreError> 
 fn decode_control_record(bytes: &[u8]) -> Result<ControlRecord, StoreError> {
     let mut cursor = ControlDecodeCursor::new(bytes);
     let version = cursor.u8()?;
-    if !matches!(
-        version,
-        LEGACY_CONTROL_METADATA_VERSION | CONTROL_METADATA_VERSION
-    ) {
+    if version != CONTROL_METADATA_VERSION {
         return Err(StoreError::ControlInvariant(
             "unsupported durable control metadata version",
         ));
@@ -20391,36 +20105,30 @@ fn decode_control_record(bytes: &[u8]) -> Result<ControlRecord, StoreError> {
             ));
         }
     };
-    let (scope_rekey_recipients, scope_rekey_recipient_metadata_authenticated) =
-        if version == LEGACY_CONTROL_METADATA_VERSION {
-            (
-                None,
-                !matches!(&effect, StoredControlEffect::ScopeEpoch { .. }),
-            )
-        } else {
-            let recipients = match cursor.u8()? {
-                0 => None,
-                1 => {
-                    let count = usize::from(cursor.u16()?);
-                    if count == 0 || count > MAX_CONTROL_INTENT_RECIPIENTS {
-                        return Err(StoreError::ControlInvariant(
-                            "scope-rekey recipient count is outside its durable bound",
-                        ));
-                    }
-                    let mut recipients = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        recipients.push(cursor.array()?);
-                    }
-                    Some(recipients)
-                }
-                _ => {
+    let (scope_rekey_recipients, scope_rekey_recipient_metadata_authenticated) = {
+        let recipients = match cursor.u8()? {
+            0 => None,
+            1 => {
+                let count = usize::from(cursor.u16()?);
+                if count == 0 || count > MAX_CONTROL_INTENT_RECIPIENTS {
                     return Err(StoreError::ControlInvariant(
-                        "invalid scope-rekey recipient presence tag",
+                        "scope-rekey recipient count is outside its durable bound",
                     ));
                 }
-            };
-            (recipients, true)
+                let mut recipients = Vec::with_capacity(count);
+                for _ in 0..count {
+                    recipients.push(cursor.array()?);
+                }
+                Some(recipients)
+            }
+            _ => {
+                return Err(StoreError::ControlInvariant(
+                    "invalid scope-rekey recipient presence tag",
+                ));
+            }
         };
+        (recipients, true)
+    };
     cursor.finish()?;
     let record = ControlRecord {
         transfer_id,
@@ -23053,16 +22761,11 @@ fn event_subscription_stats_read(
     {
         return Ok(EventSubscriptionStats::default());
     }
-    let exact_legacy_group = subscription_table_present
-        && pending_table_present
-        && !acknowledgement_table_present
-        && metadata_presence[..3].iter().all(|present| *present)
-        && !metadata_presence[3];
     let exact_current_group = subscription_table_present
         && pending_table_present
         && acknowledgement_table_present
         && metadata_presence.iter().all(|present| *present);
-    if !exact_legacy_group && !exact_current_group {
+    if !exact_current_group {
         return Err(StoreError::SemanticInvariant(
             "Event subscription schema group is incomplete",
         ));
@@ -23096,7 +22799,6 @@ fn event_subscription_stats_read(
         })?
         .value();
     let mut decoded_subscriptions = std::collections::BTreeMap::new();
-    let mut legacy_projections = std::collections::BTreeSet::new();
     for row in subscriptions.iter()? {
         let (key, value) = row?;
         let id = parse_event_subscription_id(key.value())?;
@@ -23117,11 +22819,6 @@ fn event_subscription_stats_read(
                 "Event subscription contains an invalid delivery cursor",
             ));
         }
-        legacy_projections.insert((
-            record.spec.topic.clone(),
-            record.spec.scope.clone(),
-            record.spec.include_descendant_scopes,
-        ));
         decoded_subscriptions.insert(id, record);
     }
     if subscriptions.len()? > MAX_EVENT_SUBSCRIPTIONS {
@@ -23249,9 +22946,6 @@ fn event_subscription_stats_read(
         (EVENT_PENDING_DELIVERY_COUNT, stats.pending_deliveries),
         (EVENT_ACKNOWLEDGEMENT_COUNT, stats.acknowledged_deliveries),
     ] {
-        if exact_legacy_group && field == EVENT_ACKNOWLEDGEMENT_COUNT {
-            continue;
-        }
         let durable = metadata
             .get(field)?
             .ok_or(StoreError::MissingAccountingMetadata { field })?
@@ -23264,19 +22958,7 @@ fn event_subscription_stats_read(
             });
         }
     }
-    if exact_legacy_group {
-        let expected_revision = u64::try_from(legacy_projections.len())
-            .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
-        if stats.selector_revision != expected_revision {
-            return Err(StoreError::AccountingMismatch {
-                field: EVENT_SELECTOR_REVISION,
-                durable: stats.selector_revision,
-                reconstructed: expected_revision,
-            });
-        }
-    } else {
-        validate_event_selector_generation(stats.selector_revision, stats.subscriptions)?;
-    }
+    validate_event_selector_generation(stats.selector_revision, stats.subscriptions)?;
     Ok(stats)
 }
 
@@ -23286,8 +22968,8 @@ fn inspect_readable(
     backing_identity: StoreBackingIdentity,
 ) -> Result<StoreInspection, StoreError> {
     let read = database.begin_read()?;
+    require_store_format_read(&read)?;
     let zeroization = inspect_zeroization_read(&read)?;
-    reject_legacy_publication_read(&read)?;
     let metadata = read.open_table(METADATA)?;
     let (mut event_stats, state_stats, record_stats, blob_stats, mission_authority) =
         inspect_semantic_readable(&read)?;
