@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>Aster two-node quickstart</title>
+    <link rel="stylesheet" href="/static/styles.css?token=__TOKEN__">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Aster operational quickstart</p>
+          <h1>Run two nodes. Send one real Event.</h1>
+          <p class="lede">Control each local node, authenticate the pair, and watch durable commit become verified receipt.</p>
+        </div>
+        <div class="session-state">
+          <span id="session-signal" class="signal" aria-hidden="true"></span>
+          <span id="status" aria-live="polite">Workspace ready. Start both nodes.</span>
+        </div>
+      </header>
+
+      <nav aria-label="Quickstart progress">
+        <ol class="progress">
+          <li id="workspace-step"><span class="step-number">1</span>Workspace<span id="workspace-progress-state" class="sr-only">Pending</span></li>
+          <li id="publisher-step"><span class="step-number">2</span>Publisher<span id="publisher-progress-state" class="sr-only">Pending</span></li>
+          <li id="receiver-step"><span class="step-number">3</span>Receiver<span id="receiver-progress-state" class="sr-only">Pending</span></li>
+          <li id="auth-step"><span class="step-number">4</span>Authentication<span id="auth-progress-state" class="sr-only">Pending</span></li>
+          <li id="event-step"><span class="step-number">5</span>Event<span id="event-progress-state" class="sr-only">Pending</span></li>
+        </ol>
+      </nav>
+
+      <section class="transcript-card" aria-labelledby="execution-transcript-title">
+        <div class="section-heading">
+          <div>
+            <p class="node-kicker">Execution evidence</p>
+            <h2 id="execution-transcript-title">Command transcript</h2>
+          </div>
+          <span class="transcript-note">Commands and internal operations</span>
+        </div>
+        <p>Inspect the exact commands and internal operations recorded with bounded evidence for this disposable quickstart.</p>
+        <div id="execution-transcript" class="execution-transcript"></div>
+      </section>
+
+      <section class="node-grid" aria-label="Publisher and receiver nodes">
+        <article id="publisher-card" class="node-card" aria-labelledby="publisher-title">
+          <header class="node-heading">
+            <div><p class="node-kicker">Source node</p><h2 id="publisher-title">Publisher</h2></div>
+            <span id="publisher-state" class="pill">stopped</span>
+          </header>
+          <p class="identity">Identity <code id="publisher-fingerprint">initializing…</code></p>
+          <div class="node-actions">
+            <button id="publisher-start" type="button" class="primary" aria-label="Start Publisher" disabled>Start</button>
+            <button id="publisher-stop" type="button" aria-label="Stop Publisher" disabled>Stop</button>
+            <button id="publisher-terminal" type="button" aria-label="Open Publisher terminal" disabled>Open terminal</button>
+          </div>
+          <div id="publisher-fallback" class="terminal-fallback" hidden>
+            <span id="publisher-fallback-note">Terminal could not open; browser output continues. Run:</span>
+            <code id="publisher-attach-command" tabindex="0"></code>
+            <button id="publisher-copy-command" type="button" aria-label="Copy Publisher observer command" aria-describedby="publisher-copy-feedback">Copy command</button>
+            <span id="publisher-copy-feedback" class="terminal-copy-feedback" aria-live="polite"></span>
+          </div>
+          <pre id="publisher-output" class="terminal-output" tabindex="0" aria-label="Publisher live output"></pre>
+        </article>
+
+        <article id="receiver-card" class="node-card" aria-labelledby="receiver-title">
+          <header class="node-heading">
+            <div><p class="node-kicker">Destination node</p><h2 id="receiver-title">Receiver</h2></div>
+            <span id="receiver-state" class="pill">stopped</span>
+          </header>
+          <p class="identity">Identity <code id="receiver-fingerprint">initializing…</code></p>
+          <div class="node-actions">
+            <button id="receiver-start" type="button" class="primary" aria-label="Start Receiver" disabled>Start</button>
+            <button id="receiver-stop" type="button" aria-label="Stop Receiver" disabled>Stop</button>
+            <button id="receiver-terminal" type="button" aria-label="Open Receiver terminal" disabled>Open terminal</button>
+          </div>
+          <div id="receiver-fallback" class="terminal-fallback" hidden>
+            <span id="receiver-fallback-note">Terminal could not open; browser output continues. Run:</span>
+            <code id="receiver-attach-command" tabindex="0"></code>
+            <button id="receiver-copy-command" type="button" aria-label="Copy Receiver observer command" aria-describedby="receiver-copy-feedback">Copy command</button>
+            <span id="receiver-copy-feedback" class="terminal-copy-feedback" aria-live="polite"></span>
+          </div>
+          <pre id="receiver-output" class="terminal-output" tabindex="0" aria-label="Receiver live output"></pre>
+        </article>
+      </section>
+
+      <section class="control-card" aria-labelledby="connect-title">
+        <div class="section-heading">
+          <div><p class="node-kicker">Pair control</p><h2 id="connect-title">Authenticate the nodes</h2></div>
+          <span id="auth-state" class="pill">unauthenticated</span>
+        </div>
+        <p>Both nodes restart with reciprocal peer configuration, then verify an internal challenge Event.</p>
+        <button id="authenticate" type="button" class="primary" disabled>Authenticate nodes</button>
+      </section>
+
+      <section class="control-card" aria-labelledby="event-title">
+        <div class="section-heading">
+          <div><p class="node-kicker">Event path</p><h2 id="event-title">Publish and verify</h2></div>
+          <label class="detail-control" for="detail-level">Output detail
+            <select id="detail-level">
+              <option value="compact">Compact</option>
+              <option value="guided" selected>Guided</option>
+              <option value="debug">Debug</option>
+            </select>
+          </label>
+        </div>
+        <form id="event-form" class="compose">
+          <label for="event-text">Event text</label>
+          <textarea id="event-text" rows="3" maxlength="4096" required>Hello from the Aster quickstart.</textarea>
+          <p id="validation-message" class="validation" aria-live="polite"></p>
+          <button id="send-event" type="submit" class="primary" disabled>Send Event</button>
+        </form>
+
+        <div id="delivery-result" class="delivery-result" hidden aria-live="polite">
+          <div><span>Publisher</span><strong id="commit-result">Waiting for commit…</strong></div>
+          <span class="delivery-arrow" aria-hidden="true">→</span>
+          <div><span>Receiver</span><strong id="receipt-result">Waiting for receiver…</strong></div>
+        </div>
+
+        <section id="offline-panel" class="explore" hidden aria-labelledby="explore-title">
+          <div><p class="node-kicker">Optional exploration</p><h3 id="explore-title">What happens without a transport?</h3></div>
+          <button id="offline-experiment" type="button" disabled>Try transport unavailable</button>
+        </section>
+
+        <details id="technical-evidence">
+          <summary>Technical evidence</summary>
+          <pre id="evidence"></pre>
+        </details>
+      </section>
+
+      <section class="cleanup-card" aria-labelledby="cleanup-title">
+        <div><h2 id="cleanup-title">Finished?</h2><p>Stop both nodes and remove the disposable workspace.</p></div>
+        <button id="cleanup" type="button" class="danger" disabled>Clean up everything</button>
+      </section>
+    </main>
+    <script src="/static/app.js?token=__TOKEN__" defer></script>
+  </body>
+</html>
