@@ -35,7 +35,7 @@ For a shorter path based on what you are trying to accomplish, start at the
 - [Selected production-lane architecture](architecture.md)
 - [Protocol specification](protocol.md)
 - [Envelope and security-object specification](envelope.md)
-- Historical wire grammar (removed; no longer available in the current tree)
+- [Wire grammar](wire.cddl)
 - [Security model](security.md)
 - [Classical P-256 / Iroh-QUIC security profile](classical-iroh-security-profile.md)
 - [Security-profile requirements disposition](implementation/security-profile-requirements-disposition.md)

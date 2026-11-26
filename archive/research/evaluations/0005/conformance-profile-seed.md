@@ -5,9 +5,6 @@ Authority: `data-mesh-requirements.md`, SHA-256
 `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`  
 Registered inputs: BVB-782, BVB-783, BVB-785
 
-The evaluation-v0 corpus and runner described here have been removed from the
-current tree. Findings below are historical, not current runtime validation.
-
 ## Decision
 
 Buy CBOR and CDDL mechanics. Do not invent a serialization codec, parser, or

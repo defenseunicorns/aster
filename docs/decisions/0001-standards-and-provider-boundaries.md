@@ -5,9 +5,8 @@
 
 ## Decision
 
-The original decision selected a project-owned RFC 8949 deterministic CBOR
-profile, not a Rust type layout or serializer default. That unused codec has
-since been removed; runtime replication uses separate binary frames. Cryptography, persistence, and
+The wire authority is a project-owned RFC 8949 core deterministic CBOR profile,
+not a Rust type layout or serializer default. Cryptography, persistence, and
 transport are provider boundaries. The conformance provider uses only the NIST
 algorithms selected in the protocol; replacing it with a validated provider does
 not change item or synchronization semantics.
@@ -26,7 +25,7 @@ receives a new suite identifier.
 ## Consequences
 
 - Byte-for-byte encoding vectors are mandatory.
-- The original optional/critical CBOR-key rule applied to the removed codec.
+- Unknown optional extension keys can be ignored; unknown critical keys fail.
 - RustCrypto crates are interoperability tools, not production authorization.
 - Secret-bearing types use zeroization where feasible; copies and OS/runtime
   behavior are documented limitations.
