@@ -2847,10 +2847,8 @@ and 7/7 binary tests, `mesh_cli` passed 13/13 real-process tests, and
 explicit local reconciliation performance experiment ignored. The final Rust
 1.91 `mesh_cli` and store cells took 160.79 and 88.49 seconds respectively.
 Binding gates passed C and C++ syntax/link/runtime smoke, Python 12/12, and Go;
-the conformance self-test, Python wire oracle, v0-r2 profile, and
-162-test Python lab suite also passed. The CBOR conformance tools and evaluation
-profile have since been removed; these historical results do not validate the
-current runtime framing.
+the conformance self-test, independent Python wire oracle, v0-r2 profile, and
+162-test Python lab suite also passed.
 
 The first full Rust 1.91 attempt hit the pre-existing intermittent
 `aster-lab` `Sync(SnapshotMismatch)` volume-oracle failure. The exact failure
@@ -3620,9 +3618,7 @@ binding suite and `gofmt`; Apache-2.0 project/package policy for 15 packages;
 selected-node dependency isolation; the vendored netlink equivalence plus
 13/13 tests; retained-libp2p boundary plus 16/16 regression tests; dependency
 exception scope and its fail-closed regression; and the implementation trace
-at 348 requirements and 109 exact selected mappings. The CBOR conformance
-runner, Python wire oracle, and evaluation profile cited here have since been
-removed; their results remain historical only.
+at 348 requirements and 109 exact selected mappings.
 
 The frozen source identities are:
 
