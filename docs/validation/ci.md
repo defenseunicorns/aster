@@ -1946,9 +1946,9 @@ mise run fuzz-smoke
 ```
 
 Mise installs the task's pinned `nightly-2026-08-18` and `cargo-fuzz` 0.13.2
-prerequisites automatically. Linux runs all nine targets; macOS runs seven
+prerequisites automatically. Linux runs all targets; macOS runs the
 portable targets and explicitly skips the two Linux-only systemd admin-record
-and backup targets. Linux CI continues to run all nine.
+and backup targets. Linux CI continues to run all targets.
 
 The target names and their exact mechanics-only claim boundaries are
 documented in [`fuzz/README.md`](../../fuzz/README.md). Fuzz success is not mission,

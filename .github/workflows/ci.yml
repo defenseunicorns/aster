@@ -131,7 +131,6 @@ jobs:
         run: |
           cargo fetch --locked
           cargo fetch --locked --manifest-path fuzz/Cargo.toml
-          cargo fetch --locked --manifest-path conformance/evaluation-v0/runner/Cargo.toml
 
       # Keep process acceptance on Linux with the pinned Python 3.13 toolchain;
       # the signal-safe subprocess path requires POSIX_SPAWN_CLOSEFROM.

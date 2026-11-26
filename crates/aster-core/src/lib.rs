@@ -55,10 +55,6 @@ mod source_state;
 #[path = "session_store.rs"]
 mod store;
 mod transfer_profile;
-#[cfg(feature = "adapter-sdk")]
-pub mod wire;
-#[cfg(not(feature = "adapter-sdk"))]
-mod wire;
 
 pub use blob::ReferenceBlobReader;
 pub use blob::{

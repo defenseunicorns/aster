@@ -20,6 +20,3 @@ fuzz/corpus/** -text
 
 # Preserve this hash-frozen comparison receipt byte-for-byte (registered CRLF).
 docs/evaluations/0005/results/stack-comparison.csv -text
-
-# Preserve the byte-exact historical v0-r1 CDDL, including its registered final blank line.
-conformance/evaluation-v0/history/v0-r1/profile-v0.cddl -whitespace

@@ -12,13 +12,12 @@ mise run fuzz-smoke
 ```
 
 The task selects `nightly-2026-08-18` explicitly and runs targets from the
-isolated `fuzz/` workspace. Linux runs all nine targets. macOS runs the seven
+isolated `fuzz/` workspace. Linux runs all targets. macOS runs the
 portable targets and prints explicit skips for `systemd_admin_record_decode`
 and `systemd_backup_decode`, whose production module is Linux-only. A macOS
 pass does not establish coverage of those two targets; Linux CI runs them.
-`wire_decode`, `fragment_decode`, and
-`selected_frame_decode` require accepted input bytes to equal their deterministic
-canonical encoding. The selected-frame target reaches the exact production
+`fragment_decode` and `selected_frame_decode` require accepted input bytes to
+equal their deterministic canonical encoding. The selected-frame target reaches the exact production
 decoder through an opt-in, doc-hidden fuzz seam that is absent from normal
 `aster-node` builds; each case exercises both the raw hostile input and one
 structured candidate distributed across all 78 current mechanics-frame tags,

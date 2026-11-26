@@ -43,13 +43,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "wire_decode"
-path = "fuzz_targets/wire_decode.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "fragment_decode"
 path = "fuzz_targets/fragment_decode.rs"
 test = false

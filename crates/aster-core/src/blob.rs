@@ -8,8 +8,7 @@
 //! Construction from a content grant is crate-private. Applications receive writers/readers from
 //! the high-level node integration and never see key material or algorithm controls.
 
-use crate::model::{NodeId, Scope, Topic};
-use crate::wire::{EnvelopeId, ObjectId};
+use crate::model::{EnvelopeId, NodeId, ObjectId, Scope, Topic};
 use aes_gcm::{
     Aes256Gcm,
     aead::{AeadInOut, KeyInit, array::Array},
@@ -4803,7 +4802,7 @@ mod tests {
             BlobChunkRecord::from_parts([0x11; 32], digest, 1, 17).expect("bounded chunk record");
         let verified = VerifiedBlobTransferObject {
             object: BlobTransferObject {
-                object_id: ObjectId::new(crate::wire::ObjectKind::BlobChunk, [0x12; 32]),
+                object_id: ObjectId::new(crate::model::ObjectKind::BlobChunk, [0x12; 32]),
                 source_envelope: EnvelopeId::from_bytes([0x13; 32]),
                 blob_id: BlobId([0x14; 32]),
                 index: 0,
@@ -5655,7 +5654,7 @@ mod tests {
         assert!(
             object_ids
                 .iter()
-                .all(|id| id.kind() == crate::wire::ObjectKind::BlobChunk)
+                .all(|id| id.kind() == crate::model::ObjectKind::BlobChunk)
         );
         assert!(object_ids.iter().all(|id| id.digest().len() == 32));
         let route_tree_path = producer_directory

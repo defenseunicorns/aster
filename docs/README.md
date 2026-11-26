@@ -29,7 +29,7 @@ part of the normal reading path.
 
 | Area | Current documents |
 |---|---|
-| Protocol | [Protocol](protocol.md), [wire grammar](wire.cddl), [security objects](envelope.md), [classical Iroh profile](classical-iroh-security-profile.md), and [deprecation policy](deprecation-policy.md) |
+| Protocol | [Protocol](protocol.md), [security objects](envelope.md), [classical Iroh profile](classical-iroh-security-profile.md), and [deprecation policy](deprecation-policy.md) |
 | Application APIs | [Application recipes](application-recipes.md), [ConnectRPC agent](quickstart/connect-agent.md), [selected Rust APIs](quickstart/README.md), agent configuration [schema v1](reference/aster-agent-config-v1.md) and [Compose schema v2](reference/aster-agent-config-v2.md), and [binding pattern](bindings/pattern.md) |
 | Implementation | [Architecture](architecture.md), [Security](security.md), [Carriers and contacts](transports.md), and component README files under `crates/` |
 | MVP operation | [Human operator guide](operator-guide.md), [evaluation runbook](mvp/linux-event-mvp-runbook.md), [systemd credential-provider operations](mvp/raspberry-pi-provider-v2-operations.md), and [Compose container delivery](release/docker-compose.md) |
@@ -40,7 +40,7 @@ part of the normal reading path.
 
 ## Document authority
 
-- `protocol.md`, `wire.cddl`, and `envelope.md` define profile `0x0001`
+- `protocol.md` and `envelope.md` define profile `0x0001`
   interoperable behavior.
 - The [classical Iroh profile](classical-iroh-security-profile.md) defines the
   additive evaluation-only profile `0x0002` boundary.

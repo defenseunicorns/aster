@@ -4,6 +4,146 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
+use sha2::{Digest, Sha256};
+
+/// Transfer identity of one stable source-sealed envelope.
+///
+/// This type is deliberately distinct from [`crate::model::ItemId`].  An
+/// envelope is first reassembled and checked against this SHA-256 identifier;
+/// only authenticated engine ingestion may then produce the semantic item ID.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct EnvelopeId([u8; 32]);
+
+impl EnvelopeId {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn into_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Calculates the transfer ID over exactly the stable source-sealed bytes.
+    pub fn from_sealed_bytes(sealed: &[u8]) -> Self {
+        Self(Sha256::digest(sealed).into())
+    }
+}
+
+impl From<[u8; 32]> for EnvelopeId {
+    fn from(value: [u8; 32]) -> Self {
+        Self::from_bytes(value)
+    }
+}
+
+impl From<EnvelopeId> for [u8; 32] {
+    fn from(value: EnvelopeId) -> Self {
+        value.into_bytes()
+    }
+}
+
+/// Stable kind tag in the transfer-object namespace.
+///
+/// The tag occupies the first byte of every [`ObjectId`], so a source envelope
+/// can never be interpreted as a Blob chunk even if an implementation routes
+/// an identifier to the wrong completion handler.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum ObjectKind {
+    /// A stable source-sealed data or control envelope.
+    SourceEnvelope = 1,
+    /// A canonical encrypted Blob chunk carrier.
+    BlobChunk = 2,
+    /// A source-authenticated proof covering one canonical source batch.
+    SourceBatchProof = 3,
+    /// A source-authenticated authorization for a bridge boundary.
+    BridgeAuthorization = 4,
+    /// A route-bound wrapper for bridge custody metadata.
+    BridgeRouteWrapper = 5,
+}
+
+impl ObjectKind {
+    fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::SourceEnvelope),
+            2 => Some(Self::BlobChunk),
+            3 => Some(Self::SourceBatchProof),
+            4 => Some(Self::BridgeAuthorization),
+            5 => Some(Self::BridgeRouteWrapper),
+            _ => None,
+        }
+    }
+}
+
+/// Typed identity in the reconciliation and ranged-transfer namespace.
+///
+/// Its fixed 33-byte representation is `kind:u8 || id:32`. Keeping the kind
+/// outside the digest gives parsers unambiguous dispatch while retaining the
+/// complete SHA-256 envelope or chunk commitment without truncation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ObjectId {
+    kind: ObjectKind,
+    id: [u8; 32],
+}
+
+/// Number of radix nibbles in the complete typed transfer identifier.
+pub const OBJECT_ID_NIBBLES: u8 = 66;
+
+impl ObjectId {
+    pub const WIRE_LEN: usize = 33;
+
+    pub const fn new(kind: ObjectKind, id: [u8; 32]) -> Self {
+        Self { kind, id }
+    }
+
+    pub const fn kind(&self) -> ObjectKind {
+        self.kind
+    }
+
+    pub const fn digest(&self) -> &[u8; 32] {
+        &self.id
+    }
+
+    pub fn to_wire_bytes(self) -> [u8; Self::WIRE_LEN] {
+        let mut bytes = [0_u8; Self::WIRE_LEN];
+        bytes[0] = self.kind as u8;
+        bytes[1..].copy_from_slice(&self.id);
+        bytes
+    }
+
+    pub fn from_wire_bytes(bytes: [u8; Self::WIRE_LEN]) -> Option<Self> {
+        let kind = ObjectKind::from_tag(bytes[0])?;
+        let mut id = [0_u8; 32];
+        id.copy_from_slice(&bytes[1..]);
+        Some(Self { kind, id })
+    }
+
+    /// Uses the complete SHA-256 identity of the stable source envelope.
+    pub const fn for_envelope(envelope_id: EnvelopeId) -> Self {
+        Self::new(ObjectKind::SourceEnvelope, envelope_id.into_bytes())
+    }
+
+    /// Uses the complete domain-separated Blob carrier commitment.
+    pub(crate) const fn for_blob_chunk_digest(digest: [u8; 32]) -> Self {
+        Self::new(ObjectKind::BlobChunk, digest)
+    }
+
+    /// Full stable source-envelope digest, only for the matching kind.
+    pub const fn envelope_id(&self) -> Option<EnvelopeId> {
+        match self.kind {
+            ObjectKind::SourceEnvelope => Some(EnvelopeId::from_bytes(self.id)),
+            ObjectKind::BlobChunk
+            | ObjectKind::SourceBatchProof
+            | ObjectKind::BridgeAuthorization
+            | ObjectKind::BridgeRouteWrapper => None,
+        }
+    }
+}
+
 /// Stable, opaque identifier for a node identity.
 pub type NodeId = [u8; 32];
 
@@ -254,7 +394,47 @@ pub enum SyncStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::{Scope, Topic};
+    use super::*;
+
+    #[test]
+    fn object_identifiers_preserve_kind_tags_and_complete_digests() {
+        let digest = std::array::from_fn(|index| index as u8);
+        for (kind, tag) in [
+            (ObjectKind::SourceEnvelope, 1),
+            (ObjectKind::BlobChunk, 2),
+            (ObjectKind::SourceBatchProof, 3),
+            (ObjectKind::BridgeAuthorization, 4),
+            (ObjectKind::BridgeRouteWrapper, 5),
+        ] {
+            let id = ObjectId::new(kind, digest);
+            let encoded = id.to_wire_bytes();
+            assert_eq!(encoded[0], tag);
+            assert_eq!(&encoded[1..], &digest);
+            assert_eq!(ObjectId::from_wire_bytes(encoded), Some(id));
+            assert_eq!(id.kind(), kind);
+            assert_eq!(id.digest(), &digest);
+            assert_eq!(
+                id.envelope_id(),
+                (kind == ObjectKind::SourceEnvelope).then_some(EnvelopeId::from_bytes(digest))
+            );
+        }
+        for tag in [0, 6, 255] {
+            let mut encoded = [0; ObjectId::WIRE_LEN];
+            encoded[0] = tag;
+            assert_eq!(ObjectId::from_wire_bytes(encoded), None);
+        }
+    }
+
+    #[test]
+    fn envelope_identity_is_sha256_of_exact_sealed_bytes() {
+        let sealed = b"stable source-sealed bytes";
+        let expected: [u8; 32] = Sha256::digest(sealed).into();
+        let id = EnvelopeId::from_sealed_bytes(sealed);
+        assert_eq!(id.as_bytes(), &expected);
+        assert_eq!(<[u8; 32]>::from(id), expected);
+        assert_eq!(EnvelopeId::from(expected), id);
+        assert_eq!(ObjectId::for_envelope(id).envelope_id(), Some(id));
+    }
 
     #[test]
     fn names_are_canonical() {

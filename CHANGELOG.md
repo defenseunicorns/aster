@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- Removed the unused CBOR replication codec and its schema, conformance runner,
+  evaluation corpus, oracle, fuzz target, dependencies, and CI tasks.
+
 ### Added
 
 - An adapter-neutral bounded ordered-contact contract with typed

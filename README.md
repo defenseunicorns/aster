@@ -265,7 +265,7 @@ conventional database or broker will usually be simpler.
 | Build an application | [ConnectRPC agent](docs/quickstart/connect-agent.md) or [language quickstarts](docs/quickstart/README.md) |
 | Understand trust and component boundaries | [Selected architecture](docs/architecture.md) |
 | Connect nodes or evaluate carriers | [Carriers and contacts](docs/transports.md) |
-| Implement compatible protocol bytes | [Protocol](docs/protocol.md), [wire grammar](docs/wire.cddl), and [security objects](docs/envelope.md) |
+| Implement compatible protocol bytes | [Protocol](docs/protocol.md) and [security objects](docs/envelope.md) |
 | Assess progress or readiness | [Implementation boundary](#current-implementation-boundary), [conformance](docs/validation/conformance.md), and [security](docs/security.md) |
 | Deploy the Compose container profile | [Compose operator procedure](docs/release/docker-compose.md) and [schema v2](docs/reference/aster-agent-config-v2.md) |
 | Install and operate a packaged node | [Human operator guide](docs/operator-guide.md) |

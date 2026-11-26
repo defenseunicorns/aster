@@ -26,11 +26,11 @@ use std::fmt;
 
 use sha2::{Digest, Sha256};
 
-use crate::wire::{self, Digest32, ObjectId};
+use crate::model::{OBJECT_ID_NIBBLES, ObjectId};
 
 const HASH_DOMAIN: &[u8] = b"ASTER-SPARSE-RADIX-MERKLE\0V1";
 pub const RADIX: usize = 16;
-pub const MAX_NIBBLES: u8 = 66;
+pub const MAX_NIBBLES: u8 = OBJECT_ID_NIBBLES;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InventoryError {
@@ -64,7 +64,12 @@ impl NibblePrefix {
     }
 
     pub fn new(packed: Vec<u8>, nibbles: u8) -> Result<Self, InventoryError> {
-        wire::validate_prefix(&packed, nibbles).map_err(|_| InventoryError::InvalidPrefix)?;
+        if nibbles > MAX_NIBBLES
+            || packed.len() != usize::from(nibbles).div_ceil(2)
+            || (nibbles & 1 == 1 && packed.last().is_some_and(|byte| byte & 0x0f != 0))
+        {
+            return Err(InventoryError::InvalidPrefix);
+        }
         Ok(Self { packed, nibbles })
     }
 
@@ -156,14 +161,14 @@ impl NibblePrefix {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InventoryChild {
     pub nibble: u8,
-    pub hash: Digest32,
+    pub hash: [u8; 32],
     pub item_count: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InventoryNode {
     pub prefix: NibblePrefix,
-    pub hash: Digest32,
+    pub hash: [u8; 32],
     pub item_count: u64,
     /// Non-empty children in ascending nibble order.
     pub children: Vec<InventoryChild>,
@@ -210,7 +215,7 @@ impl InventoryNode {
 
 #[derive(Clone)]
 struct TrieNode {
-    hash: Digest32,
+    hash: [u8; 32],
     item_count: u64,
     leaf: Option<ObjectId>,
     children: [Option<Box<TrieNode>>; RADIX],
@@ -365,17 +370,7 @@ impl SparseInventory {
         self.ids.is_empty()
     }
 
-    #[cfg(test)]
-    pub(crate) fn filtered_for_semantic_version(&self, semantic_version: u16) -> Self {
-        Self::from_ids(
-            self.ids
-                .iter()
-                .copied()
-                .filter(|id| id.kind().is_allowed_in_semantic_version(semantic_version)),
-        )
-    }
-
-    pub fn root_hash(&self) -> Digest32 {
+    pub fn root_hash(&self) -> [u8; 32] {
         self.root.hash
     }
 
@@ -455,7 +450,7 @@ pub struct InventoryDifference {
 }
 
 /// Public hash helpers form part of the language-neutral inventory registry.
-pub fn leaf_hash(id: &ObjectId) -> Digest32 {
+pub fn leaf_hash(id: &ObjectId) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(HASH_DOMAIN);
     digest.update([0x00]);
@@ -463,14 +458,14 @@ pub fn leaf_hash(id: &ObjectId) -> Digest32 {
     digest.finalize().into()
 }
 
-pub fn empty_hash(depth: u8) -> Digest32 {
+pub fn empty_hash(depth: u8) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(HASH_DOMAIN);
     digest.update([0x02, depth]);
     digest.finalize().into()
 }
 
-pub fn internal_hash(depth: u8, children: &[InventoryChild]) -> Result<Digest32, InventoryError> {
+pub fn internal_hash(depth: u8, children: &[InventoryChild]) -> Result<[u8; 32], InventoryError> {
     if depth >= MAX_NIBBLES || children.is_empty() || children.len() > RADIX {
         return Err(InventoryError::InvalidNode("internal shape"));
     }
@@ -585,7 +580,7 @@ mod tests {
     fn id(number: u32) -> ObjectId {
         let mut bytes = [0_u8; 32];
         bytes[..4].copy_from_slice(&number.to_be_bytes());
-        ObjectId::for_envelope(crate::wire::EnvelopeId::from_bytes(bytes))
+        ObjectId::for_envelope(crate::model::EnvelopeId::from_bytes(bytes))
     }
 
     #[test]
@@ -601,31 +596,11 @@ mod tests {
     }
 
     #[test]
-    fn semantic_v1_filter_suppresses_extended_kinds_before_root_calculation() {
-        let source = id(1);
-        let blob = ObjectId::new(crate::wire::ObjectKind::BlobChunk, [2; 32]);
-        let proof = ObjectId::new(crate::wire::ObjectKind::SourceBatchProof, [3; 32]);
-        let bridge = ObjectId::new(crate::wire::ObjectKind::BridgeAuthorization, [4; 32]);
-        let wrapper = ObjectId::new(crate::wire::ObjectKind::BridgeRouteWrapper, [5; 32]);
-        let complete = SparseInventory::from_ids([source, blob, proof, bridge, wrapper]);
-
-        let v1 = complete.filtered_for_semantic_version(crate::wire::SEMANTIC_PROTOCOL_V1);
-        let expected_v1 = SparseInventory::from_ids([source, blob]);
-        assert_eq!(v1, expected_v1);
-        assert_eq!(v1.root_hash(), expected_v1.root_hash());
-        assert_eq!(v1.item_count(), 2);
-
-        let v2 = complete.filtered_for_semantic_version(crate::wire::SEMANTIC_PROTOCOL_V2);
-        assert_eq!(v2, complete);
-        assert_eq!(v2.root_hash(), complete.root_hash());
-    }
-
-    #[test]
     fn root_hash_has_stable_golden_bytes() {
         let mut object_id = [0_u8; 32];
         object_id[31] = 1;
         let inventory = SparseInventory::from_ids([ObjectId::for_envelope(
-            crate::wire::EnvelopeId::from_bytes(object_id),
+            crate::model::EnvelopeId::from_bytes(object_id),
         )]);
         assert_eq!(
             inventory.root_hash(),
@@ -650,6 +625,19 @@ mod tests {
 
     #[test]
     fn prefixes_are_canonical_and_select_exact_subtrees() {
+        for (packed, nibbles) in [
+            (vec![0; 34], 67),
+            (vec![], 2),
+            (vec![0], 0),
+            (vec![0xaf], 1),
+        ] {
+            assert_eq!(
+                NibblePrefix::new(packed, nibbles),
+                Err(InventoryError::InvalidPrefix)
+            );
+        }
+        assert_eq!(NibblePrefix::new(vec![], 0).unwrap(), NibblePrefix::root());
+        assert!(NibblePrefix::new(vec![0; 33], MAX_NIBBLES).is_ok());
         let inventory = SparseInventory::from_ids([id(1), id(2), id(0x1000_0000)]);
         let zero = NibblePrefix::new(vec![0x01, 0x00], 3).unwrap();
         assert_eq!(inventory.ids_under(&zero, 10), vec![id(1), id(2)]);
