@@ -151,7 +151,6 @@ dependencies = [
  "aes-gcm 0.11.1",
  "getrandom 0.4.3",
  "hkdf",
- "minicbor",
  "ml-dsa",
  "ml-kem",
  "p256",
@@ -1967,12 +1966,6 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
-
-[[package]]
-name = "minicbor"
-version = "2.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7244eafd1e09e7c4e33043881997aa6ab6dffff3ed2cee3395a278980481d6e"
 
 [[package]]
 name = "mio"

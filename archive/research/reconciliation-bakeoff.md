@@ -32,6 +32,9 @@ semantics into the experiment. A production design would also have to retain
 Aster's authorization checks, object validation, and fetch protocol; Negentropy
 only identifies differences between sets.
 
+The CBOR codec used by this historical comparison has been removed. Its byte
+counts do not describe the current runtime binary frame encoding.
+
 ## Known limits of this comparison
 
 - The harness exercises an honest exchange: both sides emit valid Negentropy

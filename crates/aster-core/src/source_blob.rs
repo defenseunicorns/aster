@@ -22,9 +22,8 @@ use crate::{
     },
     crypto::ReferenceEnvelopeSealer,
     envelope::{EnvelopeError, EnvelopeHeader, EnvelopeSealer, SealRequest, SealedEnvelope},
-    model::{DataClass, Dot, ItemId, NodeId, Priority, Scope, Topic, VersionVector},
+    model::{DataClass, Dot, EnvelopeId, ItemId, NodeId, Priority, Scope, Topic, VersionVector},
     source_event::SourceRouteLineage,
-    wire::EnvelopeId,
 };
 use sha2::{Digest, Sha256};
 use std::io;

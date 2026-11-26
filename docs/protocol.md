@@ -65,27 +65,16 @@ carrier can reuse the same serialized objects.
 
 ## 3. Primitive types and encoding
 
-The protocol has two deterministic encodings. Replication messages use the RFC
-8949 core deterministic encoding profile:
+Replication messages use the runtime binary frame encoding. The unused CBOR
+codec and its CDDL grammar have been removed; this does not change runtime
+frame bytes.
 
-- definite-length arrays, maps, byte strings, and text only;
-- shortest-width integer and length encodings;
-- integer map keys in deterministic encoded-key order;
-- no duplicate map keys;
-- valid UTF-8 and no floating-point values in protocol-owned structures;
-- no unregistered tags;
-- maximum nesting depth 16, maximum control-message size 1 MiB, and configured
-  byte/string/collection bounds before allocation;
-- signed bytes MUST already be deterministic; a receiver MUST NOT normalize an
-  invalid representation and then verify it.
-
-[`wire.cddl`](wire.cddl) defines those maps. Security objects—credentials, source envelopes,
-handshake flights, custody wrappers, controls, and Blob manifests—use the fixed,
-length-prefixed binary structures in [envelope.md](envelope.md); the
-semantic-v2/v3/v4/v5/v6/v7/v8 batch additions use the fixed structures in §6.1. Those readers reject
-truncation, trailing bytes, nonzero reserved fields, unknown critical kinds, and
-lengths above their field-specific bound before allocation. A security object is
-never reinterpreted as a CBOR object or vice versa.
+Security objects—credentials, source envelopes, handshake flights, custody
+wrappers, controls, and Blob manifests—use the fixed, length-prefixed binary
+structures in [envelope.md](envelope.md); the semantic-v2/v3/v4/v5/v6/v7/v8 batch
+additions use the fixed structures in §6.1. Those readers reject truncation,
+trailing bytes, nonzero reserved fields, unknown critical kinds, and lengths
+above their field-specific bound before allocation.
 
 Numeric registries in §19 define meaning. The exact domain prefixes, input-length
 words, signature messages, KDF salts, labels, and contexts are normative in
@@ -384,11 +373,8 @@ receiver never silently converts the compact item to format 2.
 
 A semantic-v1 session suppresses kinds `3..5` before inventory construction and
 rejects ObjectKind 3, `ASTRENV3`, and compact authentication wherever received.
-The receive gate applies to raw bytes: a semantic-v1 deterministic-CBOR decoder
-rejects a canonical message containing a kind-3 ObjectID, and a semantic-v1
-fixed-envelope decoder rejects an `ASTRENV3` header before route or content
-dispatch.
-This rule preserves all semantic-v1 format-2 bytes and corpus vectors exactly.
+The semantic-v1 fixed-envelope decoder rejects an `ASTRENV3` header before
+route or content dispatch. This rule preserves semantic-v1 format-2 bytes.
 A semantic-v2, semantic-v3, semantic-v4, semantic-v5, semantic-v6, semantic-v7, or semantic-v8 session accepts format-2 singleton fallback as
 well as valid format-3 proof/item representations. When both representations
 are published, they share ItemID but retain distinct EnvelopeIDs, receipts,
@@ -2075,8 +2061,8 @@ live L2CAP or GATT I/O. Core persisted object progress and the Rust host's link
 pump are link neutral; the missing controller and physical run prevent a live
 claim that a transfer survives BTLE disconnect or MTU change.
 
-Every replication message is serializable; a future file carrier can exchange
-CBOR sequences across separate physical trips without a live call stack.
+Every replication message is serializable; a future file carrier could exchange
+serialized frames across separate physical trips without a live call stack.
 
 ## 17. Versioning and extensions
 
@@ -2161,8 +2147,7 @@ source object's earlier compatibility provenance.
 Eligibility filtering occurs before page limits so incompatible early rows
 cannot starve later compatible work.
 
-Deterministic-CBOR map keys `64` and above are ignorable extensions, while
-unknown keys `0..63` fail. Fixed-binary registries are closed. The current
+Fixed-binary registries are closed. The current
 source-envelope decoder rejects unknown data classes, so opaque forwarding of a
 future class is aspirational rather than implemented behavior. New semantics,
 formats, or registry entries MUST allocate new values rather than changing
@@ -2299,13 +2284,11 @@ and visible quota/eviction policy. Evictions and conflicts surface to the app.
 | source envelope format | 2 singleton hybrid authentication; semantics 2 through 8 add 3 content-committing batch authentication |
 | batch authentication mode | 1 exact proof reference, Merkle path, and P-256 item signature |
 | suite | `0x0001` provisional hybrid reference suite |
-| map field | unknown `0..63` critical; unknown `64..2^64-1` optional |
 
 New allocations require specification text, conformance vectors, security and
 compatibility analysis, and a unique numeric value. Reusing a withdrawn value is
 forbidden. The closed fixed-binary magic, kind, and role registries are in
-[envelope.md](envelope.md) §2; the deterministic-CBOR field registry is in
-[wire.cddl](wire.cddl).
+[envelope.md](envelope.md) §2.
 
 ## 20. Known bounds
 

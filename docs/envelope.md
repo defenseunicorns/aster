@@ -22,10 +22,9 @@ additions are defined normatively in [protocol.md](protocol.md) §6.1; together,
 these sections are the interoperability authority for the fixed bytes. Rust
 types and local database rows are not wire formats.
 
-Replication messages are the deterministic-CBOR objects in `wire.cddl` and are
-not redefined here. A decoder MUST know from its containing protocol state
-whether the next object is deterministic CBOR or one of the fixed binary objects
-below. It MUST NOT probe one encoding and then reinterpret a failure as another.
+Replication messages use the runtime binary frame encoding and are not
+redefined here. A decoder MUST use its containing protocol state to select the
+expected object format, not reinterpret a decoding failure as another format.
 
 ## Find a section
 
@@ -1814,17 +1813,9 @@ BlobChunkObjectID = 0x02 || BlobTransferDigest
 
 The ciphertext bytes are committed through `ciphertext_sha256`; they are not
 repeated in `transfer_id_input`. A source-envelope ObjectID is
-`0x01 || EnvelopeID`. These fixed 33-byte typed ObjectIDs are the identifiers in
-`wire.cddl` inventory, WANT, DATA, and RECEIPT messages and are ordered by all 33
-bytes. Prefixes therefore range from zero through 66 nibbles.
+`0x01 || EnvelopeID`.
 
-A Blob DATA message ranges over the exact `ASTRBT01` bytes and MUST have an empty
-forwarding field; authenticated custody wrappers apply only to source-envelope
-kind `1`. The canonical initial request for a Blob carrier has unknown total
-length, no ranges, and `need_forwarding = false`. Once DATA supplies the total,
-subsequent WANTs name its exact sorted missing ranges; a WANT with no missing
-ranges and no forwarding work is invalid. Before retaining a chunk, a
-route-capable node MUST verify the complete
+Before retaining a chunk, a route-capable node MUST verify the complete
 carrier identity, exact source-envelope association, BlobID, ciphertext hash and
 length, Merkle proof against the source-authenticated route, and quota. A
 route-only relay can perform all of those checks without a content key or
@@ -1833,6 +1824,11 @@ manifest record to match the ciphertext digest and length before making the
 chunk reader-visible, and then applies the AEAD/plaintext/whole-Blob checks in
 §10.3. Serving a retained carrier MUST repeat peer authorization against its
 source envelope.
+
+#### Historical ranged-transfer failure handling (retired messages)
+
+The following paragraph describes the retired CBOR WANT/DATA/RECEIPT contract,
+not the active runtime `Frame` grammar:
 
 If completion ends in a terminal full-object failure, the receiver MUST NOT add
 the ObjectID to inventory or issue a successful receipt. Terminal failures are:
@@ -1848,15 +1844,18 @@ MUST retain staging progress.
 
 ### 10.6 Network versus local Blob state
 
-Network/stable bytes are the Blob manifest inside its `ASTRENV2` source envelope,
-the source-signed route commitment, the `ASTRBT01` carriers, and their ranged
-deterministic-CBOR replication messages. Typed ObjectID and durable range state
-are peer- and session-neutral, permitting another authorized peer to continue a
-partial carrier.
+Network/stable bytes include the Blob manifest inside its `ASTRENV2` source
+envelope, the source-signed route commitment, and the `ASTRBT01` carriers.
+The retired CBOR ranged-transfer messages are not part of the active runtime
+`Frame` grammar; the carrier object grammar does not define its enclosing
+transfer messages.
 
 `ASTRBC01` encrypted chunk files, `ASTRBS01` summaries, `ASTRRT01` cached route
 trees, directory names, temporary files, expected-record files, quota counters,
 and atomic-rename procedures are local store details and are not network bytes.
+
+The SQLite staging and composite-inventory descriptions below are historical:
+they served the retired ranged-transfer message contract, not the selected runtime.
 
 The reference SQLite store maps the typed ObjectID to a domain-separated
 fixed-width staging key. Its terminal abort is one transaction deleting that

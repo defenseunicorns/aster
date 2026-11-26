@@ -464,7 +464,7 @@ topic content key or payload plaintext.
 
 The accounting below covers stable source-authentication bytes. Payload, normal
 header fields, content AEAD ciphertext/tag, route AEAD tag already counted in
-the proof formula, deterministic-CBOR message framing, fragmentation, and
+the proof formula, message framing, fragmentation, and
 peer-specific forwarding metadata are reported separately by transport tests.
 Changing the fixed-width semantic-protocol value from 1 to 2 changes no field
 length, so all batch-only formulas remain unchanged. Dual representation adds

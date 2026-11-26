@@ -26,7 +26,6 @@ getrandom.workspace = true
 hkdf.workspace = true
 ml-dsa.workspace = true
 ml-kem.workspace = true
-minicbor.workspace = true
 p256.workspace = true
 rand_core.workspace = true
 sha2.workspace = true

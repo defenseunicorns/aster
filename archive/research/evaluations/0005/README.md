@@ -147,9 +147,8 @@ exact research requirement maps under [`../../../../docs/evaluations/0005/requir
 Raw execution logs, downloaded sources, one-off build recipes, candidate
 harnesses, and historical control ledgers are retained separately.
 
-The maintained differential corpus lives in
-[`conformance/evaluation-v0`](../../../../conformance/evaluation-v0/README.md).
-`mise run conformance-profile-v0-r2` builds and checks that corpus. Historical
+The historical `conformance/evaluation-v0` differential corpus and its
+`conformance-profile-v0-r2` task have been removed from the current tree. Historical
 validation counts and source hashes describe their dated archived snapshots;
 they are not assertions about the reduced public tree or new test executions.
 

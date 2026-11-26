@@ -12,7 +12,6 @@ cleanup_fuzz_smoke() {
 }
 trap cleanup_fuzz_smoke 0 1 2 3 15
 
-wire_corpus="$fuzz_smoke_dir/wire-corpus"
 fragment_corpus="$fuzz_smoke_dir/fragment-corpus"
 envelope_corpus="$fuzz_smoke_dir/envelope-corpus"
 selected_frame_corpus="$fuzz_smoke_dir/selected-frame-corpus"
@@ -25,7 +24,6 @@ stream_transfer_corpus="$fuzz_smoke_dir/stream-transfer-corpus"
 ble_l2cap_record_corpus="$fuzz_smoke_dir/ble-l2cap-record-corpus"
 ble_roster_beacon_corpus="$fuzz_smoke_dir/ble-roster-beacon-corpus"
 ble_discovery_credential_corpus="$fuzz_smoke_dir/ble-discovery-credential-corpus"
-wire_artifacts="$fuzz_smoke_dir/wire-artifacts"
 fragment_artifacts="$fuzz_smoke_dir/fragment-artifacts"
 envelope_artifacts="$fuzz_smoke_dir/envelope-artifacts"
 selected_frame_artifacts="$fuzz_smoke_dir/selected-frame-artifacts"
@@ -38,17 +36,16 @@ stream_transfer_artifacts="$fuzz_smoke_dir/stream-transfer-artifacts"
 ble_l2cap_record_artifacts="$fuzz_smoke_dir/ble-l2cap-record-artifacts"
 ble_roster_beacon_artifacts="$fuzz_smoke_dir/ble-roster-beacon-artifacts"
 ble_discovery_credential_artifacts="$fuzz_smoke_dir/ble-discovery-credential-artifacts"
-mkdir -p "$wire_corpus" "$fragment_corpus" "$envelope_corpus" \
+mkdir -p "$fragment_corpus" "$envelope_corpus" \
     "$selected_frame_corpus" "$selected_negentropy_corpus" "$classical_profile_corpus" \
     "$systemd_credential_corpus" "$systemd_admin_record_corpus" "$stream_transfer_corpus" \
-    "$wire_artifacts" "$fragment_artifacts" "$envelope_artifacts" \
+    "$fragment_artifacts" "$envelope_artifacts" \
     "$selected_frame_artifacts" "$selected_negentropy_artifacts" \
     "$classical_profile_artifacts" "$systemd_credential_artifacts" \
     "$systemd_admin_record_artifacts" "$systemd_backup_corpus" "$systemd_backup_artifacts" \
     "$stream_transfer_artifacts" "$ble_l2cap_record_corpus" "$ble_l2cap_record_artifacts" \
     "$ble_roster_beacon_corpus" "$ble_roster_beacon_artifacts" \
     "$ble_discovery_credential_corpus" "$ble_discovery_credential_artifacts"
-cp -R "$project_dir/fuzz/corpus/wire_decode/." "$wire_corpus/"
 cp -R "$project_dir/fuzz/corpus/fragment_decode/." "$fragment_corpus/"
 cp -R "$project_dir/fuzz/corpus/envelope_inspect/." "$envelope_corpus/"
 cp -R "$project_dir/fuzz/corpus/selected_frame_decode/." "$selected_frame_corpus/"
@@ -60,9 +57,6 @@ cp -R "$project_dir/fuzz/corpus/ble_roster_beacon/." "$ble_roster_beacon_corpus/
 cp -R "$project_dir/fuzz/corpus/ble_discovery_credential/." "$ble_discovery_credential_corpus/"
 
 cd "$project_dir"
-cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz wire_decode "$wire_corpus" -- \
-    -runs=10000 -max_len=262144 -seed=2026081901 \
-    -artifact_prefix="$wire_artifacts/" -print_final_stats=1
 cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz fragment_decode "$fragment_corpus" -- \
     -runs=10000 -max_len=262144 -seed=2026081902 \
     -artifact_prefix="$fragment_artifacts/" -print_final_stats=1

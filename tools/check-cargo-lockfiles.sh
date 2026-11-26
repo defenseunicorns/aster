@@ -5,7 +5,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 result=0
-for manifest in Cargo.toml fuzz/Cargo.toml conformance/evaluation-v0/runner/Cargo.toml
+for manifest in Cargo.toml fuzz/Cargo.toml
 do
     printf 'Checking committed Cargo lockfile: %s\n' "$manifest"
     if ! cargo fetch --locked --manifest-path "$manifest"; then

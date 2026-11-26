@@ -1326,11 +1326,11 @@ pub mod conformance {
                 selected_semantic_version,
                 SEMANTIC_PROTOCOL_VERSION
                     | crate::MIN_CUSTODY_SEMANTIC_VERSION
-                    | crate::wire::SEMANTIC_PROTOCOL_V4
-                    | crate::wire::SEMANTIC_PROTOCOL_V5
-                    | crate::wire::SEMANTIC_PROTOCOL_V6
-                    | crate::wire::SEMANTIC_PROTOCOL_V7
-                    | crate::wire::SEMANTIC_PROTOCOL_V8
+                    | crate::crypto::SEMANTIC_PROTOCOL_V4
+                    | crate::crypto::SEMANTIC_PROTOCOL_V5
+                    | crate::crypto::SEMANTIC_PROTOCOL_V6
+                    | crate::crypto::SEMANTIC_PROTOCOL_V7
+                    | crate::crypto::SEMANTIC_PROTOCOL_V8
             ) {
                 return Err(format!(
                     "semantic-v{selected_semantic_version} receiver rejects ASTRENV3"
@@ -1362,28 +1362,38 @@ pub mod conformance {
         {
             return Err("semantic-v3 ASTRENV3 decoder changed the header".to_owned());
         }
-        if Envelope3Header::decode_for_semantic_version(&bytes, crate::wire::SEMANTIC_PROTOCOL_V4)?
-            != header
+        if Envelope3Header::decode_for_semantic_version(
+            &bytes,
+            crate::crypto::SEMANTIC_PROTOCOL_V4,
+        )? != header
         {
             return Err("semantic-v4 ASTRENV3 decoder changed the header".to_owned());
         }
-        if Envelope3Header::decode_for_semantic_version(&bytes, crate::wire::SEMANTIC_PROTOCOL_V5)?
-            != header
+        if Envelope3Header::decode_for_semantic_version(
+            &bytes,
+            crate::crypto::SEMANTIC_PROTOCOL_V5,
+        )? != header
         {
             return Err("semantic-v5 ASTRENV3 decoder changed the header".to_owned());
         }
-        if Envelope3Header::decode_for_semantic_version(&bytes, crate::wire::SEMANTIC_PROTOCOL_V6)?
-            != header
+        if Envelope3Header::decode_for_semantic_version(
+            &bytes,
+            crate::crypto::SEMANTIC_PROTOCOL_V6,
+        )? != header
         {
             return Err("semantic-v6 ASTRENV3 decoder changed the header".to_owned());
         }
-        if Envelope3Header::decode_for_semantic_version(&bytes, crate::wire::SEMANTIC_PROTOCOL_V7)?
-            != header
+        if Envelope3Header::decode_for_semantic_version(
+            &bytes,
+            crate::crypto::SEMANTIC_PROTOCOL_V7,
+        )? != header
         {
             return Err("semantic-v7 ASTRENV3 decoder changed the header".to_owned());
         }
-        if Envelope3Header::decode_for_semantic_version(&bytes, crate::wire::SEMANTIC_PROTOCOL_V8)?
-            != header
+        if Envelope3Header::decode_for_semantic_version(
+            &bytes,
+            crate::crypto::SEMANTIC_PROTOCOL_V8,
+        )? != header
         {
             return Err("semantic-v8 ASTRENV3 decoder changed the header".to_owned());
         }
@@ -2656,6 +2666,10 @@ mod tests {
     #[test]
     fn adapter_conformance_corpus_and_overhead_claims_are_self_consistent() {
         let document = conformance::vector_document().unwrap();
+        assert_eq!(
+            document,
+            include_str!("../../../conformance/vectors/batch-semantic-v2.tsv")
+        );
         assert!(!document.lines().any(|line| line.starts_with("ACCEPT\t")));
         for name in [
             "merkle-depth1-n2",

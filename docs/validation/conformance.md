@@ -15,113 +15,42 @@ independent-interoperability acceptance claim.
 
 Profile-`0x0001` fixed security-object bytes and bounds come from
 [envelope.md](../envelope.md) and the semantic-v2/v3/v4/v5 batch profile in
-[protocol.md](../protocol.md) §6.1; replication CBOR comes from
-[wire.cddl](../wire.cddl). The bounded profile-`0x0002` implementation is
+[protocol.md](../protocol.md) §6.1. The bounded profile-`0x0002` implementation is
 documented separately in the
 [classical Iroh-QUIC profile](../classical-iroh-security-profile.md). A test
 harness MUST retain those namespaces and must not normalize a rejected encoding
 or retry another profile after a profile/ALPN/policy failure.
 
-The shipped conformance runner and checked-in corpora remain profile-`0x0001`
-artifacts. Profile `0x0002` currently has same-implementation unit and real-Iroh
-integration tests only; complete normative byte grammar, independent vectors,
-packet captures, and a black-box SUT lane remain open and receive no
-conformance credit.
+The obsolete CBOR codec, `aster-conformance` runner, wire vectors, and Python
+wire oracle have been removed. Their historical results do not validate the
+runtime binary frame format.
 
-The shipped `aster-conformance` runner provides four stable entry points:
-
-```text
-aster-conformance --self-test
-aster-conformance --emit-vectors
-aster-conformance --emit-batch-vectors
-aster-conformance --check-wire-hex HEX
-```
-
-The generated corpus is checked in at `conformance/vectors/wire-v1.tsv` so an
-independent implementation can consume it without linking the reference core.
-`ACCEPT` rows must decode and re-encode byte-for-byte; `REJECT` rows must be
-rejected before semantic dispatch. The current corpus has 10 ACCEPT and 21
-REJECT rows. The Rust verifier requires every ACCEPT row to raw-decode,
-canonical re-encode to identical bytes, and pass typed semantic decoding; every
-REJECT row must fail typed decoding. The accepted evolution row retains an
-unknown key-64 bounded nested value in the raw-value path even though the typed
-version-1 message ignores its semantics. Negative rows cover deterministic-CBOR
-form, identifiers, critical extensions, prefix form, range ordering and
-coalescing, Blob forwarding, no-work requests, Receipt completeness, empty
-DATA, radix counts, and integer bounds.
-
-The separate checked-in
-`conformance/vectors/batch-semantic-v2.tsv` corpus covers the fixed-binary
-semantic-v2/v3/v4/v5 content-committing batch profile without changing any wire-v1 row.
-It intentionally contains no `ACCEPT` disposition because it provides no
-provider keys or cryptographic authentication oracle. Its four dispositions
-have these exact meanings:
+The retained fixed-binary corpus is
+`conformance/vectors/batch-semantic-v2.tsv`. Its dispositions are:
 
 - `CANONICAL-COMPONENT`: a standalone preamble, manifest, or leaf parses and
-  re-encodes exactly; this is not application or source-authentication
-  acceptance.
-- `STRUCTURAL-UNVERIFIED`: a proof-bearing structure has exact canonical
-  framing and internally consistent commitments, but every signature remains
-  cryptographically unverified and the row MUST NOT release a pending item.
-- `PENDING`: a canonical ASTRENV3 header or compact suffix is insufficient
-  without an independently authenticated matching proof.
-- `REJECT`: canonical or semantic structural decoding must fail before
-  provider authentication.
+  re-encodes exactly.
+- `STRUCTURAL-UNVERIFIED`: proof-route or Merkle-case framing and commitments
+  are checked, but signatures remain cryptographically unverified.
+- `PENDING`: a canonical format-3 header or compact suffix still requires an
+  authenticated matching proof before item acceptance.
+- `REJECT`: structural decoding must fail before provider authentication.
 
-The corpus contains 4 `CANONICAL-COMPONENT`, 8
-`STRUCTURAL-UNVERIFIED`, 4 `PENDING`, and 38 `REJECT` rows. Its exact checked-in
-SHA-256 is
-`46b94199042576fdcbbfd7713f47d60995740e8cbdbb04e6459fef813a364979`.
-The Rust verifier explicitly rejects an
-`ACCEPT` row, requires proof routes to carry exact
-`u16(64) || 64 bytes || u32(3309) || 3309 bytes` hybrid framing, and never
-reports a structural row as authenticated.
+`ACCEPT` is forbidden because this corpus supplies no provider authentication.
+The existing core test validates the checked-in corpus, Merkle cases, overhead
+claims, and semantic-v1 envelope rejection. Run it from the repository root:
 
-Six portable `merkle-case` rows cover depths 1 through 6 with `(n,index)` equal
-to `(2,1)`, `(3,2)`, `(5,4)`, `(9,8)`, `(17,16)`, and `(33,32)`. Every
-non-power-of-two case selects the final real leaf, whose first sibling is the
-normative padded empty leaf. `merkle-case` is a conformance-only container, not
-a protocol object, encoded as:
-
-```text
-"ASTRMCV1"[8]
-u32 manifest_length || manifest[manifest_length]
-u16 item_count
-repeat item_count times:
-    u32 leaf_length || leaf[leaf_length]
-    u32 ciphertext_length || ciphertext[ciphertext_length]
-u16 selected_index
-u32 compact_length || compact_authentication[compact_length]
+```sh
+cargo test -p aster-core --all-features --lib batch::tests::adapter_conformance_corpus_and_overhead_claims_are_self_consistent -- --exact
 ```
 
-The verifier checks every ciphertext commitment, rebuilds the complete ordered
-and padded tree from every leaf, compares the root to the manifest, compares the
-exact generated path to the compact siblings, and verifies the BatchID, item
-index, proof-depth, root, and item-signature digest input end to end. The item
-signature bytes remain `STRUCTURAL-UNVERIFIED`. A negative padding-sibling row
-must fail that same end-to-end verifier.
+`--all-features` enables the required `adapter-sdk` feature. This is a
+same-implementation structural check, not a replacement conformance runner or
+an independent-interoperability result.
 
-Negative rows additionally cover global Topic/Scope grammar and both embedded
-hybrid-signature length prefixes, alongside constant/version downgrade,
-class/count/sequence/range, truncation, trailing bytes, leaf format, compact
-mode/depth, proof kind, credential commitment, ASTRENV3
-magic/reserved/kind/length, and proof-content invariants. The self-test injects
-raw canonical kind-3 CBOR and raw `ASTRENV3` into semantic-v1 receive decoders,
-serializes every `n=2..64` batch at `g=1` and `g=256`, and checks the exact
-overhead equations and headline byte totals.
-
-The supersession receipt at
-`conformance/vectors/batch-semantic-v2-supersession.ndjson` preserves the exact
-hash, byte/line counts, dispositions, and unsafe-acceptance reason for the prior
-corpus before recording this replacement. The active runner includes only the
-corrected TSV.
-
-This batch corpus is emitted and judged by the reference implementation and
-therefore has `oracle=self`. A separately authored implementation must consume
-the checked-in bytes and exchange actual proof/item objects with the reference
-before the independent-interoperability gate can pass. Reimplementing the
-decoder inside this repository, using another language, or passing
-reference-to-reference tests does not satisfy that gate.
+Profile `0x0002` currently has same-implementation unit and real-Iroh integration
+tests only; complete normative byte grammar, independent vectors, packet
+captures, and a black-box SUT lane remain open and receive no conformance credit.
 
 Beyond the structural corpus, the Rust reference implements the provider and
 explicit atomic source/store/application path: 2–64-item validation, contiguous
@@ -138,23 +67,6 @@ proof/compact/carrier transfer with plaintext verification. The complete core
 and host suites plus strict core/host lint pass. This remains same-team reference
 evidence, not independent interoperability, a 3 kbps result, or a
 physical-carrier claim.
-
-The self-test additionally checks exact Merkle differences, tiny-MTU
-out-of-order reassembly, resource bounds, and causal concurrency using the same
-reference implementation as producer and oracle. The checked-in corpus is the
-deterministic sync-wire corpus only; it is not a complete corpus for every
-V-FIXED/V-CRYPTO group below. Scenario, independent-SUT, and hardware claims
-remain separate gates.
-
-`conformance/python_wire_oracle.py` is a separate, standard-library-only decoder
-and semantic validator which neither imports nor binds the Rust implementation.
-It checks canonical re-encoding for every ACCEPT row and rejection of every
-negative row. Its result identifies itself as
-`same-team-not-independent-python-codepath`, while the corpus and Rust runner
-retain `oracle=self`. Because both were authored by the same project team and
-the corpus is produced by the reference, this is
-code-path and language diversity evidence—not the separately authored SUT
-required by A-10.
 
 ## Local SUT control contract
 
@@ -175,7 +87,6 @@ implementation version and conformance-vector digest under test.
 
 | ID | Group | Required evidence |
 |---|---|---|
-| V-WIRE | deterministic CBOR | exact accepted bytes and nonminimal/duplicate/indefinite/oversized rejection |
 | V-FIXED | fixed binary security objects | every `envelope.md` object at min/max bounds, including `ASTRPB03`, delegated `ASTRCA02`, and `ASTRBCA2`; truncation, trailing, reserved, length, ordering, credential/signer substitution, and cross-field rejection |
 | V-BATCH | semantic-v2/v3/v4/v5 content-committing batch | exact preamble/manifest/BatchID, content leaf, complete tree/padding/path, ObjectKind 3 proof route, format-3 compact suffix, missing-proof pending state, downgrade/mutation rejection, and serialized overhead |
 | V-BRIDGE | semantic-v2/v3/v4/v5 cross-scope bridge | exact ObjectKind 4 authorization-format-2 delegated signer authentication and ObjectKind 5 wrapper bytes; signer persistence/liveness, directed-edge/filter/path authentication, v1 suppression, source/Blob dependencies, arrival-order, restart, custody, revocation, fallback, quota, and unified-delivery behavior |
@@ -592,7 +503,7 @@ unauthenticated staging exhaustion never evicts a committed item
 
 ## Fuzz corpus
 
-Targets: deterministic decoder, every fixed object in `envelope.md`, source
+Targets: every fixed object in `envelope.md`, source
 envelopes, controls, custody wrappers, handshakes, protected frames (including
 all 20 semantic-v4/v5 mutable tags, historical semantic-v5 Blob
 interest/range/result/finish tags, and the current profile-4 schedule decoder),
@@ -601,8 +512,8 @@ overlapping ranges, Merkle probes, dotted contexts, bridge filters, store
 authorizations/wrappers/path dependencies, store recovery, and FFI call
 sequences.
 
-Seeds include duplicate keys; nonminimum integers; indefinite/oversized/deep
-objects; truncated tags/signatures; wrong inclusion proofs; inconsistent fragment
+Seeds include oversized objects; truncated tags/signatures; wrong inclusion
+proofs; inconsistent fragment
 overlap; TTL underflow; old epochs; replayed session counters; malformed public
 keys; same-dot/different-item; route-root/chunk-count substitution; poisoned
 partial restart; staging exhaustion; zero-length and maximum-length blobs.
