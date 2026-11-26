@@ -1220,7 +1220,6 @@ ATTEMPT_TWO_CHILD_KEYS = (
     "shutdown_direct_contacts",
     "shutdown_relay_contacts",
     "shutdown_unknown_path_contacts",
-    "shutdown_items",
     "shutdown_events",
     "shutdown_blobs",
     "shutdown_data_offered",
@@ -1648,7 +1647,7 @@ def validate_terminal_stdout(
     ):
         if attempt_two[f"shutdown_{key}"] != str(redelivery_shutdown[key]):
             fail(f"ATTEMPT2_DONE.shutdown_{key} differs from public shutdown")
-    for key in ("shutdown_items", "shutdown_events", "shutdown_blobs"):
+    for key in ("shutdown_events", "shutdown_blobs"):
         if attempt_two[key] != "0":
             fail(f"ATTEMPT2_DONE.{key} is nonzero")
 

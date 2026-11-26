@@ -1617,7 +1617,7 @@ mod tests {
             (LaneId::EventBridge, vec![TransferProfileId::LegacyV6]),
             (LaneId::Blob, vec![TransferProfileId::LegacyV6]),
             (LaneId::Record, vec![TransferProfileId::LegacyV6]),
-            (LaneId::State, vec![TransferProfileId::LegacyV6]),
+            (LaneId::State, vec![]),
             (LaneId::Event, vec![TransferProfileId::EventPagesV1]),
         ]);
         assert!(missing_legacy.encode().is_err());

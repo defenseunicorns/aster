@@ -198,7 +198,7 @@ RECEIPT_KEYS = (
     "phase", "participant", "contacts", "contact_errors", "direct_contacts",
     "relay_contacts", "unknown_path_contacts", "data_offered", "data_fetched",
     "data_inserted", "data_duplicates", "data_remaining", "mutable_remaining",
-    "deferred_mutable_lanes", "items", "events", "blobs",
+    "deferred_mutable_lanes", "events", "blobs",
 )
 CHILD_DELIVERY_KEYS = (
     "phase", "participant", "projection_id", "projection_key_sha256", "siblings",
@@ -274,7 +274,7 @@ ATTEMPT_TWO_CHILD_KEYS = (
     "post_successor_empty", "superseded_ids", "beta_id", "beta_present",
     "gamma_empty", "token_artifacts_removed", "closed_kind", "closed_operation",
     "shutdown_contacts", "shutdown_contact_errors", "shutdown_direct_contacts",
-    "shutdown_relay_contacts", "shutdown_unknown_path_contacts", "shutdown_items",
+    "shutdown_relay_contacts", "shutdown_unknown_path_contacts",
     "shutdown_events", "shutdown_blobs", "shutdown_data_offered",
     "shutdown_data_fetched", "shutdown_data_inserted", "shutdown_data_duplicates",
     "shutdown_data_remaining", "shutdown_mutable_remaining",
@@ -515,7 +515,6 @@ def _validate_receipt_record(
         {
             "phase": phase,
             "participant": participant,
-            "items": "0",
             "events": "0",
             "blobs": "0",
         },
@@ -533,7 +532,6 @@ def _validate_receipt_record(
         "data_remaining",
         "mutable_remaining",
         "deferred_mutable_lanes",
-        "items",
         "events",
         "blobs",
     )
@@ -1565,8 +1563,6 @@ def validate_terminal_stdout(
                     "carrier_path_transitions": "0",
                     "carrier_path_transition_saturations": "0",
                     "path_observation": "not-authorization",
-                    "opaque_items": "0",
-                    "opaque_acceptance_markers": "0",
                     "events": "0",
                     "event_acceptance_markers": "0",
                     "route_cached_events": "0",
@@ -1719,7 +1715,6 @@ def validate_terminal_stdout(
         "direct_contacts",
         "relay_contacts",
         "unknown_path_contacts",
-        "items",
         "events",
         "blobs",
         "data_offered",

@@ -50,6 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Removed pre-v9 hybrid sessions, Event fallback and Blob profile-4 transfer,
+  opaque storage and `put`, and historical Event publication ledgers and migration.
+  Incompatible stores fail without mutation.
+
 - Replaced Iroh 1.4.1 with 1.5.0 and removed the vendored netlink patch.
 - Replaced the SQLite-backed application runtime and C, Go, and Python bindings
   with the `aster-node` runtime and redb; removed atomic publication batches,

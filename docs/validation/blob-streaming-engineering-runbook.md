@@ -43,14 +43,11 @@ The receiver verifies authenticated FINISH and content, atomically promotes the 
 
 ## Understand the selected profile
 
-Profile 5 is the semantic-v9 selection. It is not a migration back to v8.
-Semantic v7/v8 peers retain profile 4 for compatibility; a semantic-v9 peer
-selects profile 5. Profile 5 stores and transfers the same append-only,
+The hybrid session requires semantic v9 and Blob profile 5. Profile 5 stores and transfers the same append-only,
 authenticated `ASTRBS02` pack records. It does not repack, re-encrypt, or
 translate them through the profile-4 `ASTRBT01`/`ABX1` carrier representation.
 
-Blob profile negotiation: semantic v7/v8 select profile 4; semantic v9 selects
-profile 5. Profile 5 size terms: 1,048,576 plaintext bytes per segment;
+Blob profile negotiation requires semantic v9 and profile 5. Profile 5 size terms: 1,048,576 plaintext bytes per segment;
 1,048,706 bytes per maximum encoded `ASTRBS02` record; 1,048,710 bytes per
 maximum length-prefixed DATA body. The checkpoint maximum is 134,217,728 bytes
 (128 MiB). Provisional uploads, lifecycle-owned provisional network sources,
@@ -58,10 +55,9 @@ and completed native packs share the configured Blob depot limits.
 
 | Selection | Object maximum | Canonical chunks | Authenticated source |
 | --- | ---: | ---: | ---: |
-| semantic v7/v8, profile 4 | 64 MiB | 1,024 | 1 MiB |
 | semantic v9, profile 5 | 8 GiB | 8,192 native segments | 401,902 bytes |
 
-Profile 4 retains canonical 64-KiB chunks. Profile 5 instead transfers one
+Profile 5 transfers one
 complete length-prefixed `ASTRBS02` record per DATA body. SOURCE is sent in
 records no larger than 1 MiB, with a 16-MiB authenticated-open maximum. The
 receiver selects a checkpoint batch no larger than 128 MiB.
@@ -269,10 +265,7 @@ the caller.
 
 - A v9-to-v9 contact selects profile 5 and can transfer empty through 8-GiB
   publications.
-- A v7/v8 contact selects profile 4. It can receive only compatible nonempty
-  publications up to 64 MiB / 1,024 chunks / a 1-MiB authenticated source.
-- A profile-5 attempt does not fall back in place to profile 4. Content outside
-  profile-4 bounds remains local for that older peer.
+- A peer without semantic v9 and profile 5 fails negotiation.
 - Peer configuration alone grants nothing. Confirm exact Blob interest plus
   current route/content authorization on the receiver.
 

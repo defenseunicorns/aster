@@ -11,12 +11,12 @@ use aster_node::application::{
     ContactSyncStatus as NodeContactSyncStatus, EventAcknowledgement, EventClientContext,
     EventClientDisposition, EventClientId, EventDelivery as NodeEventDelivery,
     EventGap as NodeEventGap, EventGapQuery, EventId, EventItem, EventOperationAbandonment,
-    EventOperationAuditState, EventOperationCapacityWarning, EventOperationLedgerMode,
-    EventOperationSequence, EventPollRequest, EventPublicationSession, EventPublishOptions,
-    EventQuery, EventResultAcknowledgement, EventSubscriptionId, EventSubscriptionRequest,
-    EventSyncStatus as NodeEventSyncStatus, EventUnsubscribe, NumberedEventPublishRequest,
-    NumberedEventResult, PeerAuthorization as NodePeerAuthorization, Priority as NodePriority,
-    Scope, SelectedBlobHandle, SelectedEventHandle, SelectedEventStatus, Topic,
+    EventOperationCapacityWarning, EventOperationSequence, EventPollRequest,
+    EventPublicationSession, EventPublishOptions, EventQuery, EventResultAcknowledgement,
+    EventSubscriptionId, EventSubscriptionRequest, EventSyncStatus as NodeEventSyncStatus,
+    EventUnsubscribe, NumberedEventPublishRequest, NumberedEventResult,
+    PeerAuthorization as NodePeerAuthorization, Priority as NodePriority, Scope,
+    SelectedBlobHandle, SelectedEventHandle, SelectedEventStatus, Topic,
 };
 use aster_redb_store::{CustodyRetirementReason, MAX_EVENT_PENDING_DELIVERIES};
 use connectrpc::{
@@ -1175,9 +1175,6 @@ fn status_response(
             profile_remaining,
             profile_warning: operations.rows >= PROFILE_EVENT_OPERATION_WARNING,
             profile_exhausted: operations.rows >= PROFILE_EVENT_OPERATION_BOUNDARY,
-            active_rows: operations.stats.records_active,
-            retired_rows: operations.stats.records_retired,
-            reverse_rows: operations.stats.reverse_rows,
             ordinary_remaining: operations.ordinary_remaining,
             emergency_remaining: operations.emergency_remaining,
             rolling_accept_rate: status.event_operation_rolling_accept_rate,
@@ -1189,24 +1186,6 @@ fn status_response(
                 EventOperationCapacityWarning::Exhausted => {
                     api::OperationCapacityWarning::Exhausted
                 }
-            }
-            .into(),
-            audit: api::OperationLedgerAuditStatus {
-                state: match status.event_operation_audit.state {
-                    EventOperationAuditState::Pending => api::OperationLedgerAudit::Pending,
-                    EventOperationAuditState::Running => api::OperationLedgerAudit::Running,
-                    EventOperationAuditState::Complete => api::OperationLedgerAudit::Complete,
-                    EventOperationAuditState::Failed => api::OperationLedgerAudit::Failed,
-                }
-                .into(),
-                scanned: status.event_operation_audit.scanned,
-                total: status.event_operation_audit.total,
-                ..Default::default()
-            }
-            .into(),
-            ledger_mode: match operations.mode {
-                EventOperationLedgerMode::Legacy => api::PublishOperationLedgerMode::Legacy,
-                EventOperationLedgerMode::Numbered => api::PublishOperationLedgerMode::Numbered,
             }
             .into(),
             numbered_clients: operations.numbered_stats.clients,
@@ -2105,7 +2084,6 @@ mod tests {
             EventEmissionPolicy::Normal,
             None,
             SelectedEventStatus {
-                event_operation_audit: Default::default(),
                 sync: NodeEventSyncStatus::Offline,
                 authenticated_contacts: 0,
                 failed_contact_attempts: 0,
@@ -2114,7 +2092,7 @@ mod tests {
                 store_usage: AggregateStoreUsage::default(),
                 store_limits: StoreLimits::new(10_000, 64 * 1024 * 1024).expect("limits"),
                 event_operation_capacity:
-                    aster_node::application::EventOperationCapacity::from_legacy_inspection(
+                    aster_node::application::EventOperationCapacity::for_ledgers(
                         Default::default(),
                         aster_redb_store::EventOperationLimits::DEFAULT,
                     ),
@@ -2177,15 +2155,9 @@ mod tests {
                 profile_remaining: 1_024,
                 profile_warning: false,
                 profile_exhausted: false,
-                ordinary_remaining: 990_000,
-                emergency_remaining: 10_000,
+                ordinary_remaining: 683926,
+                emergency_remaining: 5548,
                 warning_state: api::OperationCapacityWarning::Ok.into(),
-                ledger_mode: api::PublishOperationLedgerMode::Legacy.into(),
-                audit: api::OperationLedgerAuditStatus {
-                    state: api::OperationLedgerAudit::Pending.into(),
-                    ..Default::default()
-                }
-                .into(),
                 ..Default::default()
             })
         );
@@ -2202,48 +2174,14 @@ mod tests {
     }
 
     #[test]
-    fn status_reports_ledger_health_and_all_audit_states_without_changing_approved_profile() {
-        use aster_node::application::{
-            EventOperationAuditStatus, EventOperationCapacity, EventOperationLimits,
-            EventOperationStats,
-        };
-        for (rows, state, scanned, total, expected_state, expected_warning, expected_exhausted) in [
-            (
-                511,
-                EventOperationAuditState::Pending,
-                0,
-                0,
-                api::OperationLedgerAudit::Pending,
-                false,
-                false,
-            ),
-            (
-                512,
-                EventOperationAuditState::Running,
-                12,
-                520,
-                api::OperationLedgerAudit::Running,
-                true,
-                false,
-            ),
-            (
-                1_023,
-                EventOperationAuditState::Complete,
-                1_030,
-                1_030,
-                api::OperationLedgerAudit::Complete,
-                true,
-                false,
-            ),
-            (
-                1_024,
-                EventOperationAuditState::Failed,
-                40,
-                1_031,
-                api::OperationLedgerAudit::Failed,
-                true,
-                true,
-            ),
+    fn status_reports_numbered_ledger_health_without_changing_approved_profile() {
+        use aster_node::application::{EventOperationCapacity, EventOperationLimits};
+        use aster_redb_store::NumberedEventOperationStats;
+        for (rows, expected_warning, expected_exhausted) in [
+            (511, false, false),
+            (512, true, false),
+            (1_023, true, false),
+            (1_024, true, true),
         ] {
             let response = status_response(
                 [0x11; 32],
@@ -2251,11 +2189,6 @@ mod tests {
                 EventEmissionPolicy::Normal,
                 None,
                 SelectedEventStatus {
-                    event_operation_audit: EventOperationAuditStatus {
-                        state,
-                        scanned,
-                        total,
-                    },
                     sync: NodeEventSyncStatus::Offline,
                     authenticated_contacts: 0,
                     failed_contact_attempts: 0,
@@ -2263,15 +2196,14 @@ mod tests {
                     emission_policy: EventEmissionPolicy::Normal,
                     store_usage: AggregateStoreUsage::default(),
                     store_limits: StoreLimits::default(),
-                    event_operation_capacity: EventOperationCapacity::from_legacy_inspection(
-                        EventOperationStats {
-                            records_total: rows,
-                            records_active: 7,
-                            records_retired: rows - 7,
-                            reverse_rows: 7,
-                            logical_bytes: 7 * 162 + (rows - 7) * 67,
+                    event_operation_capacity: EventOperationCapacity::for_ledgers(
+                        NumberedEventOperationStats {
+                            clients: rows - 7,
+                            outstanding_results: 7,
+                            reverse_edges: 7,
+                            logical_bytes: (rows - 7) * 162 + 7 * 292,
                         },
-                        EventOperationLimits::new(2_000, 400_000, 100).unwrap(),
+                        EventOperationLimits::new(2_000, 1_000_000, 100).unwrap(),
                     ),
                     event_operation_rolling_accept_rate: 1.5,
                     event_operation_estimated_seconds_to_exhaustion: 123,
@@ -2283,16 +2215,16 @@ mod tests {
             assert_eq!(
                 (
                     operations.rows,
-                    operations.active_rows,
-                    operations.retired_rows,
-                    operations.reverse_rows
+                    operations.numbered_clients,
+                    operations.numbered_outstanding_results,
+                    operations.numbered_reverse_rows
                 ),
-                (rows, 7, rows - 7, 7)
+                (rows, rows - 7, 7, 7)
             );
-            assert_eq!(operations.bytes, 7 * 162 + (rows - 7) * 67);
+            assert_eq!(operations.bytes, (rows - 7) * 162 + 7 * 292);
             assert_eq!(
                 (operations.row_hard_limit, operations.byte_hard_limit),
-                (2_000, 400_000)
+                (2_000, 1_000_000)
             );
             assert_eq!(operations.profile_boundary, 1_024);
             assert_eq!(operations.profile_remaining, 1_024 - rows);
@@ -2309,19 +2241,12 @@ mod tests {
             );
             assert_eq!(operations.warning_state, api::OperationCapacityWarning::Ok);
             assert_eq!(
-                operations.ledger_mode,
-                api::PublishOperationLedgerMode::Legacy
-            );
-            assert_eq!(
                 (
                     operations.rolling_accept_rate,
                     operations.estimated_seconds_to_exhaustion
                 ),
                 (1.5, 123)
             );
-            let audit = operations.audit.as_option().unwrap();
-            assert_eq!(audit.state, expected_state);
-            assert_eq!((audit.scanned, audit.total), (scanned, total));
         }
     }
 

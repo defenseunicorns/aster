@@ -96,13 +96,9 @@ const SEMANTIC_PROTOCOL_V1: u16 = super::SEMANTIC_PROTOCOL_V1;
 #[cfg(test)]
 const SEMANTIC_PROTOCOL_V2: u16 = super::SEMANTIC_PROTOCOL_V2;
 #[cfg(test)]
-const SEMANTIC_PROTOCOL_V3: u16 = super::SEMANTIC_PROTOCOL_V3;
-#[cfg(test)]
 const SEMANTIC_PROTOCOL_V4: u16 = super::SEMANTIC_PROTOCOL_V4;
 #[cfg(test)]
 const SEMANTIC_PROTOCOL_V5: u16 = super::SEMANTIC_PROTOCOL_V5;
-#[cfg(test)]
-const SEMANTIC_PROTOCOL_V6: u16 = super::SEMANTIC_PROTOCOL_V6;
 const SEMANTIC_PROTOCOL_V7: u16 = super::SEMANTIC_PROTOCOL_V7;
 const SEMANTIC_PROTOCOL_V8: u16 = super::SEMANTIC_PROTOCOL_V8;
 const SEMANTIC_PROTOCOL_V9: u16 = super::SEMANTIC_PROTOCOL_V9;
@@ -4583,10 +4579,13 @@ impl ReferenceSessionInitiator {
         bundle: ProvisioningBundle,
         semantic_ceiling: u16,
     ) -> Result<(Self, Vec<u8>), EnvelopeError> {
-        if semantic_ceiling == 0 || semantic_ceiling > super::SEMANTIC_PROTOCOL_V9 {
+        if semantic_ceiling != super::SEMANTIC_PROTOCOL_V9 {
             return Err(invalid_envelope());
         }
-        Self::start_with_semantic_versions(bundle, (1..=semantic_ceiling).rev().collect())
+        Self::start_with_semantic_versions(
+            bundle,
+            super::SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS.to_vec(),
+        )
     }
 
     /// Compatibility-only constructor for downstream authenticated transport
@@ -4789,10 +4788,13 @@ impl ReferenceSessionResponder {
         bundle: ProvisioningBundle,
         semantic_ceiling: u16,
     ) -> Result<Self, EnvelopeError> {
-        if semantic_ceiling == 0 || semantic_ceiling > super::SEMANTIC_PROTOCOL_V9 {
+        if semantic_ceiling != super::SEMANTIC_PROTOCOL_V9 {
             return Err(invalid_envelope());
         }
-        Self::open_with_semantic_versions(bundle, (1..=semantic_ceiling).rev().collect())
+        Self::open_with_semantic_versions(
+            bundle,
+            super::SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS.to_vec(),
+        )
     }
 
     pub(crate) fn open_with_semantic_versions(
@@ -9803,7 +9805,7 @@ mod tests {
     }
 
     #[test]
-    fn handshake_flights_keep_stable_profile_and_negotiate_semantic_v2() {
+    fn handshake_flights_keep_stable_profile_and_negotiate_semantic_v9() {
         let mut provisioner = ReferenceProvisioner::from_seed([0x31; 32])
             .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
         let initiator_bundle = provisioner
@@ -9817,7 +9819,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("initiator endpoint failed: {error}"));
         let (_handshake, hello) = InitiatorHandshake::start(
             &mut endpoint.provider,
-            vec![PROTOCOL_VERSION + 1, PROTOCOL_VERSION],
+            vec![SEMANTIC_PROTOCOL_V9 + 1, SEMANTIC_PROTOCOL_V9],
             vec![0x0202, SUITE_ID],
         )
         .unwrap_or_else(|error| panic!("client start failed: {error}"));
@@ -9847,7 +9849,7 @@ mod tests {
         assert_eq!(&flight_one[14..16], &2u16.to_be_bytes());
         assert_eq!(
             &flight_one[16..20],
-            &[PROTOCOL_VERSION + 1, PROTOCOL_VERSION]
+            &[SEMANTIC_PROTOCOL_V9 + 1, SEMANTIC_PROTOCOL_V9]
                 .into_iter()
                 .flat_map(u16::to_be_bytes)
                 .collect::<Vec<_>>()
@@ -9865,8 +9867,8 @@ mod tests {
         assert_eq!(decoded, hello);
         assert_eq!(decoded_proof, mission_proof);
         let mut reordered_versions = flight_one.clone();
-        reordered_versions[16..18].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-        reordered_versions[18..20].copy_from_slice(&(PROTOCOL_VERSION + 1).to_be_bytes());
+        reordered_versions[16..18].copy_from_slice(&SEMANTIC_PROTOCOL_V9.to_be_bytes());
+        reordered_versions[18..20].copy_from_slice(&(SEMANTIC_PROTOCOL_V9 + 1).to_be_bytes());
         assert!(decode_client_flight(&reordered_versions).is_err());
 
         let responder = ReferenceSessionResponder::open(responder_bundle)
@@ -9875,11 +9877,11 @@ mod tests {
             .receive_client(&flight_one)
             .unwrap_or_else(|error| panic!("future-compatible client flight failed: {error}"));
         assert_eq!(&flight_two[..14], &handshake_prefix(2));
-        assert_eq!(&flight_two[14..16], &SEMANTIC_PROTOCOL_V2.to_be_bytes());
+        assert_eq!(&flight_two[14..16], &SEMANTIC_PROTOCOL_V9.to_be_bytes());
         assert_eq!(&flight_two[16..18], &SUITE_ID.to_be_bytes());
         let selected = decode_server_flight(&flight_two)
             .unwrap_or_else(|error| panic!("server flight decoding failed: {error}"));
-        assert_eq!(selected.selected_version, SEMANTIC_PROTOCOL_V2);
+        assert_eq!(selected.selected_version, SEMANTIC_PROTOCOL_V9);
         assert_eq!(selected.selected_suite, SUITE_ID);
         assert_eq!(
             encode_server_flight(&selected)
@@ -9889,71 +9891,70 @@ mod tests {
     }
 
     #[test]
-    fn reference_handshake_falls_back_for_a_v1_only_peer() {
-        let mut provisioner = ReferenceProvisioner::from_seed([0x39; 32])
-            .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
-        let initiator_bundle = provisioner
-            .issue_node(1, &[member_access(vec![0])])
-            .unwrap_or_else(|error| panic!("initiator issue failed: {error}"));
-        let responder_bundle = provisioner
-            .issue_node(2, &[member_access(vec![0])])
-            .unwrap_or_else(|error| panic!("responder issue failed: {error}"));
-        let (_initiator, first_flight) = ReferenceSessionInitiator::start_with_semantic_versions(
-            initiator_bundle,
-            vec![SEMANTIC_PROTOCOL_V1],
-        )
-        .unwrap_or_else(|error| panic!("v1 initiator start failed: {error}"));
-        let (hello, _) = decode_client_flight(&first_flight)
-            .unwrap_or_else(|error| panic!("v1 client flight failed: {error}"));
-        assert_eq!(hello.supported_versions, vec![SEMANTIC_PROTOCOL_V1]);
+    fn reference_handshake_rejects_pre_v9_peers_in_both_roles() {
+        for version in 1..9 {
+            let mut provisioner = ReferenceProvisioner::from_seed([0x39; 32]).expect("authority");
+            let initiator_bundle = provisioner
+                .issue_node(1, &[member_access(vec![0])])
+                .expect("initiator");
+            let responder_bundle = provisioner
+                .issue_node(2, &[member_access(vec![0])])
+                .expect("responder");
+            let responder_bytes = responder_bundle.to_bytes().expect("responder bytes");
+            let mut endpoint = SessionEndpoint::open(initiator_bundle).expect("endpoint");
+            let (_, mut hello) =
+                InitiatorHandshake::start(&mut endpoint.provider, vec![9], vec![SUITE_ID])
+                    .expect("hello");
+            hello.supported_versions = vec![version];
+            let proof = create_mission_proof(&endpoint, &hello).expect("proof");
+            let first = encode_client_flight(&hello, &proof).expect("flight");
+            let responder = ReferenceSessionResponder::open(responder_bundle).expect("responder");
+            assert!(
+                responder.receive_client(&first).is_err(),
+                "accepted v{version} initiator"
+            );
 
-        let responder = ReferenceSessionResponder::open(responder_bundle)
-            .unwrap_or_else(|error| panic!("responder open failed: {error}"));
-        let (_pending, second_flight) = responder
-            .receive_client(&first_flight)
-            .unwrap_or_else(|error| panic!("v1 client flight rejected: {error}"));
-        let selected = decode_server_flight(&second_flight)
-            .unwrap_or_else(|error| panic!("v1 server flight failed: {error}"));
-        assert_eq!(selected.selected_version, SEMANTIC_PROTOCOL_V1);
-    }
-
-    #[test]
-    fn reference_handshake_selects_v4_for_a_v4_only_offer() {
-        let mut provisioner = ReferenceProvisioner::from_seed([0x3a; 32])
-            .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
-        let initiator_bundle = provisioner
-            .issue_node(1, &[member_access(vec![0])])
-            .unwrap_or_else(|error| panic!("initiator issue failed: {error}"));
-        let responder_bundle = provisioner
-            .issue_node(2, &[member_access(vec![0])])
-            .unwrap_or_else(|error| panic!("responder issue failed: {error}"));
-        let (initiator, responder) = complete_sessions_with_versions(
-            initiator_bundle,
-            responder_bundle,
-            vec![
-                SEMANTIC_PROTOCOL_V4,
-                SEMANTIC_PROTOCOL_V3,
-                SEMANTIC_PROTOCOL_V2,
-                SEMANTIC_PROTOCOL_V1,
-            ],
-        );
-        assert_eq!(initiator.semantic_version(), SEMANTIC_PROTOCOL_V4);
-        assert_eq!(responder.semantic_version(), SEMANTIC_PROTOCOL_V4);
+            let initiator_bundle = provisioner
+                .issue_node(3, &[member_access(vec![0])])
+                .expect("initiator");
+            let (initiator, first) = ReferenceSessionInitiator::start_with_semantic_versions(
+                initiator_bundle,
+                vec![9, version],
+            )
+            .expect("test offer");
+            let responder = ReferenceSessionResponder::open_with_semantic_versions(
+                ProvisioningBundle::from_bytes(&responder_bytes).expect("bundle"),
+                vec![version],
+            )
+            .expect("old responder fixture");
+            let (_, second) = responder.receive_client(&first).expect("old selection");
+            assert!(
+                initiator.receive_server(&second).is_err(),
+                "accepted v{version} responder"
+            );
+            assert!(
+                ReferenceSessionInitiator::start_with_semantic_ceiling(
+                    provisioner
+                        .issue_node(4, &[member_access(vec![0])])
+                        .expect("bundle"),
+                    version,
+                )
+                .is_err()
+            );
+            assert!(
+                ReferenceSessionResponder::open_with_semantic_ceiling(
+                    ProvisioningBundle::from_bytes(&responder_bytes).expect("bundle"),
+                    version,
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
     fn semantic_registry_negotiates_each_supported_version_and_rejects_neighbors() {
-        for version in [
-            SEMANTIC_PROTOCOL_V1,
-            SEMANTIC_PROTOCOL_V2,
-            SEMANTIC_PROTOCOL_V3,
-            SEMANTIC_PROTOCOL_V4,
-            SEMANTIC_PROTOCOL_V5,
-            SEMANTIC_PROTOCOL_V6,
-            SEMANTIC_PROTOCOL_V7,
-            SEMANTIC_PROTOCOL_V8,
-            SEMANTIC_PROTOCOL_V9,
-        ] {
+        {
+            let version = SEMANTIC_PROTOCOL_V9;
             let mut provisioner = ReferenceProvisioner::from_seed([0x40 + version as u8; 32])
                 .unwrap_or_else(|error| panic!("v{version} provisioner failed: {error}"));
             let initiator_bundle = provisioner
@@ -9968,7 +9969,7 @@ mod tests {
             assert_eq!(responder.semantic_version(), version);
         }
 
-        for unsupported in [0, SEMANTIC_PROTOCOL_V9 + 1] {
+        for unsupported in [0, 1, 2, 3, 4, 5, 6, 7, 8, SEMANTIC_PROTOCOL_V9 + 1] {
             let mut provisioner = ReferenceProvisioner::from_seed([0x50 + unsupported as u8; 32])
                 .unwrap_or_else(|error| panic!("v{unsupported} provisioner failed: {error}"));
             let initiator_bundle = provisioner
@@ -9997,12 +9998,9 @@ mod tests {
             .unwrap_or_else(|error| panic!("responder fixture failed: {error}"));
         let mut endpoint = SessionEndpoint::open(initiator_bundle)
             .unwrap_or_else(|error| panic!("initiator endpoint failed: {error}"));
-        let (_handshake, hello) = InitiatorHandshake::start(
-            &mut endpoint.provider,
-            vec![PROTOCOL_VERSION + 1, PROTOCOL_VERSION],
-            vec![0x0202, SUITE_ID],
-        )
-        .unwrap_or_else(|error| panic!("client start failed: {error}"));
+        let (_handshake, hello) =
+            InitiatorHandshake::start(&mut endpoint.provider, vec![10, 9], vec![0x0202, SUITE_ID])
+                .unwrap_or_else(|error| panic!("client start failed: {error}"));
         let mission_proof = create_mission_proof(&endpoint, &hello)
             .unwrap_or_else(|error| panic!("mission proof failed: {error}"));
 
@@ -10043,34 +10041,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("initiator start failed: {error}"));
         let (mut hello, mission_proof) = decode_client_flight(&first_flight)
             .unwrap_or_else(|error| panic!("client flight decode failed: {error}"));
-        assert_eq!(
-            hello.supported_versions,
-            vec![
-                SEMANTIC_PROTOCOL_V9,
-                SEMANTIC_PROTOCOL_V8,
-                SEMANTIC_PROTOCOL_V7,
-                SEMANTIC_PROTOCOL_V6,
-                SEMANTIC_PROTOCOL_V5,
-                SEMANTIC_PROTOCOL_V4,
-                SEMANTIC_PROTOCOL_V3,
-                SEMANTIC_PROTOCOL_V2,
-                SEMANTIC_PROTOCOL_V1,
-            ]
-        );
-        hello.supported_versions.remove(0);
-        assert_eq!(
-            hello.supported_versions,
-            vec![
-                SEMANTIC_PROTOCOL_V8,
-                SEMANTIC_PROTOCOL_V7,
-                SEMANTIC_PROTOCOL_V6,
-                SEMANTIC_PROTOCOL_V5,
-                SEMANTIC_PROTOCOL_V4,
-                SEMANTIC_PROTOCOL_V3,
-                SEMANTIC_PROTOCOL_V2,
-                SEMANTIC_PROTOCOL_V1,
-            ]
-        );
+        assert_eq!(hello.supported_versions, vec![SEMANTIC_PROTOCOL_V9]);
+        hello.supported_versions = vec![8];
         let stripped = encode_client_flight(&hello, &mission_proof)
             .unwrap_or_else(|error| panic!("stripped flight encoding failed: {error}"));
         let responder = ReferenceSessionResponder::open(responder_bundle)
@@ -10093,20 +10065,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("initiator start failed: {error}"));
         let (default_hello, _) = decode_client_flight(&flight_one)
             .unwrap_or_else(|error| panic!("default client flight failed: {error}"));
-        assert_eq!(
-            default_hello.supported_versions,
-            vec![
-                SEMANTIC_PROTOCOL_V9,
-                SEMANTIC_PROTOCOL_V8,
-                SEMANTIC_PROTOCOL_V7,
-                SEMANTIC_PROTOCOL_V6,
-                SEMANTIC_PROTOCOL_V5,
-                SEMANTIC_PROTOCOL_V4,
-                SEMANTIC_PROTOCOL_V3,
-                SEMANTIC_PROTOCOL_V2,
-                SEMANTIC_PROTOCOL_V1,
-            ]
-        );
+        assert_eq!(default_hello.supported_versions, vec![SEMANTIC_PROTOCOL_V9]);
         let initiator_id = initiator.endpoint.credential.identity;
         let responder = ReferenceSessionResponder::open(responder_bundle)
             .unwrap_or_else(|error| panic!("responder open failed: {error}"));
@@ -10162,7 +10121,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_custody_wrapper_is_nested_replay_safe_and_context_bound() {
+    fn v9_custody_wrapper_is_nested_replay_safe_and_context_bound() {
         let mut provisioner = ReferenceProvisioner::from_seed([0x73; 32])
             .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
         let initiator_bytes = provisioner
@@ -10179,11 +10138,7 @@ mod tests {
                     .unwrap_or_else(|error| panic!("initiator parse failed: {error}")),
                 ProvisioningBundle::from_bytes(&responder_bytes)
                     .unwrap_or_else(|error| panic!("responder parse failed: {error}")),
-                vec![
-                    SEMANTIC_PROTOCOL_V3,
-                    SEMANTIC_PROTOCOL_V2,
-                    SEMANTIC_PROTOCOL_V1,
-                ],
+                vec![SEMANTIC_PROTOCOL_V9],
             )
         };
         let (mut sender, mut receiver) = pair();
@@ -10303,199 +10258,6 @@ mod tests {
     }
 
     #[test]
-    fn v8_blob_custody_requires_the_authenticated_negotiated_blob_profile() {
-        // Mutations caught: accepting a caller-supplied transfer-profile
-        // digest, treating a Legacy-selected Blob lane as profile 4, or
-        // deriving negotiation state from an unauthenticated offer.
-        let mut provisioner = ReferenceProvisioner::from_seed([0x84; 32])
-            .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
-        let initiator_bytes = provisioner
-            .issue_node(1, &[member_access(vec![0])])
-            .and_then(|bundle| bundle.to_bytes())
-            .unwrap_or_else(|error| panic!("initiator fixture failed: {error}"));
-        let responder_bytes = provisioner
-            .issue_node(2, &[member_access(vec![0])])
-            .and_then(|bundle| bundle.to_bytes())
-            .unwrap_or_else(|error| panic!("responder fixture failed: {error}"));
-        let pair = || {
-            complete_sessions_with_versions(
-                ProvisioningBundle::from_bytes(&initiator_bytes)
-                    .unwrap_or_else(|error| panic!("initiator parse failed: {error}")),
-                ProvisioningBundle::from_bytes(&responder_bytes)
-                    .unwrap_or_else(|error| panic!("responder parse failed: {error}")),
-                vec![SEMANTIC_PROTOCOL_V8],
-            )
-        };
-
-        let authenticate_offers =
-            |initiator: &mut ReferenceAuthenticatedSession,
-             responder: &mut ReferenceAuthenticatedSession,
-             initiator_offer: &crate::TransferProfileOfferV1,
-             responder_offer: &crate::TransferProfileOfferV1| {
-                let request = initiator
-                    .seal_transfer_profile_offer(initiator_offer)
-                    .unwrap_or_else(|error| panic!("offer request seal failed: {error}"));
-                assert_eq!(
-                    responder
-                        .open_transfer_profile_offer(&request)
-                        .unwrap_or_else(|error| panic!("offer request open failed: {error}")),
-                    *initiator_offer
-                );
-                let response = responder
-                    .seal_transfer_profile_offer(responder_offer)
-                    .unwrap_or_else(|error| panic!("offer response seal failed: {error}"));
-                assert_eq!(
-                    initiator
-                        .open_transfer_profile_offer(&response)
-                        .unwrap_or_else(|error| panic!("offer response open failed: {error}")),
-                    *responder_offer
-                );
-            };
-
-        let current = crate::TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V8)
-            .expect("semantic-v8 offer");
-        let legacy = crate::TransferProfileOfferV1::legacy_only();
-        let direction = crate::BlobCustodyDirectionV1::ToSessionResponder;
-        let mut literal = literal_blob_custody_claim();
-
-        let (mut legacy_sender, mut legacy_receiver) = pair();
-        let request = legacy_sender
-            .seal_transfer_profile_offer(&current)
-            .expect("stream offer request");
-        assert_eq!(
-            legacy_receiver
-                .open_transfer_profile_offer(&request)
-                .expect("authenticated stream offer"),
-            current
-        );
-        assert!(
-            legacy_receiver
-                .seal_transfer_profile_offer(&legacy)
-                .is_err(),
-            "a legacy-only Blob offer must fail before any profile-4 record can be minted"
-        );
-
-        let (mut sender, mut receiver) = pair();
-        authenticate_offers(&mut sender, &mut receiver, &current, &current);
-        literal[14..46].copy_from_slice(&sender.session_id);
-        literal[54] = direction as u8;
-        let claim = crate::BlobCustodyClaimV1::decode(&literal).expect("session-bound claim");
-        let substituted_context = blob_custody_lane_record_context([0xa5; 32], direction);
-        let substituted = sender
-            .seal_frame_with_context(&claim.encode(), &substituted_context)
-            .expect("caller-selected digest frame");
-        assert!(
-            receiver
-                .open_blob_custody_frame(direction, &substituted)
-                .is_err(),
-            "a caller-selected profile digest must not mint Blob authority"
-        );
-        let negotiated = negotiate_transfer_profiles_for_semantic_version(
-            SEMANTIC_PROTOCOL_V8,
-            &current,
-            &current,
-        )
-        .expect("BlobRangesStreamV1-selected semantic-v8 profiles");
-        let digest = transfer_profile_digest(&current, &current, &negotiated);
-        let mut substituted_profile = blob_custody_lane_record_context(digest, direction);
-        let profile_offset = substituted_profile.len() - 3;
-        substituted_profile[profile_offset..profile_offset + 2]
-            .copy_from_slice(&(TransferProfileId::LegacyV6 as u16).to_be_bytes());
-        let substituted = sender
-            .seal_frame_with_context(&claim.encode(), &substituted_profile)
-            .expect("caller-selected profile frame");
-        assert!(
-            receiver
-                .open_blob_custody_frame(direction, &substituted)
-                .is_err(),
-            "a caller-selected profile ID must not mint Blob authority"
-        );
-        let frame = sender
-            .seal_blob_custody_frame(direction, &claim)
-            .unwrap_or_else(|error| panic!("Blob custody seal failed: {error}"));
-        let (opened, authority) = receiver
-            .open_blob_custody_frame(direction, &frame)
-            .unwrap_or_else(|error| panic!("Blob custody open failed: {error}"));
-        assert_eq!(opened, claim);
-        assert_eq!(authority.claim_digest(), claim.digest());
-        assert!(
-            receiver.open_blob_custody_frame(direction, &frame).is_err(),
-            "one protected claim record must mint authority at most once"
-        );
-        assert_eq!(
-            sender.negotiated_transfer_profile(crate::TransferLaneId::Blob),
-            Some(crate::TransferProfileId::BlobRangesStreamV1)
-        );
-
-        // Mutation caught: protecting only an adjacent claim record, accepting
-        // a claim that differs from the complete authenticated source frame,
-        // or replaying that frame could mint reusable runtime authority.
-        let mut source_plaintext = b"canonical source-bearing prefix".to_vec();
-        source_plaintext.extend_from_slice(&[1, 0, 208]);
-        source_plaintext.extend_from_slice(&claim.encode());
-        let (mut source_sender, mut source_receiver) = pair();
-        authenticate_offers(&mut source_sender, &mut source_receiver, &current, &current);
-        let mut source_claim_bytes = claim.encode();
-        source_claim_bytes[14..46].copy_from_slice(&source_sender.session_id);
-        let source_claim = crate::BlobCustodyClaimV1::decode(&source_claim_bytes)
-            .expect("source-frame session claim");
-        source_plaintext.truncate(b"canonical source-bearing prefix".len());
-        source_plaintext.extend_from_slice(&[1, 0, 208]);
-        source_plaintext.extend_from_slice(&source_claim.encode());
-        let source_frame = source_sender
-            .seal_blob_source_frame(direction, Some(&source_claim), &source_plaintext)
-            .expect("protect complete Blob source frame");
-        let (opened_source, opened_finite) = source_receiver
-            .open_blob_source_frame(direction, &source_frame)
-            .expect("open complete Blob source frame");
-        let (opened_claim, source_authority) =
-            opened_finite.expect("finite source authority is present");
-        assert_eq!(opened_source, source_plaintext);
-        assert_eq!(opened_claim, source_claim);
-        assert_eq!(source_authority.claim_digest(), source_claim.digest());
-        assert!(
-            source_receiver
-                .open_blob_source_frame(direction, &source_frame)
-                .is_err(),
-            "the complete source record must remain replay-checked"
-        );
-        let mut mismatched_plaintext = source_plaintext.clone();
-        *mismatched_plaintext.last_mut().expect("claim tail") ^= 1;
-        assert!(
-            source_sender
-                .seal_blob_source_frame(direction, Some(&source_claim), &mismatched_plaintext,)
-                .is_err(),
-            "the protected source tail must equal the supplied canonical claim"
-        );
-
-        // Mutation caught: letting Store authorization accept caller-selected
-        // session, profile, exchange, direction, or finalization fields would
-        // mint a claim without exact authenticated outbound contact context.
-        let outbound = source_sender
-            .mint_blob_custody_send_context(direction, 73, 41)
-            .expect("mint exact outbound Blob custody context");
-        assert_eq!(outbound.semantic_version(), SEMANTIC_PROTOCOL_V8);
-        assert_eq!(
-            outbound.profile_id(),
-            TransferProfileId::BlobRangesStreamV1 as u16
-        );
-        assert_eq!(outbound.session_transcript(), source_sender.session_id());
-        assert_eq!(outbound.exchange_id(), 73);
-        assert_eq!(outbound.direction(), direction);
-        assert_eq!(outbound.finalization_charge_ms(), 41);
-        assert!(
-            source_sender
-                .mint_blob_custody_send_context(
-                    crate::BlobCustodyDirectionV1::ToSessionInitiator,
-                    73,
-                    41,
-                )
-                .is_err(),
-            "the authenticated sender role fixes the outbound direction"
-        );
-    }
-
-    #[test]
     fn blob_custody_v2_requires_v9_profile_five_attempt_context() {
         let mut provisioner = ReferenceProvisioner::from_seed([0x85; 32]).unwrap();
         let initiator = provisioner
@@ -10570,66 +10332,6 @@ mod tests {
             *byte = u8::from_str_radix(&HEX[index * 2..index * 2 + 2], 16).unwrap();
         }
         output
-    }
-
-    fn literal_blob_custody_claim() -> [u8; crate::BLOB_CUSTODY_CLAIM_V1_BYTES] {
-        const HEX: &str = "41535452424c30380001000800041111111111111111111111111111111111111111111111111111111111111111000000000000000001222222222222222222222222222222222222222222222222222222222222222200000000000000013333333333333333333333333333333333333333333333333333333333333333444444444444444444444444444444444444444444444444444444444444444400000000000000000100000000000000005555555555555555555555555555555500000000000000000000000000000000";
-        let mut output = [0u8; crate::BLOB_CUSTODY_CLAIM_V1_BYTES];
-        for (index, byte) in output.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&HEX[index * 2..index * 2 + 2], 16)
-                .expect("literal hexadecimal byte");
-        }
-        output
-    }
-
-    #[test]
-    fn v1_v2_keep_durable_frames_and_refuse_finite_custody_wrappers() {
-        for version in [SEMANTIC_PROTOCOL_V1, SEMANTIC_PROTOCOL_V2] {
-            let mut provisioner = ReferenceProvisioner::from_seed([version as u8; 32])
-                .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
-            let initiator_bundle = provisioner
-                .issue_node(1, &[member_access(vec![0])])
-                .unwrap_or_else(|error| panic!("initiator issue failed: {error}"));
-            let responder_bundle = provisioner
-                .issue_node(2, &[member_access(vec![0])])
-                .unwrap_or_else(|error| panic!("responder issue failed: {error}"));
-            let (mut sender, mut receiver) =
-                complete_sessions_with_versions(initiator_bundle, responder_bundle, vec![version]);
-            assert_eq!(sender.semantic_version(), version);
-            assert_eq!(receiver.semantic_version(), version);
-            let durable = sender
-                .seal_frame(b"durable source bytes")
-                .unwrap_or_else(|error| panic!("v{version} durable seal failed: {error}"));
-            assert_eq!(
-                receiver
-                    .open_frame(&durable)
-                    .unwrap_or_else(|error| panic!("v{version} durable open failed: {error}")),
-                b"durable source bytes"
-            );
-            let transfer = crate::custody::CustodyTransferClaims::new(
-                crate::custody::CustodyTransferId::from_exact_hash([version as u8; 32]),
-                128,
-                Some(1_000),
-                Priority::Flash,
-            )
-            .unwrap_or_else(|error| panic!("transfer fixture failed: {error}"));
-            let finite = CustodyClaims::new(
-                transfer,
-                1,
-                1,
-                crate::custody::CustodyHop::new(
-                    0,
-                    crate::custody::CustodySample {
-                        clock_id: [version as u8; 16],
-                        tick_ms: 1,
-                    },
-                    0,
-                )
-                .unwrap_or_else(|error| panic!("finite hop failed: {error}")),
-            )
-            .unwrap_or_else(|error| panic!("finite claims failed: {error}"));
-            assert!(sender.seal_custody_wrapper(&finite).is_err());
-        }
     }
 
     #[test]
@@ -12940,20 +12642,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("initiator start failed: {error}"));
         let (hello, _) = decode_client_flight(&first_flight)
             .unwrap_or_else(|error| panic!("client flight decode failed: {error}"));
-        assert_eq!(
-            hello.supported_versions,
-            vec![
-                SEMANTIC_PROTOCOL_V9,
-                SEMANTIC_PROTOCOL_V8,
-                SEMANTIC_PROTOCOL_V7,
-                SEMANTIC_PROTOCOL_V6,
-                SEMANTIC_PROTOCOL_V5,
-                SEMANTIC_PROTOCOL_V4,
-                SEMANTIC_PROTOCOL_V3,
-                SEMANTIC_PROTOCOL_V2,
-                SEMANTIC_PROTOCOL_V1,
-            ]
-        );
+        assert_eq!(hello.supported_versions, vec![SEMANTIC_PROTOCOL_V9]);
         let responder = ReferenceSessionResponder::open(responder_bundle)
             .unwrap_or_else(|error| panic!("responder open failed: {error}"));
         let (_pending, second_flight) = responder

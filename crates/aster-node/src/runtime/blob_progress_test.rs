@@ -1,5 +1,6 @@
 //! Test-only observation of committed Blob prefixes; never a transport policy.
-use super::{BlobCarrierObjectId, BlobTransferId, ContentVerifiedBlobEnvelope, NodeId};
+use super::{BlobTransferId, NodeId};
+use aster_redb_store::BlobCarrierObjectId;
 use std::{
     collections::BTreeMap,
     future::Future,
@@ -154,26 +155,6 @@ impl Drop for Observer {
     fn drop(&mut self) {
         OBSERVERS.lock().expect("Blob observers").remove(&self.key);
     }
-}
-
-pub(super) fn record(
-    receiver: NodeId,
-    blob: &ContentVerifiedBlobEnvelope,
-    status: super::BlobCarrierPrefixStatus,
-) {
-    let key = (
-        receiver,
-        blob.publisher(),
-        blob.dot().counter,
-        *blob.blob_id().as_bytes(),
-    );
-    record_key(
-        key,
-        status.source(),
-        status.object(),
-        status.prefix_len(),
-        status.total_len(),
-    );
 }
 
 fn record_key(

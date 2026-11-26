@@ -1316,9 +1316,7 @@ async fn validate_closed_blob_handle(
 
 fn validate_non_blob_receipt(receipt: &NodeReceipt) -> Result<(), DynError> {
     require(
-        receipt.items == 0
-            && receipt.acceptance_markers == 0
-            && receipt.events == 0
+        receipt.events == 0
             && receipt.event_acceptance_markers == 0
             && receipt.route_cached_events == 0
             && receipt.controls == 0
@@ -2356,8 +2354,6 @@ fn emit_shutdown(phase: &str, participant: &str, receipt: &NodeReceipt) {
                 "carrier_path_transition_saturations",
                 receipt.carrier_path_transition_saturations.to_string(),
             ),
-            ("items", receipt.items.to_string()),
-            ("acceptance_markers", receipt.acceptance_markers.to_string()),
             ("events", receipt.events.to_string()),
             (
                 "event_acceptance_markers",

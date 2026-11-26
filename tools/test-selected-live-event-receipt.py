@@ -289,8 +289,6 @@ SHUTDOWN_COUNTER_KEYS = (
     "unknown_path_contacts",
     "carrier_path_transitions",
     "carrier_path_transition_saturations",
-    "items",
-    "acceptance_markers",
     "events",
     "event_acceptance_markers",
     "route_cached_events",
@@ -504,8 +502,6 @@ STOP_KEYS = (
     "carrier_path_transitions",
     "carrier_path_transition_saturations",
     "path_observation",
-    "opaque_items",
-    "opaque_acceptance_markers",
     "events",
     "event_acceptance_markers",
     "route_cached_events",
@@ -1671,6 +1667,10 @@ class SelectedLiveEventReceiptTests(unittest.TestCase):
         lines = list(self.fixture.transcript_lines)
         fields = [field for field in lines[0].split("\t") if not field.startswith("publication_model=")]
         lines[0] = "\t".join(fields).replace(ORACLE_TRANSCRIPT_SCHEMA, historical.TRANSCRIPT_SCHEMA)
+        # Historical shutdown records retain their original storage counters.
+        for index, line in enumerate(lines):
+            if line.startswith("LIVE_EVENT\tSHUTDOWN\t"):
+                lines[index] = line.replace("\tevents=", "\titems=0\tacceptance_markers=0\tevents=", 1)
         data = ("\n".join(lines) + "\n").replace("operation=publish_numbered", "operation=publish").encode()
         historical.validate_transcript(data)
         with self.assertRaises(CHECKER.ReceiptViolation):
@@ -2091,7 +2091,6 @@ class SelectedLiveEventReceiptTests(unittest.TestCase):
             (
                 (1, "events", "3"),
                 (1, "sync_status", "contacts_observed"),
-                (1, "opaque_items", "1"),
                 (8, "contacts", "0"),
                 (8, "direct_contacts", "0"),
                 (8, "contact_errors", "1"),

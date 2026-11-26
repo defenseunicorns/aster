@@ -201,10 +201,7 @@ impl TransferProfileOfferV1 {
                 ),
                 (
                     TransferLaneId::Event as u16,
-                    vec![
-                        TransferProfileId::EventPagesV1 as u16,
-                        TransferProfileId::LegacyV6 as u16,
-                    ],
+                    vec![TransferProfileId::EventPagesV1 as u16],
                 ),
             ],
         }
@@ -296,12 +293,14 @@ impl TransferProfileOfferV1 {
             };
             known_lanes.insert(lane);
             if !profiles.contains(&(TransferProfileId::LegacyV6 as u16))
+                && !(lane == TransferLaneId::Event
+                    && profiles.contains(&(TransferProfileId::EventPagesV1 as u16)))
                 && !(lane == TransferLaneId::Blob
                     && (profiles.contains(&(TransferProfileId::BlobRangesStreamV1 as u16))
                         || profiles.contains(&(TransferProfileId::BlobStreamV1 as u16))))
             {
                 return Err(TransferProfileError::invalid(
-                    "every fixed lane must offer LegacyV6",
+                    "fixed lane lacks its required transfer profile",
                 ));
             }
             if lane != TransferLaneId::Event
@@ -674,6 +673,13 @@ mod tests {
             .expect("Blob lane")
             .1;
         assert_eq!(blob, vec![TransferProfileId::BlobStreamV1]);
+        let event = offer
+            .known_lanes()
+            .into_iter()
+            .find(|(lane, _)| *lane == TransferLaneId::Event)
+            .expect("Event lane")
+            .1;
+        assert_eq!(event, vec![TransferProfileId::EventPagesV1]);
         let selected = negotiate_transfer_profiles_for_semantic_version(9, &offer, &offer)
             .expect("v9 selection");
         assert_eq!(

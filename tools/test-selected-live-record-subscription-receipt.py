@@ -94,7 +94,7 @@ KEYS = {
     "RECEIPT": words(
         """phase participant contacts contact_errors direct_contacts relay_contacts
         unknown_path_contacts data_offered data_fetched data_inserted data_duplicates
-        data_remaining mutable_remaining deferred_mutable_lanes items events blobs"""
+        data_remaining mutable_remaining deferred_mutable_lanes events blobs"""
     ),
     "CHILD_DELIVERY": words(
         """phase participant projection_id projection_key_sha256 siblings current_id
@@ -215,7 +215,7 @@ ATTEMPT_TWO_KEYS = words(
     post_successor_empty superseded_ids beta_id beta_present gamma_empty
     token_artifacts_removed closed_kind closed_operation shutdown_contacts
     shutdown_contact_errors shutdown_direct_contacts shutdown_relay_contacts
-    shutdown_unknown_path_contacts shutdown_items shutdown_events shutdown_blobs
+    shutdown_unknown_path_contacts shutdown_events shutdown_blobs
     shutdown_data_offered shutdown_data_fetched shutdown_data_inserted
     shutdown_data_duplicates shutdown_data_remaining shutdown_mutable_remaining
     shutdown_deferred_mutable_lanes"""
@@ -452,7 +452,6 @@ class Fixture:
             "data_remaining": "0",
             "mutable_remaining": "0",
             "deferred_mutable_lanes": "0",
-            "items": "0",
             "events": "0",
             "blobs": "0",
         }
@@ -1045,7 +1044,6 @@ class Fixture:
                     "shutdown_direct_contacts": "0",
                     "shutdown_relay_contacts": "0",
                     "shutdown_unknown_path_contacts": "0",
-                    "shutdown_items": "0",
                     "shutdown_events": "0",
                     "shutdown_blobs": "0",
                     "shutdown_data_offered": "0",

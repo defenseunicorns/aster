@@ -52,37 +52,12 @@ fn preflight_replacement(unclean: bool) {
 }
 
 #[test]
-fn audit_does_not_read_replacement_before_rejecting_path_change() {
-    let file = TestFile::new("read-only-audit-replacement");
-    drop(event_operation_publication::open(
-        &file, [0xa6; 32], 10, 2_000,
-    ));
-    let before = std::fs::read(&file.0).unwrap();
-    let retained = replace_after_validation(&file);
-    let mut callbacks = 0;
-
-    let error = Store::audit_existing_event_operations(&file.0, 1, |_| callbacks += 1)
-        .expect_err("reject changed pathname");
-    assert!(
-        matches!(
-            error,
-            StoreError::StoreBackingInvariant("backing path changed during read-only audit")
-        ),
-        "read the unchecked replacement: {error:?}"
-    );
-    assert_eq!(callbacks, 0, "reject replacement before reporting progress");
-    assert_eq!(std::fs::read(&retained.0).unwrap(), before);
-    assert_eq!(std::fs::read(&file.0).unwrap(), INVALID_REPLACEMENT);
-}
-
-#[test]
 fn readers_preserve_writer_exclusion_and_error_mapping() {
     let file = TestFile::new("read-only-writer-exclusion");
-    let writer = event_operation_publication::open(&file, [0xa6; 32], 10, 2_000);
+    let writer = Store::open_for_mission(&file.0, [0xa6; 32]).unwrap();
     for result in [
         Store::require_numbered_publication_compatible(&file.0),
         Store::inspect_existing(&file.0).map(|_| ()),
-        Store::audit_existing_event_operations(&file.0, 1, |_| {}).map(|_| ()),
     ] {
         assert!(matches!(
             result,
@@ -91,19 +66,17 @@ fn readers_preserve_writer_exclusion_and_error_mapping() {
     }
     drop(writer);
     let before = std::fs::read(&file.0).unwrap();
-    let mut callbacks = 0;
-    Store::audit_existing_event_operations(&file.0, 1, |_| {
-        callbacks += 1;
-        Store::inspect_existing(&file.0).expect("independent nested reader");
-        Store::require_numbered_publication_compatible(&file.0).expect("nested preflight");
-        // Closing either nested reader must not release the audit's lock.
-        assert!(matches!(
-            Database::open(&file.0),
-            Err(redb::DatabaseError::DatabaseAlreadyOpen)
-        ));
-    })
-    .expect("offline audit");
-    assert!(callbacks > 0);
+    let backing = open_read_only_store_backing(&file.0).unwrap();
+    let reader = redb::Builder::new()
+        .open_read_only_with_backend(FileBackend::new(backing.file).unwrap())
+        .unwrap();
+    Store::inspect_existing(&file.0).expect("independent nested reader");
+    Store::require_numbered_publication_compatible(&file.0).expect("nested preflight");
+    assert!(matches!(
+        Database::open(&file.0),
+        Err(redb::DatabaseError::DatabaseAlreadyOpen)
+    ));
+    drop(reader);
     assert_eq!(std::fs::read(&file.0).unwrap(), before);
     drop(Database::open(&file.0).expect("writer after all readers close"));
 }

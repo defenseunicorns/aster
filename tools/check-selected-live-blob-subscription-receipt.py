@@ -181,7 +181,7 @@ RECEIPT_KEYS = _words(
     blob_last_acceptance_marker blob_operations blob_variants
     blob_finalized_variants blob_committed_chunks blob_committed_file_bytes
     blob_reserved_file_bytes pending_blobs blob_carrier_prefixes
-    blob_network_staging_bytes items events controls"""
+    blob_network_staging_bytes events controls"""
 )
 DELIVERY_KEYS = _words(
     """phase participant label subscription_id publication_id blob_id publisher
@@ -462,7 +462,6 @@ def _validate_receipt(record: dict[str, str], phase: str) -> None:
             "pending_blobs": "0",
             "blob_carrier_prefixes": "0",
             "blob_network_staging_bytes": "0",
-            "items": "0",
             "events": "0",
             "controls": "0",
         },
@@ -902,7 +901,7 @@ ATTEMPT_TWO_CHILD_KEYS = _words(
     shutdown_blob_finalized_variants shutdown_blob_committed_chunks
     shutdown_blob_committed_file_bytes shutdown_blob_reserved_file_bytes
     shutdown_pending_blobs shutdown_blob_carrier_prefixes
-    shutdown_blob_network_staging_bytes shutdown_items shutdown_events
+    shutdown_blob_network_staging_bytes shutdown_events
     shutdown_controls"""
 )
 
@@ -1052,7 +1051,6 @@ def _validate_attempt_two_child(
             "shutdown_pending_blobs": "0",
             "shutdown_blob_carrier_prefixes": "0",
             "shutdown_blob_network_staging_bytes": "0",
-            "shutdown_items": "0",
             "shutdown_events": "0",
             "shutdown_controls": "0",
         },
@@ -1091,8 +1089,6 @@ def _validate_stop(
         "unknown_path_contacts": 0,
         "carrier_path_transitions": 0,
         "carrier_path_transition_saturations": 0,
-        "opaque_items": 0,
-        "opaque_acceptance_markers": 0,
         "events": 0,
         "event_acceptance_markers": 0,
         "route_cached_events": 0,

@@ -35,7 +35,6 @@ const DEPOT_OWNER_DOMAIN: &[u8] = b"aster/blob-depot-owner/v1";
 const DEPOT_OWNER_FILE_LEN: usize = 72;
 const IMPORT_VERSION_V1: u8 = 1;
 const IMPORT_VERSION: u8 = 2;
-const DEPOT_SCHEMA_VERSION_V1: u64 = 1;
 const CHUNK_STATE_VERSION: u8 = 1;
 const CHUNK_FILE_VERSION: u8 = 1;
 const CHUNK_FILE_MAGIC: &[u8; 8] = b"ASTRDP01";
@@ -2170,7 +2169,7 @@ pub(super) fn audit_depot_metadata_write(
                 "Blob depot schema version is missing",
             ))
         })?;
-    if schema != DEPOT_SCHEMA_VERSION_V1 && schema != BLOB_DEPOT_SCHEMA_VERSION {
+    if schema != BLOB_DEPOT_SCHEMA_VERSION {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "Blob depot schema version is unsupported",
         )));
@@ -2186,16 +2185,11 @@ pub(super) fn audit_depot_metadata_write(
         DEPOT_COMMITTED_FILE_BYTES,
         stats.committed_file_bytes,
     )?;
-    if schema == DEPOT_SCHEMA_VERSION_V1 {
-        depot.insert(DEPOT_RESERVED_FILE_BYTES, stats.reserved_file_bytes)?;
-        depot.insert(DEPOT_SCHEMA_VERSION, BLOB_DEPOT_SCHEMA_VERSION)?;
-    } else {
-        audit_depot_counter(
-            &mut depot,
-            DEPOT_RESERVED_FILE_BYTES,
-            stats.reserved_file_bytes,
-        )?;
-    }
+    audit_depot_counter(
+        &mut depot,
+        DEPOT_RESERVED_FILE_BYTES,
+        stats.reserved_file_bytes,
+    )?;
     Ok(stats)
 }
 
@@ -2307,7 +2301,7 @@ pub(super) fn inspect_depot_metadata_read(
                 "Blob depot schema version is missing",
             ))
         })?;
-    if schema != DEPOT_SCHEMA_VERSION_V1 && schema != BLOB_DEPOT_SCHEMA_VERSION {
+    if schema != BLOB_DEPOT_SCHEMA_VERSION {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "Blob depot schema version is unsupported",
         )));
@@ -2517,20 +2511,10 @@ pub(super) fn blob_upload_capacity(
     blob_upload_capacity_with_staging(total_len, blob_upload_staging_charge(total_len)?)
 }
 
-pub(super) fn legacy_blob_upload_capacity(
-    total_len: u64,
-) -> Result<super::upload::BlobUploadCapacity, StoreError> {
-    blob_upload_capacity_with_staging(total_len, legacy_blob_upload_staging_charge(total_len)?)
-}
-
 pub(super) fn blob_upload_staging_charge(total_len: u64) -> Result<u64, StoreError> {
     super::pack::reserved_upload_pack_bytes(total_len)?
         .checked_add(super::pack::upload_digest_reserved_bytes(total_len)?)
         .ok_or(StoreError::PayloadByteAccountingOverflow)
-}
-
-pub(super) fn legacy_blob_upload_staging_charge(total_len: u64) -> Result<u64, StoreError> {
-    super::pack::reserved_upload_pack_bytes(total_len)
 }
 
 pub(super) fn blob_upload_conversion_overhead(total_len: u64) -> Result<u64, StoreError> {
@@ -2814,153 +2798,24 @@ pub(crate) fn depot_owner_token_write(
     })
 }
 
-/// Performs the only safe owner-token migration before the Blob schema audit.
-///
-/// A wholly absent Blob group may be initialized later by the ordinary additive
-/// migration, but only when the fixed depot root is absent. An exact pre-token
-/// Blob group may receive a token only when every Blob row/counter is canonical
-/// empty and that root is absent. Partial token fields, any logical Blob state,
-/// or any fixed depot root fail without repair. Populated pre-marker depots are
-/// deliberately rejected because their files cannot be attributed safely.
+/// Validates existing depot ownership, or checks that a new store has no foreign root.
 pub(crate) fn prepare_depot_owner_token_write(
     write: &redb::WriteTransaction,
     store_path: &Path,
 ) -> Result<(), StoreError> {
-    let blob_tables = blob_table_names();
-    let multimap_tables = write
-        .list_multimap_tables()?
-        .map(|table| table.name().to_owned())
-        .collect::<BTreeSet<_>>();
-    if multimap_tables.contains(OBSOLETE_PROFILE5_RECEIPT_TABLE_NAME) {
-        return Err(blob_error(
-            BlobStoreError::UnsupportedLegacyProfile5ReceiptSchema,
-        ));
-    }
-    if multimap_tables
-        .iter()
-        .any(|table| blob_tables.contains(&table.as_str()))
-    {
-        return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "mission-scoped Blob schema has the wrong table kind",
-        )));
-    }
-    let existing = write
+    if !write
         .list_tables()?
-        .map(|table| table.name().to_owned())
-        .collect::<BTreeSet<_>>();
-    if existing.contains(OBSOLETE_PROFILE5_RECEIPT_TABLE_NAME) {
-        return Err(blob_error(
-            BlobStoreError::UnsupportedLegacyProfile5ReceiptSchema,
-        ));
-    }
-    if !existing.contains(BLOB_DEPOT_METADATA.name()) {
+        .any(|table| table.name() == BLOB_DEPOT_METADATA.name())
+    {
+        crate::require_new_store_write(write)?;
         if OwnedDirectory::open_root_if_present(store_path)?.is_some() {
             return Err(blob_error(BlobStoreError::DepotIntegrity(
-                "an unbound Blob depot root blocks whole-absent schema migration",
+                "an unbound Blob depot root blocks store creation",
             )));
         }
         return Ok(());
     }
-    let legacy = legacy_blob_table_names();
-    let network = network_blob_table_names();
-    let network_present = network
-        .iter()
-        .filter(|table| existing.contains(**table))
-        .count();
-    let network_current = network_present == network.len();
-    if legacy.iter().any(|table| !existing.contains(*table))
-        || !(network_present == 0 || network_current)
-    {
-        return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "mission-scoped Blob schema group is incomplete",
-        )));
-    }
-
-    let mut depot = write.open_table(BLOB_DEPOT_METADATA)?;
-    let fields = depot_owner_token_fields();
-    let present = fields
-        .iter()
-        .map(|field| depot.get(*field).map(|value| value.is_some()))
-        .collect::<Result<Vec<_>, _>>()?;
-    if present.iter().all(|present| *present) {
-        drop(depot);
-        let _ = depot_owner_token_write(write)?;
-        return Ok(());
-    }
-    if present.iter().any(|present| *present) {
-        return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "Blob depot owner token is incomplete",
-        )));
-    }
-
-    let populated = write.open_table(BLOB_PUBLICATIONS)?.len()? != 0
-        || write.open_table(BLOB_BYTES)?.len()? != 0
-        || write.open_table(BLOB_SEMANTIC_ITEMS)?.len()? != 0
-        || write.open_table(BLOB_CONTENT_INDEX)?.len()? != 0
-        || write.open_table(BLOB_ACCEPTANCE_MARKERS)?.len()? != 0
-        || write.open_table(BLOB_OPERATIONS)?.len()? != 0
-        || write.open_table(BLOB_IMPORTS)?.len()? != 0
-        || write.open_table(BLOB_CHUNKS)?.len()? != 0
-        || (network_current
-            && (write.open_table(BLOB_PENDING_SOURCES)?.len()? != 0
-                || write.open_table(BLOB_CARRIER_PREFIXES)?.len()? != 0
-                || write.open_table(BLOB_CARRIER_FETCH_CURSORS)?.len()? != 0));
-    if populated {
-        return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "populated pre-marker Blob schema cannot acquire depot ownership",
-        )));
-    }
-    let schema = depot.get(DEPOT_SCHEMA_VERSION)?.map(|value| value.value());
-    let canonical_header = (depot.len()? == 4 && schema == Some(DEPOT_SCHEMA_VERSION_V1))
-        || (depot.len()? == 5 && schema == Some(BLOB_DEPOT_SCHEMA_VERSION));
-    let mut canonical_counters = true;
-    for field in [
-        DEPOT_VARIANT_COUNT,
-        DEPOT_COMMITTED_CHUNK_COUNT,
-        DEPOT_COMMITTED_FILE_BYTES,
-    ] {
-        canonical_counters &= depot.get(field)?.map(|value| value.value()) == Some(0);
-    }
-    if schema == Some(BLOB_DEPOT_SCHEMA_VERSION) {
-        canonical_counters &= depot
-            .get(DEPOT_RESERVED_FILE_BYTES)?
-            .map(|value| value.value())
-            == Some(0);
-    }
-    if !canonical_header || !canonical_counters {
-        return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "pre-marker Blob depot metadata is not canonical empty state",
-        )));
-    }
-    if schema == Some(DEPOT_SCHEMA_VERSION_V1) {
-        depot.insert(DEPOT_RESERVED_FILE_BYTES, 0)?;
-        depot.insert(DEPOT_SCHEMA_VERSION, BLOB_DEPOT_SCHEMA_VERSION)?;
-    }
-    let metadata = write.open_table(METADATA)?;
-    for field in blob_global_metadata_fields() {
-        if metadata.get(field)?.map(|value| value.value()) != Some(0) {
-            return Err(blob_error(BlobStoreError::SchemaInvariant(
-                "pre-marker Blob aggregate metadata is not canonical empty state",
-            )));
-        }
-    }
-    if OwnedDirectory::open_root_if_present(store_path)?.is_some() {
-        return Err(blob_error(BlobStoreError::DepotIntegrity(
-            "a pre-marker Blob depot root cannot be attributed safely",
-        )));
-    }
-
-    let token = generate_depot_owner_token()?;
-    for (field, chunk) in fields.into_iter().zip(token.chunks_exact(8)) {
-        depot.insert(
-            field,
-            u64::from_be_bytes(chunk.try_into().map_err(|_| {
-                blob_error(BlobStoreError::SchemaInvariant(
-                    "Blob depot owner token chunk has invalid length",
-                ))
-            })?),
-        )?;
-    }
+    depot_owner_token_write(write)?;
     Ok(())
 }
 
@@ -4731,64 +4586,6 @@ fn active_from_import(import: &ImportRecord) -> ActiveImport {
     }
 }
 
-fn legacy_import_can_bind_write(
-    write: &redb::WriteTransaction,
-    import: &ImportRecord,
-    plan: &VerifiedBlobTransferPlan,
-) -> Result<bool, StoreError> {
-    if import.finalized_manifest_digest != Some(*plan.manifest_digest()) {
-        return Ok(false);
-    }
-    let mut exact_chunks = 0u64;
-    for row in write.open_table(BLOB_CHUNKS)?.iter()? {
-        let (key, value) = row?;
-        if !key.value().starts_with(import.variant_id.as_bytes()) {
-            continue;
-        }
-        let (_, index) = parse_chunk_key(key.value())?;
-        let Some(expected) = usize::try_from(index)
-            .ok()
-            .and_then(|index| plan.chunk_records().get(index))
-            .copied()
-        else {
-            return Ok(false);
-        };
-        let state = decode_chunk_state(value.value())?;
-        if state.expected != Some(expected)
-            || state.committed != Some(expected)
-            || state.committed_file_bytes == 0
-        {
-            return Ok(false);
-        }
-        exact_chunks = exact_chunks
-            .checked_add(1)
-            .ok_or(StoreError::ItemCountAccountingOverflow)?;
-    }
-    if exact_chunks != import.chunk_count {
-        return Ok(false);
-    }
-
-    let source = BlobTransferId::new(plan.source_envelope().into_bytes());
-    let mut exact_publication = false;
-    for row in write.open_table(BLOB_PUBLICATIONS)?.iter()? {
-        let (_, value) = row?;
-        let publication = decode_blob_metadata(value.value())?;
-        if publication.variant_id != import.variant_id {
-            continue;
-        }
-        if publication.transfer_id != source
-            || publication.blob_id != import.blob_id
-            || publication.manifest_digest != *plan.manifest_digest()
-            || publication.header.key_epoch != import.epoch
-            || publication.physical_lineage.is_some()
-        {
-            return Ok(false);
-        }
-        exact_publication = true;
-    }
-    Ok(exact_publication)
-}
-
 /// Atomically preflights and installs one exact provider-authenticated manifest
 /// import plus every expected chunk record. No row is mutated until all variant,
 /// lineage, record, and capacity checks have succeeded.
@@ -4832,12 +4629,8 @@ pub(super) fn stage_verified_plan_write(
         {
             return Err(blob_error(BlobStoreError::PhysicalLineageConflict));
         }
-        Some(mut existing) if existing.physical_lineage.is_none() => {
-            if !legacy_import_can_bind_write(write, &existing, plan)? {
-                return Err(blob_error(BlobStoreError::PhysicalLineageMigrationRequired));
-            }
-            existing.physical_lineage = incoming.physical_lineage;
-            (existing, false)
+        Some(existing) if existing.physical_lineage.is_none() => {
+            return Err(blob_error(BlobStoreError::PhysicalLineageMigrationRequired));
         }
         Some(existing) => (existing, false),
         None => (incoming, true),

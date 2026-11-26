@@ -261,8 +261,6 @@ SHUTDOWN_KEYS = (
     "unknown_path_contacts",
     "carrier_path_transitions",
     "carrier_path_transition_saturations",
-    "items",
-    "acceptance_markers",
     "events",
     "event_acceptance_markers",
     "route_cached_events",
@@ -529,8 +527,6 @@ STOP_KEYS = (
     "carrier_path_transitions",
     "carrier_path_transition_saturations",
     "path_observation",
-    "opaque_items",
-    "opaque_acceptance_markers",
     "events",
     "event_acceptance_markers",
     "route_cached_events",
@@ -1540,8 +1536,6 @@ def validate_transcript(data: bytes) -> dict[str, Any]:
             for field in numeric_fields
         }
         for field in (
-            "items",
-            "acceptance_markers",
             "events",
             "event_acceptance_markers",
             "route_cached_events",
@@ -2336,8 +2330,6 @@ def validate_terminal_stdout(
                 "unknown_path_contacts": "unknown_path_contacts",
                 "carrier_path_transitions": "carrier_path_transitions",
                 "carrier_path_transition_saturations": "carrier_path_transition_saturations",
-                "items": "opaque_items",
-                "acceptance_markers": "opaque_acceptance_markers",
                 "events": "events",
                 "event_acceptance_markers": "event_acceptance_markers",
                 "route_cached_events": "route_cached_events",

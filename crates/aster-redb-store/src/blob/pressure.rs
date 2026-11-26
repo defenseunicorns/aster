@@ -3348,22 +3348,6 @@ where
     let present = names.iter().filter(|name| normal.contains(**name)).count();
     match present {
         0 => Ok(PressureSchemaState::Predecessor),
-        count
-            if count == pressure_v4_table_names().len()
-                && pressure_v4_table_names()
-                    .iter()
-                    .all(|name| normal.contains(*name)) =>
-        {
-            Ok(PressureSchemaState::V4)
-        }
-        count
-            if count == pressure_old_v5_table_names().len()
-                && pressure_old_v5_table_names()
-                    .iter()
-                    .all(|name| normal.contains(*name)) =>
-        {
-            Ok(PressureSchemaState::OldV5)
-        }
         count if count == names.len() => Ok(PressureSchemaState::Current),
         _ => Err(pressure_corruption(
             "Blob pressure schema is partial and cannot be repaired",
@@ -3405,91 +3389,6 @@ impl PressureTableCatalog for redb::ReadTransaction {
             .list_multimap_tables()?
             .map(|table| table.name().to_owned())
             .collect())
-    }
-}
-
-fn migrate_pending_acceptance_orders(
-    write: &redb::WriteTransaction,
-    generation: super::PendingBlobEncodingGeneration,
-) -> Result<u64, StoreError> {
-    let pending = write.open_table(super::BLOB_PENDING_SOURCES)?;
-    let mut records = Vec::new();
-    let mut saw_legacy = false;
-    let mut saw_current = false;
-    let mut unique = BTreeSet::new();
-    let mut maximum = 0u64;
-    for row in pending.iter()? {
-        let (key, value) = row?;
-        if key.value().len() != 32 {
-            return Err(pressure_corruption(
-                "pending Blob pressure migration found an invalid transfer identity",
-            ));
-        }
-        let record = super::decode_pending_blob_source_for_encoding(value.value(), generation)?;
-        if record.pending_acceptance_order == 0 {
-            saw_legacy = true;
-        } else {
-            saw_current = true;
-            maximum = maximum.max(record.pending_acceptance_order);
-            if !unique.insert(record.pending_acceptance_order) {
-                return Err(pressure_corruption(
-                    "pending Blob acceptance order is duplicated",
-                ));
-            }
-        }
-        records.push((key.value().to_vec(), record));
-    }
-    drop(pending);
-    if saw_legacy && saw_current {
-        return Err(pressure_corruption(
-            "pending Blob sources mix legacy and current acceptance orders",
-        ));
-    }
-    if saw_legacy {
-        let mut next = 1u64;
-        for (_, record) in &mut records {
-            record.pending_acceptance_order = next;
-            next = next.checked_add(1).ok_or_else(|| {
-                pressure_corruption("pending Blob acceptance order overflows during migration")
-            })?;
-        }
-        let added_bytes = u64::try_from(records.len())
-            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?
-            .checked_mul(8)
-            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-        let metadata = write.open_table(super::BLOB_NETWORK_METADATA)?;
-        let current = metadata
-            .get(super::BLOB_NETWORK_STAGING_BYTES)?
-            .map(|value| value.value())
-            .ok_or_else(|| {
-                pressure_corruption("Blob network staging byte counter is missing during migration")
-            })?;
-        let migrated = current
-            .checked_add(added_bytes)
-            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-        if migrated > super::MAX_BLOB_NETWORK_STAGING_BYTES {
-            return Err(blob_error(
-                BlobStoreError::NetworkStagingByteLimitExceeded {
-                    current,
-                    incoming: added_bytes,
-                    limit: super::MAX_BLOB_NETWORK_STAGING_BYTES,
-                },
-            ));
-        }
-        drop(metadata);
-        let mut pending = write.open_table(super::BLOB_PENDING_SOURCES)?;
-        for (key, record) in records {
-            let encoded = super::encode_pending_blob_source(&record)?;
-            pending.insert(key.as_slice(), encoded.as_slice())?;
-        }
-        drop(pending);
-        let mut metadata = write.open_table(super::BLOB_NETWORK_METADATA)?;
-        metadata.insert(super::BLOB_NETWORK_STAGING_BYTES, migrated)?;
-        Ok(next)
-    } else {
-        maximum.checked_add(1).ok_or_else(|| {
-            pressure_corruption("pending Blob acceptance order overflows during migration")
-        })
     }
 }
 
@@ -4405,29 +4304,11 @@ fn audit_or_migrate_pressure_write_inner(
     write: &redb::WriteTransaction,
     lifecycle_was_predecessor: Option<bool>,
 ) -> Result<(), StoreError> {
+    let _ = lifecycle_was_predecessor;
     let state = pressure_schema_state(write)?;
-    if let Some(lifecycle_was_predecessor) = lifecycle_was_predecessor {
-        match (lifecycle_was_predecessor, state) {
-            (false, PressureSchemaState::OldV5 | PressureSchemaState::Current)
-            | (true, PressureSchemaState::Predecessor | PressureSchemaState::V4) => {}
-            _ => {
-                return Err(pressure_corruption(
-                    "Blob lifecycle and pressure schema generations are mixed",
-                ));
-            }
-        }
-    }
-    let publication_generation = super::lifecycle::publication_encoding_write(write)?;
-    let pending_generation =
-        super::pending_blob_encoding_for_publication_encoding(publication_generation);
-    let migrated_next = match state {
-        PressureSchemaState::Predecessor | PressureSchemaState::V4 => Some(
-            migrate_pending_acceptance_orders(write, pending_generation)?,
-        ),
-        PressureSchemaState::OldV5 | PressureSchemaState::Current => None,
-    };
     match state {
         PressureSchemaState::Predecessor => {
+            crate::require_new_store_write(write)?;
             let mut image = build_pressure_image(
                 &write.open_table(super::BLOB_PUBLICATIONS)?,
                 &write.open_table(super::BLOB_ACCEPTANCE_MARKERS)?,
@@ -4436,9 +4317,7 @@ fn audit_or_migrate_pressure_write_inner(
                 &write.open_table(super::BLOB_IMPORTS)?,
                 &write.open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?,
                 &write.open_table(super::BLOB_CHUNKS)?,
-                migrated_next.ok_or_else(|| {
-                    pressure_corruption("predecessor pressure migration order is missing")
-                })?,
+                1,
                 super::lifecycle::publication_encoding_write(write)?,
                 PressurePendingRootEncodingGeneration::PressureV4,
                 PressureImageEncodingGeneration::CurrentV5,
@@ -4480,136 +4359,8 @@ fn audit_or_migrate_pressure_write_inner(
                 &image.finite_pending_generations,
             )
         }
-        PressureSchemaState::OldV5 => {
-            let metadata = write.open_table(BLOB_PRESSURE_METADATA)?;
-            let next = metadata
-                .get(NEXT_PENDING_ACCEPTANCE_ORDER)?
-                .map(|value| value.value())
-                .ok_or_else(|| {
-                    pressure_corruption("next pending Blob acceptance order is missing")
-                })?;
-            drop(metadata);
-            let old_image = build_pressure_image(
-                &write.open_table(super::BLOB_PUBLICATIONS)?,
-                &write.open_table(super::BLOB_ACCEPTANCE_MARKERS)?,
-                &write.open_table(super::BLOB_PENDING_SOURCES)?,
-                &write.open_table(super::BLOB_CARRIER_PREFIXES)?,
-                &write.open_table(super::BLOB_IMPORTS)?,
-                &write.open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?,
-                &write.open_table(super::BLOB_CHUNKS)?,
-                next,
-                super::lifecycle::publication_encoding_write(write)?,
-                PressurePendingRootEncodingGeneration::PressureV4,
-                PressureImageEncodingGeneration::PreTask5V5,
-            )?;
-            audit_image_write(write, &old_image)?;
-            audit_reanchor_state(
-                &write.open_table(BLOB_PRESSURE_METADATA)?,
-                &write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS)?,
-                crate::custody::lower_bound_continuity_write(write)?,
-                true,
-                &old_image.finite_publication_generations,
-                &old_image.finite_pending_generations,
-            )?;
-            synchronize_reanchor_state_write(write)?;
-            let current_image = build_pressure_image(
-                &write.open_table(super::BLOB_PUBLICATIONS)?,
-                &write.open_table(super::BLOB_ACCEPTANCE_MARKERS)?,
-                &write.open_table(super::BLOB_PENDING_SOURCES)?,
-                &write.open_table(super::BLOB_CARRIER_PREFIXES)?,
-                &write.open_table(super::BLOB_IMPORTS)?,
-                &write.open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?,
-                &write.open_table(super::BLOB_CHUNKS)?,
-                next,
-                super::lifecycle::publication_encoding_write(write)?,
-                PressurePendingRootEncodingGeneration::PressureV4,
-                PressureImageEncodingGeneration::CurrentV5,
-            )?;
-            audit_reanchor_state(
-                &write.open_table(BLOB_PRESSURE_METADATA)?,
-                &write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS)?,
-                crate::custody::lower_bound_continuity_write(write)?,
-                false,
-                &current_image.finite_publication_generations,
-                &current_image.finite_pending_generations,
-            )?;
-            replace_current_index_maps(write, &current_image)?;
-            audit_image_write(write, &current_image)?;
-            audit_durable_image_write(write, &current_image)?;
-            audit_reanchor_state(
-                &write.open_table(BLOB_PRESSURE_METADATA)?,
-                &write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS)?,
-                crate::custody::lower_bound_continuity_write(write)?,
-                false,
-                &current_image.finite_publication_generations,
-                &current_image.finite_pending_generations,
-            )
-        }
-        PressureSchemaState::V4 => {
-            let metadata = write.open_table(BLOB_PRESSURE_METADATA)?;
-            if metadata.len()? != 2 {
-                return Err(pressure_corruption(
-                    "Blob pressure metadata schema is incomplete or unknown",
-                ));
-            }
-            let version = metadata
-                .get(PRESSURE_SCHEMA_VERSION_FIELD)?
-                .map(|value| value.value())
-                .ok_or_else(|| {
-                    pressure_corruption("Blob pressure metadata schema is incomplete or unknown")
-                })?;
-            if !matches!(
-                version,
-                2 | PREVIOUS_PRESSURE_SCHEMA_VERSION | PRESSURE_V4_SCHEMA_VERSION
-            ) {
-                return Err(pressure_corruption(
-                    "Blob pressure metadata schema is incomplete or unknown",
-                ));
-            }
-            let next = metadata
-                .get(NEXT_PENDING_ACCEPTANCE_ORDER)?
-                .map(|value| value.value())
-                .ok_or_else(|| {
-                    pressure_corruption("next pending Blob acceptance order is missing")
-                })?;
-            drop(metadata);
-            let image = build_pressure_image(
-                &write.open_table(super::BLOB_PUBLICATIONS)?,
-                &write.open_table(super::BLOB_ACCEPTANCE_MARKERS)?,
-                &write.open_table(super::BLOB_PENDING_SOURCES)?,
-                &write.open_table(super::BLOB_CARRIER_PREFIXES)?,
-                &write.open_table(super::BLOB_IMPORTS)?,
-                &write.open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?,
-                &write.open_table(super::BLOB_CHUNKS)?,
-                next,
-                if version == PRESSURE_V4_SCHEMA_VERSION {
-                    super::lifecycle::publication_encoding_write(write)?
-                } else {
-                    super::lifecycle::publication_encoding_migration_write(write)?
-                },
-                if version == PRESSURE_V4_SCHEMA_VERSION {
-                    PressurePendingRootEncodingGeneration::PressureV4
-                } else {
-                    PressurePendingRootEncodingGeneration::PressureV3
-                },
-                PressureImageEncodingGeneration::LegacyV4,
-            )?;
-            audit_image_write(write, &image)?;
-            let mut current = build_pressure_image(
-                &write.open_table(super::BLOB_PUBLICATIONS)?,
-                &write.open_table(super::BLOB_ACCEPTANCE_MARKERS)?,
-                &write.open_table(super::BLOB_PENDING_SOURCES)?,
-                &write.open_table(super::BLOB_CARRIER_PREFIXES)?,
-                &write.open_table(super::BLOB_IMPORTS)?,
-                &write.open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?,
-                &write.open_table(super::BLOB_CHUNKS)?,
-                next,
-                super::lifecycle::publication_encoding_write(write)?,
-                PressurePendingRootEncodingGeneration::PressureV4,
-                PressureImageEncodingGeneration::CurrentV5,
-            )?;
-            prepare_reanchor_image(write, &mut current)?;
-            replace_image(write, &current)
+        PressureSchemaState::OldV5 | PressureSchemaState::V4 => {
+            Err(pressure_corruption("unsupported Blob pressure schema"))
         }
     }
 }

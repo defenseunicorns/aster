@@ -27,51 +27,22 @@ Unknown optional extensions remain ignorable throughout a major version.
 Unknown critical values fail only the containing object/session and never cause
 silent reinterpretation. Stable replication-wire, credential/envelope, crypto-
 profile, and handshake-framing encodings remain version `1`. The current
-handshake separately negotiates semantic versions `8` through `1` and complete
-suite `0x0001`; a default offer is `[8, 7, 6, 5, 4, 3, 2, 1]`, and an honest
-responder selects the highest common semantic version. Offer and selection are transcript, KDF,
-confirmation, and hybrid-authentication bound, so an unauthenticated on-path
-rewrite fails.
+hybrid handshake negotiates semantic version `9` and complete suite `0x0001`.
+Its default offer is `[9]`; older semantic versions are rejected in both
+handshake roles, including adapter capability-ceiling entry points. Offer and
+selection are transcript, KDF, confirmation, and hybrid-authentication bound.
+The separate classical security profile has its own semantic policy.
 
-Semantic version `7` inherits every semantic-v6 lane and adds a mandatory
-post-handshake per-lane transfer-profile exchange. Semantic version `8`
-inherits that exchange, changes the lane AAD domain, and adds authenticated
-finite Blob custody. Protocol draft.3 requires `BlobRangesStreamV1` profile 4
-for selected Blob transfer: v7 is durable-only and v8 admits durable plus
-authenticated finite sources. The historical v5/v6 carrier dialogue has no
-runtime fallback.
-An incompatible offer fails the authenticated profile exchange, and older
-semantic Blob carrier attempts fail before carrier IO; both endpoints must
-upgrade. Stored source, manifest, and durable-prefix formats are unchanged.
-Historical vector IDs retain their bytes; new stream-only vectors use new IDs.
-Other lanes retain `LegacyV6`; Event directions may select `EventPagesV1` for exact durable,
-finite-TTL, tombstone, route-only, mixed, and bounded blind ReceiveOnly
-traffic. Semantic-v7/v8 page frames are invalid in v1-v6 sessions, and neither
-version reinterprets any v1-v6 byte or stable object.
-
-Semantic version `4` adds the selected protected, class- and direction-separated
-State/Record mechanics lanes; semantic version `5` inherits them and allocates
-the historical direct-content Blob frames. Semantic version `6`
-inherits every v5 ordinary lane unchanged and adds an opt-in selected Event
-bridge lane that runs only when both authenticated endpoints enable it. Event
-remains compatible across semantic versions `1` through `8`; State/Record
-frames are absent from v1-v3 contacts, Blob frames are absent from v1-v4
-contacts, Event-bridge frames are absent from v1-v5 contacts, and v7 profile/page
-frames are absent from v1-v6 contacts.
-Selected Blob carrier IO is absent at v5/v6 and requires v7/v8 profile 4.
-This is a negotiated-behavior addition: stable wire/profile, handshake framing,
-suite, and source-object formats are not renumbered. A v4 State/Record object is
-therefore never silently downgraded into an Event or processed by a v1-v3
-mutable lane, and a v5 Blob transfer is never silently accepted as v4 traffic.
-
-Negotiation does not authenticate the responder's full capability set. An
-accepted older or modified peer can complete semantic `1`, `2`, or `3`, so production use
-that depends on downgrade resistance remains fail-closed at release
-authorization until all of the following exist: an authority-signed mission
-minimum semantic version, durable per-identity observed high-water state,
-explicit signed rollback authorization, mixed-version vectors, and independent
-interoperability evidence. Version `1` fallback is compatibility behavior, not
-evidence that a downgrade-sensitive deployment may enable it.
+Semantic v9 uses the authenticated per-lane transfer-profile exchange. Event
+uses `EventPagesV1`, Blob uses `BlobStreamV1` (profile 5), and State, Record,
+and EventBridge retain `LegacyV6`. An incompatible offer fails negotiation;
+there is no Event fallback in the v9 offer. Stable wire/profile, handshake
+framing, suite, and source-object formats are not renumbered by this policy.
+Protocol draft.4 and fixed-security-object draft.3 record this incompatible draft change. Historical vector IDs
+retain their original bytes; regenerated protected profile-5 fixtures use v2 IDs.
+Unsupported stores fail without mutation, migration, or automatic reset.
+Historical qualification receipts remain evidence only for their recorded
+semantic version and executable; they do not qualify the v9 implementation.
 
 Cryptographic emergency response may prohibit producing or accepting a broken
 suite sooner than the ordinary window. Such a change requires a signed mission

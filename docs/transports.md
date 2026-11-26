@@ -63,7 +63,6 @@ selected Blob profile and map-unit contract is machine checked:
 {
   "schema": 1,
   "surface": "transports",
-  "semantic_v7_v8_profile": "4:BlobRangesStreamV1",
   "semantic_v9_profile": "5:BlobStreamV1",
   "map_unit": "1048576-byte native plaintext segment",
   "record": "ASTRBS02, at most 1048706 bytes",
@@ -71,18 +70,14 @@ selected Blob profile and map-unit contract is machine checked:
 }
 ```
 <!-- ASTER-BLOB-CAPABILITY:RENDERED -->
-Semantic v7/v8 selects profile 4 BlobRangesStreamV1; semantic v9 selects profile 5 BlobStreamV1. Profile 5 maps 1,048,576-byte plaintext segments into append-only ASTRBS02 records of at most 1,048,706 bytes and sends one complete length-prefixed record per DATA body, at most 1,048,710 bytes, without repacking or re-encryption.
+The hybrid network requires semantic v9 and profile 5 BlobStreamV1. Profile 5 maps 1,048,576-byte plaintext segments into append-only ASTRBS02 records of at most 1,048,706 bytes and sends one complete length-prefixed record per DATA body, at most 1,048,710 bytes, without repacking or re-encryption.
 <!-- ASTER-BLOB-CAPABILITY:END -->
 
 Profile 5 resumes from lifecycle-owned provisional source or upload state plus
 the native pack checkpoint journal. Atomic promotion precedes RESULT;
 RESULT_ACK or EOF settles only the attempt and owns no durable resume state.
-Profile 4 remains the
-compatibility path for peer-neutral contiguous carrier ranges of at most 16 KiB;
-v7 is durable-only,
-while v8 also implements
-authenticated finite-TTL custody and bounded lower-priority pressure recovery
-internally. The `aster-node` runtime owns semantic-v9/profile-5 streaming.
+The `aster-node` runtime owns semantic-v9/profile-5 streaming, including
+authenticated finite custody and bounded lower-priority pressure recovery.
 
 ## Capability boundary
 
@@ -91,7 +86,7 @@ internally. The `aster-node` runtime owns semantic-v9/profile-5 streaming.
 | Selected direct Iroh | Manually admitted exact endpoint ID and socket, authenticated direct UDP/QUIC, and bounded exchange | Carrier identity is separate from mission and data authorization; no address discovery, port mapping, dynamic-NAT policy, or multi-carrier failover |
 | Selected nearby Iroh discovery | Feature-gated Iroh mDNS lookup using an exact roster or mission-authenticated `--discover-lan`; each window is at most 30 seconds | Default off; upstream observations are not globally capped, so this is not a hostile-LAN or production discovery service |
 | Selected controlled Iroh relay | One operator-pinned HTTPS relay with explicit trust, alongside an initial direct locator or with IP disabled | No public/default relay selection; the relay is transport infrastructure rather than an Aster mission or payload-blind application relay |
-| Selected node and CLI | Networked Event, State, and Record reconciliation; semantic-v9/profile-5 checkpointed Blob streaming plus semantic-v7/v8 profile-4 compatibility; live and stopped Rust APIs; bounded application delivery; payload-blind Event relay; restart/idempotency; Unix zeroization | Reference provisioning; no cross-transport failover, dynamic application-driven network interests, automatic Record merge, route-only Blob custody, finite State/Record TTL, public Blob lifecycle controls, generalized control administration, or production authorization |
+| Selected node and CLI | Networked Event, State, and Record reconciliation; semantic-v9/profile-5 checkpointed Blob streaming; live and stopped Rust APIs; bounded application delivery; payload-blind Event relay; restart/idempotency; Unix zeroization | Reference provisioning; no cross-transport failover, dynamic application-driven network interests, automatic Record merge, route-only Blob custody, finite State/Record TTL, public Blob lifecycle controls, generalized control administration, or production authorization |
 | Linux BlueZ Event evaluation | Fixed-locator Ring 1 uses one exact controller and provisioned peer per process, event-driven availability, deterministic Linux role, bounded retry, and one semantic-v9 ordered Event contact. A separate source-present rostered evaluator adds authenticated transient discovery, a dynamic listener PSM, bounded credential/candidate state, and the same one-peer Event boundary. | [Bounded Ring-1 CM4 evidence](validation/evidence/2026-11-05-cm4-btle-ring1-event-validation.md) is evaluation-only. The process-restart failure was bound to CVE-2026-72333 on Linux 6.18.39 by the [clean-restart diagnostic](validation/evidence/2026-11-06-cm4-btle-clean-restart-diagnostic.md); the [fixed-kernel record](validation/evidence/2026-11-06-cm4-btle-clean-restart-validation.md) then observed zero-work restart on Linux 6.18.60 without a controller epoch change. Rostered discovery remains source-and-test evidence: stock `bluer` does not establish acknowledged cancellation-safe advertisement/discovery teardown or a bounded first D-Bus ingress queue, and stock `hmac` does not establish erasure of constructor-derived key/IPAD/OPAD temporaries. No selection/fallback, daemon, other data class, requirement credit, or production authorization is claimed. |
 | Current semantic BTLE | MTU-aware link, unicast plus an advertisement primitive, disconnect handling, platform `BleRadio` seam | Selected-node integration; a shipped Android, iOS, Linux, or controller-specific radio driver; complete one-to-many profile |
 | LoRa, serial, file | The requirements and semantic design do not preclude them | No selected adapters ship |
@@ -389,69 +384,20 @@ scheduling authority. Use the
 
 ## Semantic protocol versions you may see
 
-Aster separates stable bytes from negotiated behavior. The current selected
-implementation offers semantic versions `[9, 8, 7, 6, 5, 4, 3, 2, 1]` in that
-descending order:
+The hybrid profile offers semantic version `[9]`. Event requires
+`EventPagesV1`; Blob requires `BlobStreamV1` (profile 5). State, Record, and
+EventBridge use `LegacyV6` inside the v9 session. Peers without a common
+semantic version or the required lane profile fail negotiation.
 
-- **Replication wire/profile version 1** identifies the current encoding and
-  fixed security-object family.
-- **Semantic version 9** is offered first. It preserves v1-v8 stable bytes and
-  selects Blob profile 5 `BlobStreamV1`. Profile 5 is a distinct allocation,
-  never a reinterpretation or in-attempt downgrade of profile 4. Its
-  `0xd6..0xdc` records, v9 custody/record protection, concurrent Iroh
-  data/control pair, adapter-neutral registry and selector, bounded parallel
-  segment verification, durable pack checkpoints, resume, and lifecycle
-  promotion are implemented. The optional local `BLE_L2CAP_V1` registration is
-  always unavailable and cannot carry an attempt; `IrohQuicV1` remains the only
-  selectable shipped adapter. Automatic selection therefore does not yet mean
-  cross-transport failover.
-- **Semantic version 8** inherits semantic-v7 profile
-  negotiation and receipt-free Event pages, while profile 4 adds authenticated
-  finite-TTL Blob custody and bounded lower-priority pressure recovery.
-- **Semantic version 7** remains a compatibility option. After the four-flight mission
-  handshake, peers negotiate transfer profiles per lane. Event directions use
-  receipt-free ordered pages for exact durable, finite-TTL, tombstone,
-  route-only, mixed, and bounded blind ReceiveOnly traffic when both peers
-  advertise `EventPagesV1`; only older/non-page peers use the complete
-  semantic-v6 Event mechanics. State, Record, and EventBridge use
-  `LegacyV6`. Blob requires profile 4 `BlobRangesStreamV1`; both peers must
-  support it, and v7 admits durable Blob work only. Page send is an attempt,
-  not proof of remote delivery.
-- **Semantic version 6** remains a compatibility option. It inherits ordinary Event,
-  compact-batch, custody, and State/Record behavior from version 5 and adds
-  only the opt-in selected Event-bridge mechanics lane. Blob intent is rejected
-  before source or carrier IO; there is no selected carrier fallback. Semantic
-  versions 1 through 5 emit zero Event-bridge frames.
-- **Semantic version 5** remains a compatibility option. It inherits Event,
-  compact-batch, authorized cross-scope route, custody, and semantic-v4
-  State/Record behavior. Historical Blob frame allocations remain decodable,
-  but Blob intent is rejected before source or carrier IO and does not fall
-  back to a selected carrier. Semantic versions 1 through 4 emit zero Blob frames.
-- **Semantic version 4** remains a compatibility option with Event behavior and
-  protected, class- and direction-specific State/Record reconciliation.
-- **Semantic version 3** remains an Event-compatible option with bounded
-  session-authenticated Event/RouteEvent custody and no State/Record frames.
-- **Semantic version 2** remains a compatibility option for compact batches and
-  authorized cross-scope routes without semantic-v3 custody.
-- **Semantic version 1** remains a compatibility option for singleton Event
-  transfer and has no State/Record or Blob frames.
+Stable replication wire/profile and security-object encodings remain version 1.
+Historical codecs and vectors describe their original formats, not network
+fallbacks. The [classical profile](classical-iroh-security-profile.md) has a
+separate semantic policy.
 
-The process-wide version constants report implementation support, not what a
-particular session negotiated. Application code normally does not branch on
-these values. See the [compatibility and deprecation
-policy](deprecation-policy.md) for support windows, stored-data obligations,
-and the required procedure for retiring protocol, suite, ABI, binding, or
-registry values.
-
-Transcript binding rejects an unauthenticated on-path rewrite of the offer or
-selection, but negotiation does not authenticate a responder's complete
-capability set. An older, rolled-back, or modified peer can honestly complete
-semantic version 1. A deployment that depends on downgrade resistance must
-therefore fail closed at release authorization until it has the authority-signed
-minimum, durable per-identity capability high-water, signed rollback
-authorization, mixed-version evidence, and independent interoperability
-evidence defined by the [deprecation policy](deprecation-policy.md). Version 1
-compatibility is not downgrade-resistance evidence.
+Profile 5 transfers native `ASTRBS02` records with bounded segment verification,
+durable checkpoints and atomic promotion. `IrohQuicV1` is the shipped Blob
+adapter; the unavailable `BLE_L2CAP_V1` registration does not provide Blob
+cross-transport failover.
 
 ## Before a real deployment
 

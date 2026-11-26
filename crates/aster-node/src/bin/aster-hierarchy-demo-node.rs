@@ -1291,7 +1291,7 @@ mod tests {
                     .outstanding_results,
                 0
             );
-            assert_eq!(status.event_operation_capacity.stats.records_total, 0);
+            assert_eq!(status.event_operation_capacity.rows, 1);
             drop(journal);
             drop(events);
             running.shutdown().await.unwrap();

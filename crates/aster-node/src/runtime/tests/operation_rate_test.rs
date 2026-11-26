@@ -42,7 +42,6 @@ fn operation_rate_sample_ping_pong_counts_new_records_and_excludes_replay() {
             expected_rate
         );
     }
-    assert_eq!(store.event_operation_stats().unwrap().records_total, 0);
     let stats = store.numbered_event_operation_stats().unwrap();
     assert_eq!(stats.clients, 2);
     assert_eq!(stats.outstanding_results, 0);
@@ -84,7 +83,8 @@ fn operation_rate_counts_committed_active_alias_and_direct_retired_fences_once()
         state.join(STORE_FILE),
         StoreLimits::default(),
         BlobDepotLimits::DEFAULT,
-        EventOperationLimits::new(5, 5 * 162, 1).unwrap(),
+        // One client row, four publication results, and one emergency row.
+        EventOperationLimits::new(6, 1_000_000, 1).unwrap(),
         services.other.mission_authority_id(),
     )
     .unwrap();
@@ -117,13 +117,21 @@ fn operation_rate_counts_committed_active_alias_and_direct_retired_fences_once()
         b"rate",
     )
     .unwrap();
+    let client = store.test_event_client_context().unwrap();
     let mut tracker = SelectedEventStatusTracker::new(BTreeSet::new(), false);
     let clock_id = [0xd9; 16];
-    let commit = |tracker: &mut SelectedEventStatusTracker, key: &[u8]| {
-        let operation = EventOperationKey::new(key.to_vec()).unwrap();
-        let request = EventOperationRequest::new(&operation, &intent, b"rate", None).unwrap();
+    let commit = |tracker: &mut SelectedEventStatusTracker, sequence: u64| {
+        let request = NumberedEventOperationRequest::new(
+            &client.client_id,
+            client.session,
+            aster_redb_store::EventOperationSequence::new(sequence).unwrap(),
+            None,
+            &intent,
+            b"rate",
+        )
+        .unwrap();
         tracker.observe_operation_commit(&store, || {
-            store.commit_reserved_event_once_with_custody_policy(
+            store.commit_reserved_numbered_event_with_custody_policy(
                 &policy,
                 LocalCustodyCheckpoint::new(
                     store.custody_policy_revision().unwrap(),
@@ -140,16 +148,22 @@ fn operation_rate_counts_committed_active_alias_and_direct_retired_fences_once()
         })
     };
     assert!(matches!(
-        commit(&mut tracker, b"first").unwrap(),
-        EventOnceOutcome::Inserted { .. }
+        commit(&mut tracker, 1).unwrap(),
+        NumberedEventPublishOutcome { inserted: true, .. }
     ));
     assert!(matches!(
-        commit(&mut tracker, b"first").unwrap(),
-        EventOnceOutcome::Existing { .. }
+        commit(&mut tracker, 1).unwrap(),
+        NumberedEventPublishOutcome {
+            inserted: false,
+            ..
+        }
     ));
     assert!(matches!(
-        commit(&mut tracker, b"alias").unwrap(),
-        EventOnceOutcome::BoundExisting { .. }
+        commit(&mut tracker, 2).unwrap(),
+        NumberedEventPublishOutcome {
+            inserted: false,
+            ..
+        }
     ));
     assert_eq!(
         tracker
@@ -171,8 +185,15 @@ fn operation_rate_counts_committed_active_alias_and_direct_retired_fences_once()
         b"evil",
     )
     .unwrap();
-    let key = EventOperationKey::new(b"first".to_vec()).unwrap();
-    let request = EventOperationRequest::new(&key, &changed, b"evil", None).unwrap();
+    let request = NumberedEventOperationRequest::new(
+        &client.client_id,
+        client.session,
+        aster_redb_store::EventOperationSequence::new(1).unwrap(),
+        None,
+        &changed,
+        b"evil",
+    )
+    .unwrap();
     let changed_sealed = sealer.seal_event(&header, b"evil").unwrap();
     let changed_route = sealer.verify_event(&changed_sealed.bytes).unwrap();
     let EventContentVerification::ContentVerified {
@@ -186,7 +207,7 @@ fn operation_rate_counts_committed_active_alias_and_direct_retired_fences_once()
     };
     assert!(matches!(
         tracker.observe_operation_commit(&store, || store
-            .commit_reserved_event_once_with_custody_policy(
+            .commit_reserved_numbered_event_with_custody_policy(
                 &policy,
                 LocalCustodyCheckpoint::new(
                     store.custody_policy_revision().unwrap(),
@@ -200,7 +221,7 @@ fn operation_rate_counts_committed_active_alias_and_direct_retired_fences_once()
                 &changed_event,
                 &changed_sealed.bytes,
             )),
-        Err(StoreError::EventOperationConflict)
+        Err(StoreError::NumberedEventOperation(_))
     ));
     store
         .collect_custody_garbage(
@@ -213,16 +234,34 @@ fn operation_rate_counts_committed_active_alias_and_direct_retired_fences_once()
         )
         .unwrap();
     assert!(matches!(
-        commit(&mut tracker, b"direct-retired").unwrap(),
-        EventOnceOutcome::RetiredOperation { .. }
+        commit(&mut tracker, 3).unwrap(),
+        NumberedEventPublishOutcome {
+            result: aster_redb_store::NumberedEventResult {
+                content: aster_redb_store::CommittedEventContent::Retired(_),
+                ..
+            },
+            ..
+        }
     ));
     assert!(matches!(
-        commit(&mut tracker, b"direct-retired").unwrap(),
-        EventOnceOutcome::RetiredOperation { .. }
+        commit(&mut tracker, 3).unwrap(),
+        NumberedEventPublishOutcome {
+            result: aster_redb_store::NumberedEventResult {
+                content: aster_redb_store::CommittedEventContent::Retired(_),
+                ..
+            },
+            ..
+        }
     ));
     assert!(matches!(
-        commit(&mut tracker, b"first").unwrap(),
-        EventOnceOutcome::RetiredOperation { .. }
+        commit(&mut tracker, 1).unwrap(),
+        NumberedEventPublishOutcome {
+            result: aster_redb_store::NumberedEventResult {
+                content: aster_redb_store::CommittedEventContent::Retired(_),
+                ..
+            },
+            ..
+        }
     ));
     assert_eq!(
         tracker
@@ -230,13 +269,12 @@ fn operation_rate_counts_committed_active_alias_and_direct_retired_fences_once()
             .snapshot(tokio::time::Instant::now(), 1),
         (3.0 / 60.0, 20)
     );
-    commit(&mut tracker, b"last-ordinary").unwrap();
+    commit(&mut tracker, 4).unwrap();
     assert!(matches!(
-        commit(&mut tracker, b"over-capacity"),
-        Err(StoreError::EventOperationLimitExceeded {
-            current: 4,
-            limit: 4
-        })
+        commit(&mut tracker, 5),
+        Err(StoreError::NumberedEventOperation(
+            aster_redb_store::NumberedEventOperationError::GlobalRecordLimitExceeded
+        ))
     ));
     assert_eq!(
         tracker
@@ -244,7 +282,10 @@ fn operation_rate_counts_committed_active_alias_and_direct_retired_fences_once()
             .snapshot(tokio::time::Instant::now(), 1),
         (4.0 / 60.0, 15)
     );
-    assert_eq!(store.event_operation_stats().unwrap().records_total, 4);
+    assert_eq!(
+        store.committed_numbered_event_publication_count().unwrap(),
+        4
+    );
     drop(store);
     fs::remove_dir_all(state).unwrap();
 }

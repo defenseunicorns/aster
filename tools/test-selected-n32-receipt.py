@@ -398,8 +398,6 @@ class Fixture:
                 "carrier_path_transitions": "0",
                 "carrier_path_transition_saturations": "0",
                 "path_observation": "not-authorization",
-                "opaque_items": "0",
-                "opaque_acceptance_markers": "0",
                 "events": str(events),
                 "event_acceptance_markers": str(markers),
                 "route_cached_events": str(cached),

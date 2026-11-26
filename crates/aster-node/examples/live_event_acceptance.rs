@@ -1076,9 +1076,7 @@ async fn validate_closed_handle(handle: &SelectedEventHandle) -> Result<(), DynE
 
 fn validate_excluded_receipt(receipt: &NodeReceipt) -> Result<(), DynError> {
     require(
-        receipt.items == 0
-            && receipt.acceptance_markers == 0
-            && receipt.route_cached_events == 0
+        receipt.route_cached_events == 0
             && receipt.mutable_remaining == 0
             && receipt.deferred_mutable_lanes == 0
             && receipt.blob_ranges_fetched == 0
@@ -1776,11 +1774,6 @@ fn prefixed_receipt_fields(receipt: &NodeReceipt) -> Vec<(&'static str, String)>
         (
             "shutdown_carrier_path_transition_saturations",
             receipt.carrier_path_transition_saturations.to_string(),
-        ),
-        ("shutdown_items", receipt.items.to_string()),
-        (
-            "shutdown_acceptance_markers",
-            receipt.acceptance_markers.to_string(),
         ),
         ("shutdown_events", receipt.events.to_string()),
         (
@@ -2644,8 +2637,6 @@ fn unprefixed_receipt_fields(receipt: &NodeReceipt) -> Vec<(&'static str, String
                 "unknown_path_contacts" => "unknown_path_contacts",
                 "carrier_path_transitions" => "carrier_path_transitions",
                 "carrier_path_transition_saturations" => "carrier_path_transition_saturations",
-                "items" => "items",
-                "acceptance_markers" => "acceptance_markers",
                 "events" => "events",
                 "event_acceptance_markers" => "event_acceptance_markers",
                 "route_cached_events" => "route_cached_events",

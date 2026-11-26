@@ -215,7 +215,7 @@ UNSUBSCRIBE_KEYS = (
 RECEIPT_COUNTER_KEYS = (
     "contacts", "contact_errors", "direct_contacts", "relay_contacts",
     "unknown_path_contacts", "carrier_path_transitions",
-    "carrier_path_transition_saturations", "items", "acceptance_markers", "events",
+    "carrier_path_transition_saturations", "events",
     "event_acceptance_markers", "route_cached_events", "controls", "applied_controls",
     "pending_controls", "control_highwater", "data_offered", "data_fetched",
     "data_inserted", "data_duplicates", "data_remaining", "mutable_remaining",
@@ -330,8 +330,6 @@ STOP_KEYS = (
     "carrier_path_transitions",
     "carrier_path_transition_saturations",
     "path_observation",
-    "opaque_items",
-    "opaque_acceptance_markers",
     "events",
     "event_acceptance_markers",
     "route_cached_events",
@@ -366,8 +364,6 @@ STOP_KEYS = (
 )
 STOP_NUMERIC_FIELDS = STOP_KEYS[4:11] + STOP_KEYS[12:-5]
 STOP_EXCLUDED_ZERO_FIELDS = (
-    "opaque_items",
-    "opaque_acceptance_markers",
     "route_cached_events",
     "controls",
     "applied_controls",
@@ -1382,7 +1378,7 @@ def validate_transcript(data: bytes) -> dict[str, Any]:
         ):
             fail(f"SHUTDOWN {phase}/{participant} contact or Event inventory differs")
         zero_fields = (
-            "items", "acceptance_markers", "route_cached_events", "controls",
+            "route_cached_events", "controls",
             "applied_controls", "pending_controls", "control_highwater",
             "data_duplicates", "mutable_remaining", "deferred_mutable_lanes",
             "blob_ranges_fetched", "blob_bytes_fetched", "blob_remaining",
@@ -1753,8 +1749,6 @@ def validate_terminal_stdout(
                     "carrier_path_transitions": "0",
                     "carrier_path_transition_saturations": "0",
                     "path_observation": "not-authorization",
-                    "opaque_items": str(expected["items"]),
-                    "opaque_acceptance_markers": str(expected["acceptance_markers"]),
                     "events": str(expected["events"]),
                     "event_acceptance_markers": str(expected["event_acceptance_markers"]),
                     "route_cached_events": str(expected["route_cached_events"]),

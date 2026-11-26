@@ -188,10 +188,7 @@ mod version_surface_tests {
     #[test]
     fn public_versions_match_the_authenticated_session_defaults() {
         assert_eq!(PROTOCOL_VERSION, REPLICATION_WIRE_VERSION);
-        assert_eq!(
-            crypto::SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS,
-            &[9, 8, 7, 6, 5, 4, 3, 2, 1]
-        );
+        assert_eq!(crypto::SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS, &[9]);
         assert_eq!(DEFAULT_SEMANTIC_VERSION, 9);
         assert_eq!(HIGHEST_SUPPORTED_SEMANTIC_VERSION, DEFAULT_SEMANTIC_VERSION);
         assert_eq!(batch::DATA_CLASS_EVENT, DataClass::Event as u8);

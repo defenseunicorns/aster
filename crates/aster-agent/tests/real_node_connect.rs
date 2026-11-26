@@ -2006,11 +2006,6 @@ async fn platform_compat_optional_event_ttl_is_enforced_by_the_live_agent() {
                 < full.store_capacity.as_option().unwrap().payload_bytes
         );
         let operations = empty.publish_operation_capacity.as_option().unwrap();
-        assert_eq!(
-            operations.ledger_mode,
-            api::PublishOperationLedgerMode::Numbered
-        );
-        assert_eq!(operations.retired_rows, 0);
         assert_eq!(operations.numbered_outstanding_results, 1);
         // The reverse row belongs to the retained result, not live content;
         // it is removed only when the client acknowledges that result.
@@ -2114,10 +2109,6 @@ async fn numbered_sdk_recovers_its_committed_result_across_restart() {
         assert_eq!(operations.ordinary_remaining, 683_925);
         assert!(operations.emergency_remaining > 0);
         assert_eq!(operations.profile_remaining, 1_022);
-        assert_eq!(
-            operations.ledger_mode,
-            api::PublishOperationLedgerMode::Numbered
-        );
         assert_eq!(operations.numbered_clients, 1);
         assert_eq!(operations.numbered_outstanding_results, 1);
         assert_eq!(operations.numbered_reverse_rows, 1);
@@ -2168,10 +2159,6 @@ async fn numbered_sdk_recovers_its_committed_result_across_restart() {
     assert_eq!(operations.ordinary_remaining, 683_926);
     assert!(operations.emergency_remaining > 0);
     assert_eq!(operations.profile_remaining, 1_023);
-    assert_eq!(
-        operations.ledger_mode,
-        api::PublishOperationLedgerMode::Numbered
-    );
     assert_eq!(operations.numbered_clients, 1);
     assert_eq!(operations.numbered_outstanding_results, 0);
     assert_eq!(operations.numbered_reverse_rows, 0);

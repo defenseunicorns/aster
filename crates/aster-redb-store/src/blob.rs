@@ -91,17 +91,24 @@ pub(crate) const BLOB_NETWORK_METADATA: TableDefinition<&str, u64> =
 // both ordinary semantic quotas and the network byte/row staging partition.
 pub(crate) const BLOB_CARRIER_FETCH_CURSORS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-carrier-fetch-cursors.v1");
+#[cfg(test)]
 const OBSOLETE_PROFILE5_RECEIPT_TABLE_NAME: &str = "aster.blob-profile5-receipts.v1";
+#[cfg(test)]
 pub(crate) const BLOB_STREAM_RESERVATIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-stream-reservations.v2");
+#[cfg(test)]
 pub(crate) const BLOB_STREAM_OPERATIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-stream-operations.v2");
+#[cfg(test)]
 pub(crate) const BLOB_STREAM_PUBLICATIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-stream-publications.v2");
+#[cfg(test)]
 pub(crate) const BLOB_STREAM_CONFLICTS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-stream-conflicts.v2");
+#[cfg(test)]
 pub(crate) const BLOB_STREAM_VARIANTS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-stream-variants.v2");
+#[cfg(test)]
 pub(crate) const BLOB_STREAM_RETIREMENTS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-stream-retirements.v2");
 
@@ -15172,25 +15179,7 @@ fn require_blob_apply_capacity_read(
             )
             .ok_or(StoreError::PayloadByteAccountingOverflow)?,
     };
-    let tombstone_payload = custody::selected_tombstone_payload_usage_read(read)?;
-    let tombstone = CustodyUsage {
-        items: tombstone_payload
-            .items
-            .checked_add(
-                aggregate
-                    .get(EVENT_TOMBSTONE_OPERATION_COUNT)?
-                    .map_or(0, |value| value.value()),
-            )
-            .ok_or(StoreError::ItemCountAccountingOverflow)?,
-        bytes: tombstone_payload
-            .bytes
-            .checked_add(
-                aggregate
-                    .get(EVENT_TOMBSTONE_OPERATION_TOTAL_BYTES)?
-                    .map_or(0, |value| value.value()),
-            )
-            .ok_or(StoreError::PayloadByteAccountingOverflow)?,
-    };
+    let tombstone = custody::selected_tombstone_payload_usage_read(read)?;
     let ordinary = CustodyUsage {
         items: total
             .items
@@ -16415,19 +16404,9 @@ pub(crate) fn blob_schema_present_write(
     write: &redb::WriteTransaction,
 ) -> Result<bool, StoreError> {
     let tables = blob_table_names();
-    let stream_tables = stream_blob_table_names();
-    let multimap_tables = write
+    if write
         .list_multimap_tables()?
-        .map(|table| table.name().to_owned())
-        .collect::<BTreeSet<_>>();
-    if multimap_tables.contains(OBSOLETE_PROFILE5_RECEIPT_TABLE_NAME) {
-        return Err(blob_error(
-            BlobStoreError::UnsupportedLegacyProfile5ReceiptSchema,
-        ));
-    }
-    if multimap_tables
-        .iter()
-        .any(|table| tables.contains(&table.as_str()) || stream_tables.contains(&table.as_str()))
+        .any(|table| tables.contains(&table.name()))
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "mission-scoped Blob schema has the wrong table kind",
@@ -16437,149 +16416,24 @@ pub(crate) fn blob_schema_present_write(
         .list_tables()?
         .map(|table| table.name().to_owned())
         .collect::<BTreeSet<_>>();
-    if existing.contains(OBSOLETE_PROFILE5_RECEIPT_TABLE_NAME) {
-        return Err(blob_error(
-            BlobStoreError::UnsupportedLegacyProfile5ReceiptSchema,
-        ));
+    let present = tables
+        .iter()
+        .filter(|name| existing.contains(**name))
+        .count();
+    if present == 0 {
+        crate::require_new_store_write(write)?;
+        return Ok(false);
     }
-    let legacy = legacy_blob_table_names();
-    let legacy_present = legacy
-        .iter()
-        .filter(|table| existing.contains(**table))
-        .count();
-    let network = network_blob_table_names();
-    let network_present = network
-        .iter()
-        .filter(|table| existing.contains(**table))
-        .count();
-    let network_current = network_present == network.len();
-    let stream_present = stream_tables
-        .iter()
-        .filter(|table| existing.contains(**table))
-        .count();
-    let upload_present = existing.contains(BLOB_UPLOADS.name());
-    let pack_present = existing.contains(pack_lifecycle::BLOB_PROFILE5_PACKS.name());
-    let extension_group_supported = matches!(
-        (network_present, upload_present, pack_present),
-        (0, false, false) | (4, false, false) | (4, true, true)
-    );
-    #[cfg(test)]
-    let schema_migration_required = stream_present != 0 || !upload_present;
+    if present != tables.len() {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "mission-scoped Blob schema group is incomplete",
+        )));
+    }
     let metadata = write.open_table(METADATA)?;
-    let global = blob_global_metadata_fields();
-    let global_present = global
-        .iter()
-        .map(|field| metadata.get(*field).map(|value| value.is_some()))
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(metadata);
-    if stream_present != 0 && stream_present != stream_tables.len() {
-        return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "mission-scoped Blob schema group is incomplete",
-        )));
-    }
-    let stream_complete_empty = if stream_present == stream_tables.len() {
-        let empty = write.open_table(BLOB_STREAM_RESERVATIONS)?.len()? == 0
-            && write.open_table(BLOB_STREAM_OPERATIONS)?.len()? == 0
-            && write.open_table(BLOB_STREAM_PUBLICATIONS)?.len()? == 0
-            && write.open_table(BLOB_STREAM_CONFLICTS)?.len()? == 0
-            && write.open_table(BLOB_STREAM_VARIANTS)?.len()? == 0
-            && write.open_table(BLOB_STREAM_RETIREMENTS)?.len()? == 0;
-        if !empty {
-            return Err(blob_error(
-                BlobStoreError::UnsupportedExperimentalBlobStreamSchema,
-            ));
+    for field in blob_global_metadata_fields() {
+        if metadata.get(field)?.is_none() {
+            return Err(StoreError::MissingAccountingMetadata { field });
         }
-        true
-    } else {
-        false
-    };
-    if legacy_present == 0
-        && network_present == 0
-        && !upload_present
-        && !pack_present
-        && global_present.iter().all(|present| !present)
-        && stream_complete_empty
-    {
-        lifecycle::require_blob_lifecycle_absent_write(write)?;
-        deletion::require_blob_deletion_absent_write(write)?;
-        for table in [
-            BLOB_STREAM_RESERVATIONS,
-            BLOB_STREAM_OPERATIONS,
-            BLOB_STREAM_PUBLICATIONS,
-            BLOB_STREAM_CONFLICTS,
-            BLOB_STREAM_VARIANTS,
-            BLOB_STREAM_RETIREMENTS,
-        ] {
-            if !write.delete_table(table)? {
-                return Err(blob_error(BlobStoreError::SchemaInvariant(
-                    "experimental Blob stream schema changed during migration",
-                )));
-            }
-        }
-        #[cfg(test)]
-        if TEST_BLOB_SCHEMA_MIGRATION_FAULT.get() == 1 {
-            return Err(blob_error(BlobStoreError::SchemaInvariant(
-                "injected Blob schema cleanup abort",
-            )));
-        }
-        return Ok(false);
-    }
-    if legacy_present == 0
-        && network_present == 0
-        && stream_present == 0
-        && !upload_present
-        && !pack_present
-        && global_present.iter().all(|present| !present)
-    {
-        lifecycle::require_blob_lifecycle_absent_write(write)?;
-        deletion::require_blob_deletion_absent_write(write)?;
-        return Ok(false);
-    }
-    if legacy_present != legacy.len()
-        || !(network_present == 0 || network_current)
-        || !extension_group_supported
-        || global_present.iter().any(|present| !present)
-    {
-        return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "mission-scoped Blob schema group is incomplete",
-        )));
-    }
-    if stream_complete_empty {
-        for table in [
-            BLOB_STREAM_RESERVATIONS,
-            BLOB_STREAM_OPERATIONS,
-            BLOB_STREAM_PUBLICATIONS,
-            BLOB_STREAM_CONFLICTS,
-            BLOB_STREAM_VARIANTS,
-            BLOB_STREAM_RETIREMENTS,
-        ] {
-            if !write.delete_table(table)? {
-                return Err(blob_error(BlobStoreError::SchemaInvariant(
-                    "experimental Blob stream schema changed during migration",
-                )));
-            }
-        }
-        #[cfg(test)]
-        if TEST_BLOB_SCHEMA_MIGRATION_FAULT.get() == 1 {
-            return Err(blob_error(BlobStoreError::SchemaInvariant(
-                "injected Blob schema cleanup abort",
-            )));
-        }
-    }
-    if network_present == 0 {
-        initialize_blob_network_schema(write)?;
-    }
-    if !upload_present {
-        let _ = write.open_table(BLOB_UPLOADS)?;
-    }
-    if !pack_present {
-        let _ = write.open_table(pack_lifecycle::BLOB_PROFILE5_PACKS)?;
-    }
-    #[cfg(test)]
-    if schema_migration_required && TEST_BLOB_SCHEMA_MIGRATION_FAULT.get() == 2 {
-        return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "injected Blob schema extension abort",
-        )));
     }
     Ok(true)
 }
@@ -16603,26 +16457,17 @@ fn audit_or_initialize_blob_marker_high_water(
         }),
         Some(durable) => Ok(durable),
         None => {
-            metadata.insert(LAST_BLOB_ACCEPTANCE_MARKER, reconstructed_minimum)?;
-            Ok(reconstructed_minimum)
+            if metadata.get(crate::STORE_FORMAT_VERSION_KEY)?.is_some()
+                || reconstructed_minimum != 0
+            {
+                return Err(StoreError::MissingAccountingMetadata {
+                    field: LAST_BLOB_ACCEPTANCE_MARKER,
+                });
+            }
+            metadata.insert(LAST_BLOB_ACCEPTANCE_MARKER, 0)?;
+            Ok(0)
         }
     }
-}
-
-type BlobOperationRetirement = (
-    lifecycle::RetirementReason,
-    u64,
-    [u8; 32],
-    [u8; 32],
-    lifecycle::RetirementAge,
-);
-
-struct BlobOperationOwnershipMigration {
-    old_key: Vec<u8>,
-    new_key: Vec<u8>,
-    value: Vec<u8>,
-    active_transfer: Option<BlobTransferId>,
-    retired: Option<BlobOperationRetirement>,
 }
 
 fn blob_intent_digest_for_metadata(metadata: &BlobMetadata) -> Result<[u8; 32], StoreError> {
@@ -16635,98 +16480,6 @@ fn blob_intent_digest_for_metadata(metadata: &BlobMetadata) -> Result<[u8; 32], 
         metadata.header.ttl_ms,
     )
     .map(|intent| intent.digest())
-}
-
-fn predecessor_operation_publisher(
-    publications: &impl ReadableTable<&'static [u8], &'static [u8]>,
-    publication_encoding: lifecycle::PublicationEncodingGeneration,
-    value: &[u8],
-) -> Result<(NodeId, Option<BlobTransferId>), StoreError> {
-    if let Some((reason, generation, _, intent_digest, _)) =
-        lifecycle::operation_retirement(value).map_err(blob_error)?
-    {
-        let matched = predecessor_retired_operation_publisher(
-            publications,
-            publication_encoding,
-            reason,
-            generation,
-            intent_digest,
-        )?;
-        return matched.map(|publisher| (publisher, None)).ok_or_else(|| {
-            blob_error(BlobStoreError::SchemaInvariant(
-                "retired Blob operation has no exact publication owner",
-            ))
-        });
-    }
-
-    let operation = decode_blob_operation_record(value)?;
-    let publication = publications
-        .get(operation.transfer_id.as_bytes().as_slice())?
-        .ok_or_else(|| {
-            blob_error(BlobStoreError::SchemaInvariant(
-                "Blob operation points to a missing publication",
-            ))
-        })?;
-    if lifecycle::publication_record_is_retired_for_encoding(
-        publication.value(),
-        publication_encoding,
-    )
-    .map_err(blob_error)?
-    {
-        return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "active Blob operation points to a retired publication",
-        )));
-    }
-    let metadata = decode_blob_metadata_for_encoding(publication.value(), publication_encoding)?;
-    if blob_intent_digest_for_metadata(&metadata)? != operation.intent_digest {
-        return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "Blob operation intent differs from its publication",
-        )));
-    }
-    Ok((
-        metadata.header.stamp.dot.publisher,
-        Some(operation.transfer_id),
-    ))
-}
-
-fn predecessor_retired_operation_publisher(
-    publications: &impl ReadableTable<&'static [u8], &'static [u8]>,
-    publication_encoding: lifecycle::PublicationEncodingGeneration,
-    reason: lifecycle::RetirementReason,
-    generation: u64,
-    intent_digest: [u8; 32],
-) -> Result<Option<NodeId>, StoreError> {
-    let mut matched = None;
-    for row in publications.iter()? {
-        let (_, publication) = row?;
-        let Some((publication_reason, publication_generation, _)) =
-            lifecycle::publication_retirement(publication.value()).map_err(blob_error)?
-        else {
-            continue;
-        };
-        if publication_reason != reason || publication_generation != generation {
-            continue;
-        }
-        let (metadata, _) =
-            decode_retired_blob_metadata_for_encoding(publication.value(), publication_encoding)?
-                .ok_or_else(|| {
-                blob_error(BlobStoreError::SchemaInvariant(
-                    "retired Blob operation publication lacks exact lookup metadata",
-                ))
-            })?;
-        if blob_intent_digest_for_metadata(&metadata)? != intent_digest {
-            continue;
-        }
-        if matched
-            .replace(metadata.header.stamp.dot.publisher)
-            .is_some()
-        {
-            return Err(blob_error(BlobStoreError::SchemaInvariant(
-                "retired Blob operation has ambiguous publication ownership",
-            )));
-        }
-    }
-    Ok(matched)
 }
 
 fn audit_retired_operation_owner(
@@ -16828,138 +16581,21 @@ fn retired_blob_operation_metadata(
     Ok(None)
 }
 
-fn migrate_blob_operation_ownership_write(
-    write: &redb::WriteTransaction,
-    publication_encoding: lifecycle::PublicationEncodingGeneration,
-) -> Result<(), StoreError> {
-    let schema = write
+fn audit_blob_operation_ownership_write(write: &redb::WriteTransaction) -> Result<(), StoreError> {
+    if write
         .open_table(METADATA)?
         .get(BLOB_OPERATION_KEY_SCHEMA_VERSION_FIELD)?
-        .map(|value| value.value());
-    match schema {
-        Some(BLOB_OPERATION_KEY_SCHEMA_VERSION) => {
-            for row in write.open_table(BLOB_OPERATIONS)?.iter()? {
-                let (key, _) = row?;
-                decode_blob_operation_owner_key(key.value())?;
-            }
-            return Ok(());
-        }
-        Some(_) => {
-            return Err(blob_error(BlobStoreError::SchemaInvariant(
-                "Blob operation ownership schema version is unknown",
-            )));
-        }
-        None => {}
-    }
-
-    let publications = write.open_table(BLOB_PUBLICATIONS)?;
-    let operations = write.open_table(BLOB_OPERATIONS)?;
-    let old_keys = operations
-        .iter()?
-        .map(|row| row.map(|(key, _)| key.value().to_vec()))
-        .collect::<Result<BTreeSet<_>, redb::StorageError>>()?;
-    let mut new_keys = BTreeSet::new();
-    let mut migrations = Vec::new();
-    let mut operation_bytes = 0u64;
-    for row in operations.iter()? {
-        let (key, value) = row?;
-        let operation = BlobOperationKey::new(key.value().to_vec())?;
-        let (publisher, active_transfer) =
-            predecessor_operation_publisher(&publications, publication_encoding, value.value())?;
-        let owner = BlobOperationOwner::new(publisher, operation);
-        let new_key = blob_operation_owner_key(&owner)?;
-        if !new_keys.insert(new_key.clone())
-            || (old_keys.contains(&new_key) && new_key.as_slice() != key.value())
-        {
-            return Err(blob_error(BlobStoreError::SchemaInvariant(
-                "Blob operation ownership migration is ambiguous",
-            )));
-        }
-        let retired = lifecycle::operation_retirement(value.value()).map_err(blob_error)?;
-        let predecessor_digest: [u8; 32] = Sha256::digest(key.value()).into();
-        if let Some((_, _, old_digest, _, _)) = retired
-            && old_digest != predecessor_digest
-        {
-            return Err(blob_error(BlobStoreError::SchemaInvariant(
-                "retired Blob operation digest differs from its predecessor key",
-            )));
-        }
-        operation_bytes = operation_bytes
-            .checked_add(
-                u64::try_from(new_key.len() + value.value().len())
-                    .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
-            )
-            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-        migrations.push(BlobOperationOwnershipMigration {
-            old_key: key.value().to_vec(),
-            new_key,
-            value: value.value().to_vec(),
-            active_transfer,
-            retired,
-        });
-    }
-    drop(operations);
-    drop(publications);
-    if operation_bytes > MAX_BLOB_DURABLE_OPERATION_BYTES {
+        .map(|value| value.value())
+        != Some(BLOB_OPERATION_KEY_SCHEMA_VERSION)
+    {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "owner-qualified Blob operation usage exceeds its durable safety cap",
+            "Blob operation ownership schema version is missing or unsupported",
         )));
     }
-
-    let lifecycle_current = write
-        .list_tables()?
-        .any(|table| table.name() == lifecycle::BLOB_LIFECYCLE_METADATA.name())
-        && write
-            .open_table(lifecycle::BLOB_LIFECYCLE_METADATA)?
-            .get("schema_version")?
-            .map(|value| value.value())
-            == Some(5);
-    for migration in &migrations {
-        if lifecycle_current {
-            if let Some(transfer) = migration.active_transfer {
-                lifecycle::remove_operation_owner(write, transfer, &migration.old_key)?;
-                lifecycle::insert_operation_owner(write, transfer, &migration.new_key)?;
-            } else if let Some((_, _, old_digest, _, age)) = migration.retired {
-                let deadline = age
-                    .project(age.checkpoint_sample())
-                    .map_err(blob_error)?
-                    .deadline;
-                lifecycle::replace_operation_retirement_authority(
-                    write,
-                    old_digest,
-                    &migration.old_key,
-                    Sha256::digest(&migration.new_key).into(),
-                    &migration.new_key,
-                    deadline,
-                )?;
-            }
-        }
-        write
-            .open_table(BLOB_OPERATIONS)?
-            .remove(migration.old_key.as_slice())?;
+    for row in write.open_table(BLOB_OPERATIONS)?.iter()? {
+        let (key, _) = row?;
+        decode_blob_operation_owner_key(key.value())?;
     }
-    for migration in migrations {
-        let value = if let Some((reason, generation, _, intent_digest, age)) = migration.retired {
-            lifecycle::retired_operation_record(
-                reason,
-                generation,
-                Sha256::digest(&migration.new_key).into(),
-                intent_digest,
-                age,
-            )
-        } else {
-            migration.value
-        };
-        write
-            .open_table(BLOB_OPERATIONS)?
-            .insert(migration.new_key.as_slice(), value.as_slice())?;
-    }
-    let mut metadata = write.open_table(METADATA)?;
-    metadata.insert(BLOB_OPERATION_TOTAL_BYTES, operation_bytes)?;
-    metadata.insert(
-        BLOB_OPERATION_KEY_SCHEMA_VERSION_FIELD,
-        BLOB_OPERATION_KEY_SCHEMA_VERSION,
-    )?;
     Ok(())
 }
 
@@ -16977,7 +16613,7 @@ pub(crate) fn audit_blob_tables_write(
         &mut shared.expected_publisher_high,
     )?;
     let publication_encoding = lifecycle::publication_encoding_migration_write(write)?;
-    migrate_blob_operation_ownership_write(write, publication_encoding)?;
+    audit_blob_operation_ownership_write(write)?;
     let deletion_owner_binding = depot::depot_owner_binding_if_present_write(write)?;
     let (deletion_schema_migrated, deletion_audit) =
         deletion::audit_or_migrate_blob_deletion_write(write, deletion_owner_binding)?;
@@ -17498,19 +17134,9 @@ pub(crate) fn inspect_blob_tables_read(
     read: &redb::ReadTransaction,
 ) -> Result<BlobAuditSnapshot, StoreError> {
     let tables = blob_table_names();
-    let stream_tables = stream_blob_table_names();
-    let multimap_tables = read
+    if read
         .list_multimap_tables()?
-        .map(|table| table.name().to_owned())
-        .collect::<BTreeSet<_>>();
-    if multimap_tables.contains(OBSOLETE_PROFILE5_RECEIPT_TABLE_NAME) {
-        return Err(blob_error(
-            BlobStoreError::UnsupportedLegacyProfile5ReceiptSchema,
-        ));
-    }
-    if multimap_tables
-        .iter()
-        .any(|table| tables.contains(&table.as_str()) || stream_tables.contains(&table.as_str()))
+        .any(|table| tables.contains(&table.name()))
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "mission-scoped Blob schema has the wrong table kind",
@@ -17520,96 +17146,28 @@ pub(crate) fn inspect_blob_tables_read(
         .list_tables()?
         .map(|table| table.name().to_owned())
         .collect::<BTreeSet<_>>();
-    if existing.contains(OBSOLETE_PROFILE5_RECEIPT_TABLE_NAME) {
-        return Err(blob_error(
-            BlobStoreError::UnsupportedLegacyProfile5ReceiptSchema,
-        ));
+    if tables.iter().any(|name| !existing.contains(*name)) {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "mission-scoped Blob schema group is incomplete",
+        )));
     }
-    let legacy = legacy_blob_table_names();
-    let legacy_present = legacy
-        .iter()
-        .filter(|table| existing.contains(**table))
-        .count();
-    let network = network_blob_table_names();
-    let network_present = network
-        .iter()
-        .filter(|table| existing.contains(**table))
-        .count();
-    let network_current = network_present == network.len();
-    let upload_present = existing.contains(BLOB_UPLOADS.name());
-    let pack_present = existing.contains(pack_lifecycle::BLOB_PROFILE5_PACKS.name());
-    let extension_group_supported = matches!(
-        (network_present, upload_present, pack_present),
-        (0, false, false) | (4, false, false) | (4, true, true)
-    );
-    let stream_present = stream_tables
-        .iter()
-        .filter(|table| existing.contains(**table))
-        .count();
     let metadata = read.open_table(METADATA)?;
-    let global = blob_global_metadata_fields();
-    let global_present = global
-        .iter()
-        .map(|field| metadata.get(*field).map(|value| value.is_some()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let operation_ownership_current = match metadata
+    for field in blob_global_metadata_fields() {
+        if metadata.get(field)?.is_none() {
+            return Err(StoreError::MissingAccountingMetadata { field });
+        }
+    }
+    if metadata
         .get(BLOB_OPERATION_KEY_SCHEMA_VERSION_FIELD)?
         .map(|value| value.value())
-    {
-        Some(BLOB_OPERATION_KEY_SCHEMA_VERSION) => true,
-        None => false,
-        Some(_) => {
-            return Err(blob_error(BlobStoreError::SchemaInvariant(
-                "Blob operation ownership schema version is unknown",
-            )));
-        }
-    };
-    if stream_present != 0 && stream_present != stream_tables.len() {
-        return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "mission-scoped Blob schema group is incomplete",
-        )));
-    }
-    let stream_complete_empty = if stream_present == stream_tables.len() {
-        let empty = read.open_table(BLOB_STREAM_RESERVATIONS)?.len()? == 0
-            && read.open_table(BLOB_STREAM_OPERATIONS)?.len()? == 0
-            && read.open_table(BLOB_STREAM_PUBLICATIONS)?.len()? == 0
-            && read.open_table(BLOB_STREAM_CONFLICTS)?.len()? == 0
-            && read.open_table(BLOB_STREAM_VARIANTS)?.len()? == 0
-            && read.open_table(BLOB_STREAM_RETIREMENTS)?.len()? == 0;
-        if !empty {
-            return Err(blob_error(
-                BlobStoreError::UnsupportedExperimentalBlobStreamSchema,
-            ));
-        }
-        true
-    } else {
-        false
-    };
-    if legacy_present == 0
-        && network_present == 0
-        && (stream_present == 0 || stream_complete_empty)
-        && !upload_present
-        && !pack_present
-        && global_present.iter().all(|present| !present)
-    {
-        lifecycle::require_blob_lifecycle_absent_read(read)?;
-        deletion::require_blob_deletion_absent_read(read)?;
-        return Ok(BlobAuditSnapshot::default());
-    }
-    if legacy_present != legacy.len()
-        || !(network_present == 0 || network_current)
-        || !extension_group_supported
-        || global_present.iter().any(|present| !present)
+        != Some(BLOB_OPERATION_KEY_SCHEMA_VERSION)
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "mission-scoped Blob schema group is incomplete",
+            "Blob operation ownership schema version is missing or unsupported",
         )));
     }
-    if !upload_present {
-        return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "Blob predecessor schema requires writable Profile-5 extension",
-        )));
-    }
+    let operation_ownership_current = true;
+    let network_current = true;
     drop(metadata);
     pack_lifecycle::audit_read(read)?;
     upload::audit_blob_uploads_read(read)?;
@@ -17797,17 +17355,7 @@ pub(crate) fn inspect_blob_tables_read(
     let mut active_equivalent_operation_bytes = 0u64;
     for row in operations.iter()? {
         let (key, value) = row?;
-        let owner = if operation_ownership_current {
-            decode_blob_operation_owner_key(key.value())?
-        } else {
-            let operation = BlobOperationKey::new(key.value().to_vec())?;
-            let (publisher, _) = predecessor_operation_publisher(
-                &publications,
-                publication_encoding,
-                value.value(),
-            )?;
-            BlobOperationOwner::new(publisher, operation)
-        };
+        let owner = decode_blob_operation_owner_key(key.value())?;
         let retired = lifecycle::operation_record_is_retired(value.value()).map_err(blob_error)?;
         if retired && operation_ownership_current {
             audit_retired_operation_owner(
@@ -18319,7 +17867,7 @@ fn initialize_blob_network_schema(write: &redb::WriteTransaction) -> Result<(), 
     Ok(())
 }
 
-fn legacy_blob_table_names() -> [&'static str; 9] {
+fn blob_table_names() -> [&'static str; 15] {
     [
         BLOB_PUBLICATIONS.name(),
         BLOB_BYTES.name(),
@@ -18330,46 +17878,10 @@ fn legacy_blob_table_names() -> [&'static str; 9] {
         BLOB_IMPORTS.name(),
         BLOB_CHUNKS.name(),
         BLOB_DEPOT_METADATA.name(),
-    ]
-}
-
-fn network_blob_table_names() -> [&'static str; 4] {
-    [
         BLOB_PENDING_SOURCES.name(),
         BLOB_CARRIER_PREFIXES.name(),
         BLOB_NETWORK_METADATA.name(),
         BLOB_CARRIER_FETCH_CURSORS.name(),
-    ]
-}
-
-fn stream_blob_table_names() -> [&'static str; 6] {
-    [
-        BLOB_STREAM_RESERVATIONS.name(),
-        BLOB_STREAM_OPERATIONS.name(),
-        BLOB_STREAM_PUBLICATIONS.name(),
-        BLOB_STREAM_CONFLICTS.name(),
-        BLOB_STREAM_VARIANTS.name(),
-        BLOB_STREAM_RETIREMENTS.name(),
-    ]
-}
-
-fn blob_table_names() -> [&'static str; 15] {
-    let legacy = legacy_blob_table_names();
-    let network = network_blob_table_names();
-    [
-        legacy[0],
-        legacy[1],
-        legacy[2],
-        legacy[3],
-        legacy[4],
-        legacy[5],
-        legacy[6],
-        legacy[7],
-        legacy[8],
-        network[0],
-        network[1],
-        network[2],
-        network[3],
         BLOB_UPLOADS.name(),
         pack_lifecycle::BLOB_PROFILE5_PACKS.name(),
     ]

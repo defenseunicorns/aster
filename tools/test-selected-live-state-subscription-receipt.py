@@ -857,7 +857,6 @@ class Fixture:
                 "shutdown_direct_contacts": "0",
                 "shutdown_relay_contacts": "0",
                 "shutdown_unknown_path_contacts": "0",
-                "shutdown_items": "0",
                 "shutdown_events": "0",
                 "shutdown_blobs": "0",
                 "shutdown_data_offered": "0",

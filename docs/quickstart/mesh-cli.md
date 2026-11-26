@@ -170,9 +170,9 @@ cargo run --locked -p aster-node --bin aster -- \
   inspect --state "$ASTER_DEMO_PARENT/mesh/node-2"
 ```
 
-For N=3 the endpoints report `opaque_items=0 events=2
+For N=3 the endpoints report `events=2
 event_acceptance_markers=2 route_cached_events=0`. The intermediate reports
-`opaque_items=0 events=0 event_acceptance_markers=0 route_cached_events=2`.
+`events=0 event_acceptance_markers=0 route_cached_events=2`.
 Exact sealed-byte totals match even though the relay has no semantic row.
 
 ## Run the four-role control scenario
@@ -267,16 +267,12 @@ target/debug/aster node --state ./aster-state --bind 0.0.0.0:49100 \
 
 `--state-interest TOPIC@SCOPE`, `--record-interest TOPIC@SCOPE`, and
 `--blob-interest TOPIC@SCOPE` are repeatable, class-separated receive interests
-for already durable source objects. Blob is opt-in only for semantic v7/v8
-profile 4 and its
+for source-authenticated objects. Blob uses semantic v9/profile 5 and its
 selector is an exact topic/scope pair, not a descendant or wildcard match.
 Empty means receive-none. These selectors do not grant route or content access;
 the mission bundle must independently authorize the exact source, topic,
-scope, and current epoch. Eligible semantic-v7/v8 profile-4 direct-Iroh contacts
-automatically reconcile Blob sources and peer-neutral contiguous carrier ranges
-of at most 16 KiB. V7 is durable-only; v8 also admits authenticated finite-TTL
-custody. V5/v6 Blob intent fails before source or carrier IO and has no selected
-carrier fallback.
+scope, and current epoch. Eligible contacts transfer native `ASTRBS02` pack
+records with durable checkpoints for durable or finite-TTL publications.
 
 Any stopped State/Record/Blob facade must be closed before the runtime owns the
 same store. Rust applications may instead call
@@ -346,12 +342,12 @@ boundary, truncates the same inode to zero length, and synchronizes it again.
 It does not unlink either pathname. Successful output is shaped like:
 
 ```text
-ZEROIZE status=pass mode=live state=complete mission_destroyed=true carrier_identity_destroyed=true mission_pathname=retained-zero-length carrier_identity_pathname=retained-zero-length data_rows_preserved=true opaque_items=<n> events=<n> route_cached_events=<n> controls=<n> assurance=bounded-software physical_sanitization=not-claimed local_authority=same-uid-operator state_root=<state-root>
+ZEROIZE status=pass mode=live state=complete mission_destroyed=true carrier_identity_destroyed=true mission_pathname=retained-zero-length carrier_identity_pathname=retained-zero-length data_rows_preserved=true events=<n> route_cached_events=<n> controls=<n> assurance=bounded-software physical_sanitization=not-claimed local_authority=same-uid-operator state_root=<state-root>
 ```
 
 The node emits `STOP lifecycle=zeroized sync_status=terminal-lockout`. `aster
 inspect` remains available and reports `zeroization=complete`; normal `init`,
-`node`, `put`, and authority/store opens fail closed while the retained redb
+`node` and authority/store opens fail closed while the retained redb
 marker exists. Application, Event, State, Record, Blob, route-cache, and control
 rows are deliberately preserved for audit, as is the encrypted Blob depot.
 Erasing the mission/content and carrier-identity secrets makes that ciphertext
@@ -426,19 +422,15 @@ or signed public registry. This repository does not yet provide the protected
 registry/bundle issuance, custody, recovery, or operator-authorization workflow
 needed for production administration.
 
-`aster put` remains an isolated caller-ID opaque compatibility command. Those
-rows are inspectable but are not advertised or transferred by selected Event
-reconciliation. Do not use `put` for source-authenticated mesh data.
-
 ## What this implementation owns
 
 | Component | Sole responsibility in the selected lane |
 |---|---|
 | `aster-profile` | Stable complete reconciliation keys and canonical inventory ordering; class-specific exact Event/State/Record transfer IDs enter by explicit conversion |
-| `aster-redb-store` | Mission-bound audited control chain and atomic policy snapshots plus semantic Event/State/Record/Blob causal/operation state, durable Event, positive-current-version State, whole-key active-head Record, and metadata-only Blob publication delivery state, bounded Event route-only cache, durable terminal software-zeroization state, and a disjoint opaque compatibility namespace |
+| `aster-redb-store` | Mission-bound audited control chain and atomic policy snapshots plus semantic Event/State/Record/Blob causal/operation state, durable Event, positive-current-version State, whole-key active-head Record, and metadata-only Blob publication delivery state, bounded Event route-only cache, durable terminal software-zeroization state |
 | `aster-negentropy` | Bounded, clock-independent set difference over exact transfer IDs |
 | `aster-iroh` | Direct and operator-pinned controlled-relay endpoint lifecycle, carrier identity, and bounded exchange |
-| `aster-node` | Composition, mission-before-inventory and control-before-data ordering, peer route/interest filtering, exact control/Event/State/Record transfer, semantic-v7/v8 profile-4 Blob source/range automation with v7 durable-only and v8 authenticated finite custody, live Event/State/Record/Blob handles, durable application delivery, authority commands, sample applications, bounded same-UID Unix local zeroization lifecycle, and CLI |
+| `aster-node` | Composition, mission-before-inventory and control-before-data ordering, peer route/interest filtering, exact control/Event/State/Record transfer, semantic-v9/profile-5 Blob streaming with authenticated finite custody, live Event/State/Record/Blob handles, durable application delivery, authority commands, sample applications, bounded same-UID Unix local zeroization lifecycle, and CLI |
 | `aster-core` | Existing spec-verified hybrid mission session, control envelope, recipient-filtered rekey, and typed source-envelope Event/State/Record/Blob semantics, used rather than rewritten |
 
 Current validation coverage and open product gates are tracked in

@@ -1,5 +1,9 @@
 # Receipt-free Blob range streaming
 
+Historical draft.3 specification. The current hybrid runtime requires semantic
+v9/profile 5 and does not execute this profile-4 dialogue. The original codecs
+and vectors remain available for format validation.
+
 ## Required profile and compatibility boundary
 
 Protocol draft.3 semantics v7 and v8 use profile ID `4`,

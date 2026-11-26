@@ -970,28 +970,6 @@ fn deletion_schema_state_read(
     )
 }
 
-pub(crate) fn require_blob_deletion_absent_write(
-    write: &redb::WriteTransaction,
-) -> Result<(), StoreError> {
-    if deletion_schema_state_write(write)? == DeletionSchemaState::Current {
-        return Err(invariant(
-            "Blob deletion authority exists without its base schema",
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn require_blob_deletion_absent_read(
-    read: &redb::ReadTransaction,
-) -> Result<(), StoreError> {
-    if deletion_schema_state_read(read)? == DeletionSchemaState::Current {
-        return Err(invariant(
-            "Blob deletion authority exists without its base schema",
-        ));
-    }
-    Ok(())
-}
-
 pub(crate) fn require_variant_available_read(
     read: &redb::ReadTransaction,
     variant: BlobVariantId,
@@ -1783,6 +1761,7 @@ pub(crate) fn admit_variant_write(
 }
 
 fn initialize_blob_deletion_schema(write: &redb::WriteTransaction) -> Result<(), StoreError> {
+    crate::require_new_store_write(write)?;
     let _ = write.open_table(BLOB_DELETION_MANIFESTS)?;
     let _ = write.open_table(BLOB_DELETION_CHUNKS)?;
     let _ = write.open_table(BLOB_DELETION_CONTINUITY)?;

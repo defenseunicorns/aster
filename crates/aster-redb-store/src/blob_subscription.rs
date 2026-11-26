@@ -3563,7 +3563,8 @@ pub(crate) fn audit_blob_subscription_tables(
         && retirement_tables_present == 0
         && retirement_metadata_present == 0
     {
-        backfill_blob_acceptance_order(write)?;
+        crate::require_new_store_write(write)?;
+        write.open_table(BLOB_ACCEPTANCE_ORDER)?;
         write.open_table(BLOB_SUBSCRIPTIONS)?;
         write.open_table(BLOB_SUBSCRIPTION_PENDING)?;
         write.open_table(BLOB_DELIVERY_ACKNOWLEDGEMENTS)?;
@@ -3591,10 +3592,7 @@ pub(crate) fn audit_blob_subscription_tables(
             "Blob subscription schema group is incomplete",
         ));
     }
-    if retirement_tables_present == 0 && retirement_metadata_present == 0 {
-        migrate_blob_retirement_delivery_v2_to_v3(write)?;
-    } else if retirement_tables_present != 4
-        || retirement_metadata_presence.iter().any(|present| !present)
+    if retirement_tables_present != 4 || retirement_metadata_presence.iter().any(|present| !present)
     {
         return Err(StoreError::BlobInvariant(
             "Blob retirement-delivery schema group is incomplete",
@@ -3602,197 +3600,6 @@ pub(crate) fn audit_blob_subscription_tables(
     }
     audit_blob_acceptance_order_write(write)?;
     audit_blob_subscription_rows_write(write)
-}
-
-fn migrate_blob_retirement_delivery_v2_to_v3(
-    write: &redb::WriteTransaction,
-) -> Result<(), StoreError> {
-    write.open_table(BLOB_RETIREMENT_DELIVERIES)?;
-    write.open_table(BLOB_RETIREMENT_DELIVERY_ORDER)?;
-    write.open_table(BLOB_RETIREMENT_ACKNOWLEDGEMENTS)?;
-    write.open_table(BLOB_RETIREMENT_DELIVERY_OWNERS)?;
-
-    struct MigrationRow {
-        old_key: Vec<u8>,
-        cursor_key: [u8; 64],
-        transfer: BlobTransferId,
-        primary_key: [u8; BLOB_RETIREMENT_DELIVERY_KEY_BYTES],
-        primary_value: Vec<u8>,
-        order_key: [u8; BLOB_RETIREMENT_DELIVERY_ORDER_KEY_BYTES],
-        owner_key: [u8; 64],
-    }
-
-    let mut rows = Vec::new();
-    for row in write.open_table(BLOB_SUBSCRIPTION_PENDING)?.iter()? {
-        let (key, value) = row?;
-        let BlobDeliveryRecord::Retired(retired) = decode_blob_delivery_record(value.value())?
-        else {
-            continue;
-        };
-        let (subscription, marker) = parse_blob_pending_delivery_key(key.value())?;
-        let subscription_record = write
-            .open_table(BLOB_SUBSCRIPTIONS)?
-            .get(subscription.as_bytes().as_slice())?
-            .map(|value| decode_blob_subscription_record(value.value()))
-            .transpose()?
-            .ok_or(StoreError::BlobInvariant(
-                "retired Blob delivery references a missing subscription during migration",
-            ))?;
-        let identity = blob_subscription_identity_write(write, retired.semantic_id)?.ok_or(
-            StoreError::BlobInvariant(
-                "retired Blob delivery references a missing publication during migration",
-            ),
-        )?;
-        if identity.acceptance_marker != marker
-            || !subscription_record.spec.matches_identity(&identity)
-        {
-            return Err(StoreError::BlobInvariant(
-                "retired Blob delivery differs from its subscription during migration",
-            ));
-        }
-        let (reason, generation) = blob_subscription_retirement_write(write, identity.transfer_id)?
-            .ok_or(StoreError::BlobInvariant(
-                "retired Blob delivery references a live publication during migration",
-            ))?;
-        if generation != retired.retirement_generation {
-            return Err(StoreError::BlobInvariant(
-                "retired Blob delivery generation differs during migration",
-            ));
-        }
-        let cursor_key = blob_delivery_cursor_key(subscription, retired.semantic_id);
-        let cursor = write
-            .open_table(BLOB_DELIVERY_CURSORS)?
-            .get(cursor_key.as_slice())?
-            .map(|value| decode_blob_delivery_cursor_record(value.value()))
-            .transpose()?
-            .ok_or(StoreError::BlobInvariant(
-                "retired Blob delivery is missing its content cursor during migration",
-            ))?;
-        if cursor.acceptance_marker != marker {
-            return Err(StoreError::BlobInvariant(
-                "retired Blob delivery cursor differs during migration",
-            ));
-        }
-        let primary_key =
-            blob_retirement_delivery_key(subscription, retired.semantic_id, generation);
-        let order_key = blob_retirement_delivery_order_key(
-            subscription,
-            marker,
-            retired.semantic_id,
-            generation,
-        );
-        rows.push(MigrationRow {
-            old_key: key.value().to_vec(),
-            cursor_key,
-            transfer: identity.transfer_id,
-            primary_key,
-            primary_value: encode_blob_retirement_delivery_record(BlobRetirementDeliveryRecord {
-                subscription_incarnation: subscription_record.incarnation,
-                acceptance_marker: marker,
-                current_attempt: 1,
-                reason,
-            }),
-            order_key,
-            owner_key: blob_retirement_delivery_owner_key(identity.transfer_id, &primary_key),
-        });
-    }
-
-    for row in &rows {
-        if write
-            .open_table(BLOB_SUBSCRIPTION_PENDING)?
-            .remove(row.old_key.as_slice())?
-            .is_none()
-        {
-            return Err(StoreError::BlobInvariant(
-                "retired Blob delivery disappeared during migration",
-            ));
-        }
-        super::blob::lifecycle::remove_delivery_owner(write, row.transfer, &row.old_key)?;
-        if write
-            .open_table(BLOB_DELIVERY_CURSORS)?
-            .remove(row.cursor_key.as_slice())?
-            .is_none()
-        {
-            return Err(StoreError::BlobInvariant(
-                "retired Blob delivery cursor disappeared during migration",
-            ));
-        }
-        if write
-            .open_table(BLOB_RETIREMENT_DELIVERIES)?
-            .insert(row.primary_key.as_slice(), row.primary_value.as_slice())?
-            .is_some()
-            || write
-                .open_table(BLOB_RETIREMENT_DELIVERY_ORDER)?
-                .insert(row.order_key.as_slice(), &[][..])?
-                .is_some()
-            || write
-                .open_table(BLOB_RETIREMENT_DELIVERY_OWNERS)?
-                .insert(row.owner_key.as_slice(), row.primary_key.as_slice())?
-                .is_some()
-        {
-            return Err(StoreError::BlobInvariant(
-                "Blob retirement-delivery migration collided with existing authority",
-            ));
-        }
-    }
-
-    let migrated =
-        u64::try_from(rows.len()).map_err(|_| StoreError::ItemCountAccountingOverflow)?;
-    let mut metadata = write.open_table(METADATA)?;
-    let cursors = metadata
-        .get(BLOB_DELIVERY_CURSOR_COUNT)?
-        .ok_or(StoreError::MissingAccountingMetadata {
-            field: BLOB_DELIVERY_CURSOR_COUNT,
-        })?
-        .value();
-    metadata.insert(
-        BLOB_DELIVERY_CURSOR_COUNT,
-        cursors
-            .checked_sub(migrated)
-            .ok_or(StoreError::BlobInvariant(
-                "Blob delivery-cursor accounting underflows during retirement migration",
-            ))?,
-    )?;
-    metadata.insert(BLOB_RETIREMENT_DELIVERY_COUNT, migrated)?;
-    metadata.insert(BLOB_RETIREMENT_DELIVERY_ORDER_COUNT, migrated)?;
-    metadata.insert(BLOB_RETIREMENT_ACKNOWLEDGEMENT_COUNT, 0)?;
-    metadata.insert(BLOB_RETIREMENT_DELIVERY_OWNER_COUNT, migrated)?;
-    Ok(())
-}
-
-fn backfill_blob_acceptance_order(write: &redb::WriteTransaction) -> Result<(), StoreError> {
-    let markers = write.open_table(BLOB_ACCEPTANCE_MARKERS)?;
-    let publications = write.open_table(BLOB_PUBLICATIONS)?;
-    let mut ordered = BTreeMap::<u64, [u8; 32]>::new();
-    for row in markers.iter()? {
-        let (transfer, marker) = row?;
-        let transfer = parse_blob_subscription_transfer_id(transfer.value())?;
-        let marker = marker.value();
-        if marker == 0
-            || publications.get(transfer.as_bytes().as_slice())?.is_none()
-            || ordered.insert(marker, *transfer.as_bytes()).is_some()
-        {
-            return Err(StoreError::BlobInvariant(
-                "legacy Blob acceptance markers cannot be backfilled exactly",
-            ));
-        }
-    }
-    if ordered
-        .keys()
-        .copied()
-        .ne(1..=u64::try_from(ordered.len())
-            .map_err(|_| StoreError::ItemCountAccountingOverflow)?)
-        || publications.len()? != markers.len()?
-    {
-        return Err(StoreError::BlobInvariant(
-            "legacy Blob acceptance markers are not a complete consecutive history",
-        ));
-    }
-    let mut order = write.open_table(BLOB_ACCEPTANCE_ORDER)?;
-    for (marker, transfer) in ordered {
-        order.insert(marker, transfer.as_slice())?;
-    }
-    Ok(())
 }
 
 fn live_blob_publication_rows(
@@ -4514,16 +4321,6 @@ pub(crate) fn inspect_blob_subscription_tables(
             .get(BLOB_RETIREMENT_DELIVERY_OWNER_COUNT)?
             .is_some(),
     ];
-    if tables_present == 0
-        && metadata_presence.iter().all(|present| !present)
-        && retirement_tables_present == 0
-        && retirement_metadata_presence.iter().all(|present| !present)
-    {
-        // A predecessor Blob store remains safely inspectable read-only. Its
-        // first writable open atomically backfills the inverse marker index and
-        // empty ledger group before application delivery becomes available.
-        return Ok(BlobSubscriptionStats::default());
-    }
     if tables_present != 5 || metadata_presence.iter().any(|present| !present) {
         return Err(StoreError::BlobInvariant(
             "Blob subscription schema group is incomplete",
@@ -4536,7 +4333,6 @@ pub(crate) fn inspect_blob_subscription_tables(
             .filter(|present| **present)
             .count(),
     ) {
-        (0, 0) => false,
         (4, 4) => true,
         _ => {
             return Err(StoreError::BlobInvariant(

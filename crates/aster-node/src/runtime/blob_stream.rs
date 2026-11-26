@@ -3887,19 +3887,19 @@ pub(crate) mod tests {
         for (seed, fixture) in [
             (
                 include_bytes!(
-                    "../../../../fuzz/corpus/stream_transfer_decode/profile5-composite-valid.bin"
+                    "../../../../fuzz/corpus/stream_transfer_decode/profile5-composite-valid-v2.bin"
                 )
                 .as_slice(),
-                include_bytes!("../../../../conformance/profile5-protected-data-header.bin")
+                include_bytes!("../../../../conformance/profile5-protected-data-header-v2.bin")
                     .as_slice(),
             ),
             (
                 include_bytes!(
-                    "../../../../fuzz/corpus/stream_transfer_decode/profile5-composite-maximum.bin"
+                    "../../../../fuzz/corpus/stream_transfer_decode/profile5-composite-maximum-v2.bin"
                 )
                 .as_slice(),
                 include_bytes!(
-                    "../../../../conformance/profile5-protected-data-header-maximum.bin"
+                    "../../../../conformance/profile5-protected-data-header-maximum-v2.bin"
                 )
                 .as_slice(),
             ),

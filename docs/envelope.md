@@ -1,8 +1,8 @@
 # Aster Fixed Binary Security Objects
 
-- Specification version: 0.1.0-draft.2
+- Specification version: 0.1.0-draft.3
 - Stable wire/cryptographic profile: `1`, suite `0x0001`
-- Negotiated semantic versions: default/highest `9`, compatibility `8`, `7`, `6`, `5`, `4`, `3`, `2`, and `1`
+- Hybrid negotiated semantic version: `9`; historical encodings remain documented
 - Status: normative for the implemented reference profile
 - Date: 2026-08-25
 
@@ -1075,11 +1075,7 @@ anonymous_mission_proof         AEAD with ciphertext exactly 16 bytes
 
 Both offer lists MUST be nonempty, nonzero, duplicate-free, and in strictly
 descending numeric order. The default semantic-version list is
-`[9, 8, 7, 6, 5, 4, 3, 2, 1]`; a v8-only compatibility initiator may send
-`[8, 7, 6, 5, 4, 3, 2, 1]`; a v7-only compatibility initiator may send
-`[7, 6, 5, 4, 3, 2, 1]`; a v6-only compatibility initiator may send
-`[6, 5, 4, 3, 2, 1]`, a v2 compatibility initiator may send `[2, 1]`, and a
-v1-only compatibility initiator sends `[1]`. The suite list contains only
+`[9]`. The hybrid runtime rejects older semantic versions in both roles. The suite list contains only
 `[0x0001]`. An honest responder selects the highest common semantic version and
 its locally preferred complete common suite.
 
@@ -1510,8 +1506,8 @@ Blob interest and carrier-range tags; v1-v4 sessions reject all of them. Source
 and carrier formats remain `ASTRENV2`/`ASTRENV3` and `ASTRBT01` version 1.
 Semantic v6 inherited these Blob mechanics byte-for-byte. The definitions below
 remain parser and compatibility codec allocations, not a current carrier
-fallback. Current Blob carrier transfer requires semantic v7/v8 profile 4 and
-uses the receipt-free grammar in [protocol.md](protocol.md) §9.4.
+fallback. Current Blob transfer requires semantic v9/profile 5 and
+uses the native-pack grammar in [protocol.md](protocol.md) §9.4.
 
 BlobInterest (`0x6b`) and BlobInterestReply (`0x6c`) encode:
 

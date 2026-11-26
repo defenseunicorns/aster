@@ -1948,19 +1948,9 @@ struct ExpectedLifecycleImage {
     usage: BlobLifecycleUsage,
 }
 
-/// Fully preflighted predecessor-to-current lifecycle migration.
+/// Empty lifecycle schema prepared only during new-store creation.
 pub(crate) struct BlobLifecycleMigration {
     image: ExpectedLifecycleImage,
-}
-
-fn predecessor_lifecycle_table_names() -> [&'static str; 5] {
-    [
-        BLOB_LIFECYCLE_METADATA.name(),
-        BLOB_VARIANT_REFERENCES.name(),
-        BLOB_LINEAGE_FENCES.name(),
-        BLOB_REPLAY_FENCES.name(),
-        BLOB_MAINTENANCE_CURSORS.name(),
-    ]
 }
 
 fn lifecycle_v2_table_names() -> [&'static str; 8] {
@@ -2019,30 +2009,6 @@ fn lifecycle_schema_state(
     let present = names.iter().filter(|name| normal.contains(**name)).count();
     match present {
         0 => Ok(LifecycleSchemaState::Legacy),
-        count
-            if count == predecessor_lifecycle_table_names().len()
-                && predecessor_lifecycle_table_names()
-                    .iter()
-                    .all(|name| normal.contains(*name)) =>
-        {
-            Ok(LifecycleSchemaState::V1)
-        }
-        count
-            if count == lifecycle_v2_table_names().len()
-                && lifecycle_v2_table_names()
-                    .iter()
-                    .all(|name| normal.contains(*name)) =>
-        {
-            Ok(LifecycleSchemaState::V2)
-        }
-        count
-            if count == lifecycle_v4_table_names().len()
-                && lifecycle_v4_table_names()
-                    .iter()
-                    .all(|name| normal.contains(*name)) =>
-        {
-            Ok(LifecycleSchemaState::V4)
-        }
         count if count == names.len() => Ok(LifecycleSchemaState::Current),
         _ => Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
             "Blob lifecycle schema group is incomplete",
@@ -2218,10 +2184,6 @@ fn resolve_lifecycle_schema_version(
     version: u64,
 ) -> Result<LifecycleSchemaState, StoreError> {
     match (table_state, version) {
-        (LifecycleSchemaState::V4, 3) => Ok(LifecycleSchemaState::V3),
-        (LifecycleSchemaState::V4, PREVIOUS_BLOB_LIFECYCLE_SCHEMA_VERSION) => {
-            Ok(LifecycleSchemaState::V4)
-        }
         (LifecycleSchemaState::Current, BLOB_LIFECYCLE_SCHEMA_VERSION) => {
             Ok(LifecycleSchemaState::Current)
         }
@@ -2243,7 +2205,6 @@ pub(crate) fn publication_encoding_write(
         .get(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD)?
         .map(|value| value.value())
     {
-        Some(3) => Ok(PublicationEncodingGeneration::LifecycleV2OrV3),
         Some(BLOB_LIFECYCLE_SCHEMA_VERSION) => Ok(PublicationEncodingGeneration::Current),
         _ => Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
             "Blob lifecycle schema version is unknown",
@@ -2281,6 +2242,9 @@ pub(crate) fn publication_encoding_migration_write(
     write: &redb::WriteTransaction,
 ) -> Result<PublicationEncodingGeneration, StoreError> {
     let mut schema = lifecycle_schema_state_write(write)?;
+    if schema == LifecycleSchemaState::Legacy {
+        crate::require_new_store_write(write)?;
+    }
     #[cfg(test)]
     if schema == LifecycleSchemaState::Legacy && TEST_BLOB_LIFECYCLE_MIGRATION_DISABLED.get() {
         return Ok(PublicationEncodingGeneration::RawCurrent);
@@ -2313,7 +2277,6 @@ pub(crate) fn publication_encoding_read(
         .get(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD)?
         .map(|value| value.value())
     {
-        Some(3) => Ok(PublicationEncodingGeneration::LifecycleV2OrV3),
         Some(BLOB_LIFECYCLE_SCHEMA_VERSION) => Ok(PublicationEncodingGeneration::Current),
         _ => Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
             "Blob lifecycle schema version is unknown",
@@ -5128,148 +5091,6 @@ fn collect_inverse_owners(
     Ok(rows)
 }
 
-fn merge_v1_retained_lineages(
-    lineages: &impl ReadableTable<&'static [u8], &'static [u8]>,
-    expected: &mut ExpectedLifecycleImage,
-    owner_binding: [u8; 32],
-) -> Result<(), StoreError> {
-    let required = expected.lineages.clone();
-    let mut retained = BTreeMap::new();
-    let mut lineage_bytes = 0u64;
-    for row in lineages.iter()? {
-        let (key, value) = row?;
-        if key.value().len() != 32 {
-            return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
-                "Blob lifecycle-v1 lineage fence has an invalid variant key",
-            )));
-        }
-        let fence = LineageFence::decode(value.value()).map_err(StoreError::Blob)?;
-        if fence.owner_binding != owner_binding {
-            return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
-                "Blob lifecycle-v1 lineage authority has the wrong owner binding",
-            )));
-        }
-        if let Some(required_value) = required.get(key.value()) {
-            if !fence
-                .same_authority(LineageFence::decode(required_value).map_err(StoreError::Blob)?)
-            {
-                return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
-                    "Blob lifecycle-v1 lineage authority differs",
-                )));
-            }
-        } else if !fence.bulk_reclamation_observed() {
-            return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
-                "Blob lifecycle-v1 orphan lineage lacks finalized reclamation authority",
-            )));
-        }
-        lineage_bytes = lineage_bytes
-            .checked_add(entry_bytes(key.value(), value.value())?)
-            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-        retained.insert(key.value().to_vec(), value.value().to_vec());
-    }
-    if required.keys().any(|key| !retained.contains_key(key)) {
-        return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
-            "Blob lifecycle-v1 lineage fence is missing",
-        )));
-    }
-    expected.usage.lineage_rows =
-        u64::try_from(retained.len()).map_err(|_| StoreError::ItemCountAccountingOverflow)?;
-    expected.usage.lineage_bytes = lineage_bytes;
-    expected.lineages = retained;
-    Ok(())
-}
-
-fn audit_v1_before_migration(
-    write_metadata: &impl ReadableTable<&'static str, u64>,
-    references: &impl ReadableTable<&'static [u8], &'static [u8]>,
-    lineages: &impl ReadableTable<&'static [u8], &'static [u8]>,
-    replays: &impl ReadableTable<&'static [u8], &'static [u8]>,
-    cursors: &impl ReadableTable<u8, &'static [u8]>,
-    expected: &ExpectedLifecycleImage,
-    owner_binding: [u8; 32],
-) -> Result<(), StoreError> {
-    const V1_FIELDS: [&str; 7] = [
-        BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD,
-        BLOB_LINEAGE_ROWS,
-        BLOB_LINEAGE_BYTES,
-        BLOB_REPLAY_ROWS,
-        BLOB_REPLAY_BYTES,
-        BLOB_PUBLICATION_ROWS,
-        BLOB_REFERENCE_ROWS,
-    ];
-    if write_metadata.len()? != V1_FIELDS.len() as u64 {
-        return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
-            "Blob lifecycle-v1 accounting metadata is incomplete",
-        )));
-    }
-    for (field, expected_value) in [
-        (BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD, 1),
-        (BLOB_LINEAGE_ROWS, expected.usage.lineage_rows),
-        (BLOB_LINEAGE_BYTES, expected.usage.lineage_bytes),
-        (BLOB_REPLAY_ROWS, expected.usage.replay_rows),
-        (BLOB_REPLAY_BYTES, expected.usage.replay_bytes),
-        (BLOB_PUBLICATION_ROWS, expected.usage.publication_rows),
-        (BLOB_REFERENCE_ROWS, expected.usage.reference_rows),
-    ] {
-        if write_metadata.get(field)?.map(|value| value.value()) != Some(expected_value) {
-            return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
-                "Blob lifecycle-v1 accounting differs from exact rows",
-            )));
-        }
-    }
-    validate_maintenance_cursors(cursors)?;
-    let actual_references = references
-        .iter()?
-        .map(|row| {
-            let (key, value) = row?;
-            Ok((key.value().to_vec(), value.value().to_vec()))
-        })
-        .collect::<Result<BTreeMap<_, _>, redb::StorageError>>()?;
-    let actual_replays = replays
-        .iter()?
-        .map(|row| {
-            let (key, value) = row?;
-            ReplayFence::decode(value.value()).map_err(StoreError::Blob)?;
-            Ok((key.value().to_vec(), value.value().to_vec()))
-        })
-        .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
-    if actual_references != expected.references || actual_replays != expected.replays {
-        return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
-            "Blob lifecycle-v1 relations are incomplete or mismatched",
-        )));
-    }
-    let mut actual_lineages = BTreeMap::new();
-    for row in lineages.iter()? {
-        let (key, value) = row?;
-        let fence = LineageFence::decode(value.value()).map_err(StoreError::Blob)?;
-        if fence.owner_binding != owner_binding
-            || (!expected.lineages.contains_key(key.value()) && !fence.bulk_reclamation_observed())
-        {
-            return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
-                "Blob lifecycle-v1 lineage authority is invalid",
-            )));
-        }
-        actual_lineages.insert(key.value().to_vec(), value.value().to_vec());
-    }
-    for (key, expected_value) in &expected.lineages {
-        let actual =
-            actual_lineages
-                .get(key)
-                .ok_or(StoreError::Blob(BlobStoreError::SchemaInvariant(
-                    "Blob lifecycle-v1 lineage fence is missing",
-                )))?;
-        if !LineageFence::decode(actual)
-            .map_err(StoreError::Blob)?
-            .same_authority(LineageFence::decode(expected_value).map_err(StoreError::Blob)?)
-        {
-            return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
-                "Blob lifecycle-v1 lineage authority differs",
-            )));
-        }
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)] // Exact bidirectional audit spans every lifecycle table.
 fn audit_current_rows(
     metadata: &impl ReadableTable<&'static str, u64>,
@@ -5514,58 +5335,7 @@ fn preflight_migration_limits(
     Ok(())
 }
 
-fn finalize_v5_migration_image(
-    mut image: ExpectedLifecycleImage,
-    continuity: Option<custody::LowerBoundContinuity>,
-) -> Result<ExpectedLifecycleImage, StoreError> {
-    image.ttl_deadlines.clear();
-    for (key, encoded) in &mut image.publications {
-        if publication_record_is_retired(encoded).map_err(StoreError::Blob)? {
-            continue;
-        }
-        let transfer = super::parse_blob_transfer_id("Blob publication table", key)?;
-        let mut metadata = super::decode_blob_metadata(encoded)?;
-        metadata.lifetime = project_lifetime_for_v5(metadata.lifetime, continuity)?;
-        if let Some(deadline) = stored_ttl_deadline(
-            transfer,
-            TtlDeadlineKind::LivePublication,
-            metadata.lifetime,
-        )? {
-            insert_unique(
-                &mut image.ttl_deadlines,
-                ttl_deadline_key(deadline)?.to_vec(),
-                Vec::new(),
-                "multiple live Blob publications claim one TTL deadline",
-            )?;
-        }
-        let payload = super::encode_blob_metadata(metadata)?;
-        *encoded = replace_live_publication_payload(encoded, &payload)?;
-    }
-    for (key, encoded) in &mut image.pending_sources {
-        let transfer = super::parse_blob_transfer_id("Blob pending source table", key)?;
-        let mut pending = super::decode_pending_blob_source(encoded)?;
-        pending.metadata.lifetime = project_lifetime_for_v5(pending.metadata.lifetime, continuity)?;
-        if let Some(deadline) = stored_ttl_deadline(
-            transfer,
-            TtlDeadlineKind::PendingSource,
-            pending.metadata.lifetime,
-        )? {
-            insert_unique(
-                &mut image.ttl_deadlines,
-                ttl_deadline_key(deadline)?.to_vec(),
-                Vec::new(),
-                "multiple pending Blob sources claim one TTL deadline",
-            )?;
-        }
-        *encoded = super::encode_pending_blob_source(&pending)?;
-    }
-    image.usage.ttl_deadline_rows = u64::try_from(image.ttl_deadlines.len())
-        .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
-    Ok(image)
-}
-
-/// Reconstructs and preflights a complete predecessor image, or strictly
-/// audits an already-current lifecycle schema without repairing it.
+/// Initializes an empty new-store lifecycle, or strictly audits current data.
 pub(crate) fn stage_blob_lifecycle_migration_write(
     write: &redb::WriteTransaction,
     limits: BlobLifecycleLimits,
@@ -5603,7 +5373,7 @@ pub(crate) fn stage_blob_lifecycle_migration_write(
         })
         .collect::<Result<Vec<_>, redb::StorageError>>()?;
     let continuity = custody::lower_bound_continuity_write(write)?;
-    let mut expected = reconstruct_expected_image(
+    let expected = reconstruct_expected_image(
         &publications,
         &source_bytes,
         &operations,
@@ -5615,152 +5385,27 @@ pub(crate) fn stage_blob_lifecycle_migration_write(
         continuity,
         false,
     )?;
-    if schema == LifecycleSchemaState::V1 {
-        merge_v1_retained_lineages(
-            &write.open_table(BLOB_LINEAGE_FENCES)?,
-            &mut expected,
-            owner_binding,
-        )?;
-        audit_v1_before_migration(
-            &write.open_table(BLOB_LIFECYCLE_METADATA)?,
-            &write.open_table(BLOB_VARIANT_REFERENCES)?,
-            &write.open_table(BLOB_LINEAGE_FENCES)?,
-            &write.open_table(BLOB_REPLAY_FENCES)?,
-            &write.open_table(BLOB_MAINTENANCE_CURSORS)?,
-            &expected,
-            owner_binding,
-        )?;
-    }
     match schema {
-        LifecycleSchemaState::Legacy | LifecycleSchemaState::V1 => {
+        LifecycleSchemaState::Legacy => {
+            crate::require_new_store_write(write)?;
+            if !expected.publications.is_empty()
+                || !expected.operations.is_empty()
+                || !expected.pending_sources.is_empty()
+            {
+                return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                    "new Blob lifecycle must be empty",
+                )));
+            }
             preflight_migration_limits(expected.usage, limits)?;
-            let operation_rows = u64::try_from(expected.operations.len())
-                .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
-            if operation_rows > super::MAX_BLOB_OPERATIONS
-                || expected.operation_bytes > super::MAX_BLOB_OWNED_OPERATION_BYTES
-            {
-                return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
-                    "wrapped Blob operation usage exceeds its durable safety caps",
-                )));
-            }
             expected.usage.apply_to_stats(stats);
-            let image = finalize_v5_migration_image(expected, continuity)?;
-            Ok(Some(BlobLifecycleMigration { image }))
+            Ok(Some(BlobLifecycleMigration { image: expected }))
         }
-        LifecycleSchemaState::V2 => {
-            let upgraded_publications = std::mem::take(&mut expected.publications);
-            expected.publications = publications
-                .iter()?
-                .map(|row| {
-                    let (key, value) = row?;
-                    Ok((key.value().to_vec(), value.value().to_vec()))
-                })
-                .collect::<Result<BTreeMap<_, _>, redb::StorageError>>()?;
-            let actual_usage = audit_current_rows(
-                &write.open_table(BLOB_LIFECYCLE_METADATA)?,
-                &write.open_table(BLOB_VARIANT_REFERENCES)?,
-                &write.open_table(BLOB_LINEAGE_FENCES)?,
-                &write.open_table(BLOB_REPLAY_FENCES)?,
-                &write.open_table(BLOB_MAINTENANCE_CURSORS)?,
-                &write.open_table(BLOB_OPERATION_OWNERS)?,
-                &write.open_table(BLOB_DELIVERY_OWNERS)?,
-                &write.open_table(BLOB_RETENTION_DEADLINES)?,
-                None,
-                None,
-                &expected,
-                owner_binding,
-                2,
-            )?;
-            preflight_migration_limits(actual_usage, limits)?;
-            expected.publications = upgraded_publications;
-            expected.deadlines = expected
-                .deadlines
-                .keys()
-                .map(|key| {
-                    let (deadline, owner) = decode_retention_deadline_key_v2(key)?;
-                    Ok((retention_deadline_key(deadline, owner).to_vec(), Vec::new()))
-                })
-                .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
-            // The exact v2 audit includes permanent replay and finalized
-            // lineage fences that are intentionally retained after their
-            // publication is retired.  Carry that audited accounting into
-            // v3 instead of replacing it with only the rows reconstructible
-            // from the retired wrapper.
-            expected.usage = actual_usage;
-            expected.usage.retirement_resolver_rows =
-                u64::try_from(expected.retirement_resolvers.len())
-                    .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
-            expected.usage.apply_to_stats(stats);
-            let image = finalize_v5_migration_image(expected, continuity)?;
-            Ok(Some(BlobLifecycleMigration { image }))
-        }
-        LifecycleSchemaState::V3 => {
-            let upgraded_publications = std::mem::take(&mut expected.publications);
-            expected.publications = publications
-                .iter()?
-                .map(|row| {
-                    let (key, value) = row?;
-                    Ok((key.value().to_vec(), value.value().to_vec()))
-                })
-                .collect::<Result<BTreeMap<_, _>, redb::StorageError>>()?;
-            let actual_usage = audit_current_rows(
-                &write.open_table(BLOB_LIFECYCLE_METADATA)?,
-                &write.open_table(BLOB_VARIANT_REFERENCES)?,
-                &write.open_table(BLOB_LINEAGE_FENCES)?,
-                &write.open_table(BLOB_REPLAY_FENCES)?,
-                &write.open_table(BLOB_MAINTENANCE_CURSORS)?,
-                &write.open_table(BLOB_OPERATION_OWNERS)?,
-                &write.open_table(BLOB_DELIVERY_OWNERS)?,
-                &write.open_table(BLOB_RETENTION_DEADLINES)?,
-                None,
-                Some(collect_retirement_resolvers(
-                    &write.open_table(BLOB_RETIREMENT_RESOLVERS)?,
-                )?),
-                &expected,
-                owner_binding,
-                3,
-            )?;
-            preflight_migration_limits(actual_usage, limits)?;
-            expected.publications = upgraded_publications;
-            expected.usage = actual_usage;
-            expected.usage.apply_to_stats(stats);
-            let image = finalize_v5_migration_image(expected, continuity)?;
-            Ok(Some(BlobLifecycleMigration { image }))
-        }
-        LifecycleSchemaState::V4 => {
-            if u64::try_from(expected.publications.len())
-                .map_err(|_| StoreError::ItemCountAccountingOverflow)?
-                != publications.len()?
-                || u64::try_from(expected.operations.len())
-                    .map_err(|_| StoreError::ItemCountAccountingOverflow)?
-                    != operations.len()?
-            {
-                return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
-                    "Blob lifecycle wrappers are not bidirectionally complete",
-                )));
-            }
-            let actual_usage = audit_current_rows(
-                &write.open_table(BLOB_LIFECYCLE_METADATA)?,
-                &write.open_table(BLOB_VARIANT_REFERENCES)?,
-                &write.open_table(BLOB_LINEAGE_FENCES)?,
-                &write.open_table(BLOB_REPLAY_FENCES)?,
-                &write.open_table(BLOB_MAINTENANCE_CURSORS)?,
-                &write.open_table(BLOB_OPERATION_OWNERS)?,
-                &write.open_table(BLOB_DELIVERY_OWNERS)?,
-                &write.open_table(BLOB_RETENTION_DEADLINES)?,
-                None,
-                Some(collect_retirement_resolvers(
-                    &write.open_table(BLOB_RETIREMENT_RESOLVERS)?,
-                )?),
-                &expected,
-                owner_binding,
-                PREVIOUS_BLOB_LIFECYCLE_SCHEMA_VERSION,
-            )?;
-            preflight_migration_limits(actual_usage, limits)?;
-            actual_usage.apply_to_stats(stats);
-            let image = finalize_v5_migration_image(expected, continuity)?;
-            Ok(Some(BlobLifecycleMigration { image }))
-        }
+        LifecycleSchemaState::V1
+        | LifecycleSchemaState::V2
+        | LifecycleSchemaState::V3
+        | LifecycleSchemaState::V4 => Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+            "unsupported Blob lifecycle schema",
+        ))),
         LifecycleSchemaState::Current => {
             if u64::try_from(expected.publications.len())
                 .map_err(|_| StoreError::ItemCountAccountingOverflow)?
@@ -5798,8 +5443,7 @@ pub(crate) fn stage_blob_lifecycle_migration_write(
     }
 }
 
-/// Strict read-only predecessor/current audit. A complete predecessor is
-/// reconstructed in memory only; current authority must match bidirectionally.
+/// Strict read-only current-format lifecycle audit.
 pub(crate) fn inspect_blob_lifecycle_read(
     read: &redb::ReadTransaction,
 ) -> Result<BlobLifecycleUsage, StoreError> {
@@ -5821,6 +5465,11 @@ pub(crate) fn inspect_blob_lifecycle_read(
             )))?;
         schema = resolve_lifecycle_schema_version(schema, version)?;
     }
+    if schema != LifecycleSchemaState::Current {
+        return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+            "missing current Blob lifecycle schema",
+        )));
+    }
     let pending_rows = if normal.contains(super::BLOB_PENDING_SOURCES.name()) {
         read.open_table(super::BLOB_PENDING_SOURCES)?
             .iter()?
@@ -5833,7 +5482,7 @@ pub(crate) fn inspect_blob_lifecycle_read(
         Vec::new()
     };
     let owner_binding = depot::depot_owner_binding_read(read)?;
-    let mut expected = reconstruct_expected_image(
+    let expected = reconstruct_expected_image(
         &read.open_table(super::BLOB_PUBLICATIONS)?,
         &read.open_table(super::BLOB_BYTES)?,
         &read.open_table(super::BLOB_OPERATIONS)?,
@@ -5845,84 +5494,29 @@ pub(crate) fn inspect_blob_lifecycle_read(
         custody::lower_bound_continuity_read(read)?,
         false,
     )?;
-    if schema == LifecycleSchemaState::V1 {
-        merge_v1_retained_lineages(
-            &read.open_table(BLOB_LINEAGE_FENCES)?,
-            &mut expected,
-            owner_binding,
-        )?;
-        audit_v1_before_migration(
-            &read.open_table(BLOB_LIFECYCLE_METADATA)?,
-            &read.open_table(BLOB_VARIANT_REFERENCES)?,
-            &read.open_table(BLOB_LINEAGE_FENCES)?,
-            &read.open_table(BLOB_REPLAY_FENCES)?,
-            &read.open_table(BLOB_MAINTENANCE_CURSORS)?,
-            &expected,
-            owner_binding,
-        )?;
-    }
-    if matches!(
-        schema,
-        LifecycleSchemaState::V2
-            | LifecycleSchemaState::V3
-            | LifecycleSchemaState::V4
-            | LifecycleSchemaState::Current
-    ) {
-        if schema == LifecycleSchemaState::Current {
-            load_ttl_expiry_state(&read.open_table(BLOB_TTL_EXPIRY_CURSORS)?)?;
-        }
-        if matches!(schema, LifecycleSchemaState::V2 | LifecycleSchemaState::V3) {
-            expected.publications = read
-                .open_table(super::BLOB_PUBLICATIONS)?
-                .iter()?
-                .map(|row| {
-                    let (key, value) = row?;
-                    Ok((key.value().to_vec(), value.value().to_vec()))
-                })
-                .collect::<Result<BTreeMap<_, _>, redb::StorageError>>()?;
-        }
-        return audit_current_rows(
-            &read.open_table(BLOB_LIFECYCLE_METADATA)?,
-            &read.open_table(BLOB_VARIANT_REFERENCES)?,
-            &read.open_table(BLOB_LINEAGE_FENCES)?,
-            &read.open_table(BLOB_REPLAY_FENCES)?,
-            &read.open_table(BLOB_MAINTENANCE_CURSORS)?,
-            &read.open_table(BLOB_OPERATION_OWNERS)?,
-            &read.open_table(BLOB_DELIVERY_OWNERS)?,
-            &read.open_table(BLOB_RETENTION_DEADLINES)?,
-            if schema == LifecycleSchemaState::Current {
-                Some(table_map(&read.open_table(BLOB_TTL_DEADLINES)?)?)
-            } else {
-                None
-            },
-            if matches!(
-                schema,
-                LifecycleSchemaState::V3 | LifecycleSchemaState::V4 | LifecycleSchemaState::Current
-            ) {
-                Some(collect_retirement_resolvers(
-                    &read.open_table(BLOB_RETIREMENT_RESOLVERS)?,
-                )?)
-            } else {
-                None
-            },
-            &expected,
-            owner_binding,
-            if schema == LifecycleSchemaState::Current {
-                BLOB_LIFECYCLE_SCHEMA_VERSION
-            } else if schema == LifecycleSchemaState::V4 {
-                PREVIOUS_BLOB_LIFECYCLE_SCHEMA_VERSION
-            } else if schema == LifecycleSchemaState::V3 {
-                3
-            } else {
-                2
-            },
-        );
-    }
-    Ok(expected.usage)
+    load_ttl_expiry_state(&read.open_table(BLOB_TTL_EXPIRY_CURSORS)?)?;
+    audit_current_rows(
+        &read.open_table(BLOB_LIFECYCLE_METADATA)?,
+        &read.open_table(BLOB_VARIANT_REFERENCES)?,
+        &read.open_table(BLOB_LINEAGE_FENCES)?,
+        &read.open_table(BLOB_REPLAY_FENCES)?,
+        &read.open_table(BLOB_MAINTENANCE_CURSORS)?,
+        &read.open_table(BLOB_OPERATION_OWNERS)?,
+        &read.open_table(BLOB_DELIVERY_OWNERS)?,
+        &read.open_table(BLOB_RETENTION_DEADLINES)?,
+        Some(table_map(&read.open_table(BLOB_TTL_DEADLINES)?)?),
+        Some(collect_retirement_resolvers(
+            &read.open_table(BLOB_RETIREMENT_RESOLVERS)?,
+        )?),
+        &expected,
+        owner_binding,
+        BLOB_LIFECYCLE_SCHEMA_VERSION,
+    )
 }
 
 impl BlobLifecycleMigration {
     pub(crate) fn apply(&self, write: &redb::WriteTransaction) -> Result<(), StoreError> {
+        crate::require_new_store_write(write)?;
         let mut metadata = write.open_table(BLOB_LIFECYCLE_METADATA)?;
         for (field, value) in [
             (
@@ -5968,97 +5562,18 @@ impl BlobLifecycleMigration {
         initialize_maintenance_cursors(write)?;
         initialize_ttl_expiry_cursors(write)?;
 
-        let mut lineages = write.open_table(BLOB_LINEAGE_FENCES)?;
-        for (key, value) in &self.image.lineages {
-            lineages.insert(key.as_slice(), value.as_slice())?;
+        for table in [
+            BLOB_LINEAGE_FENCES,
+            BLOB_REPLAY_FENCES,
+            BLOB_VARIANT_REFERENCES,
+            BLOB_OPERATION_OWNERS,
+            BLOB_DELIVERY_OWNERS,
+            BLOB_RETENTION_DEADLINES,
+            BLOB_TTL_DEADLINES,
+            BLOB_RETIREMENT_RESOLVERS,
+        ] {
+            write.open_table(table)?;
         }
-        drop(lineages);
-        let mut replays = write.open_table(BLOB_REPLAY_FENCES)?;
-        for (key, value) in &self.image.replays {
-            replays.insert(key.as_slice(), value.as_slice())?;
-        }
-        drop(replays);
-        let mut references = write.open_table(BLOB_VARIANT_REFERENCES)?;
-        for (key, value) in &self.image.references {
-            references.insert(key.as_slice(), value.as_slice())?;
-        }
-        drop(references);
-        let mut operation_owners = write.open_table(BLOB_OPERATION_OWNERS)?;
-        for (key, value) in &self.image.operation_owners {
-            operation_owners.insert(key.as_slice(), value.as_slice())?;
-        }
-        drop(operation_owners);
-        let mut delivery_owners = write.open_table(BLOB_DELIVERY_OWNERS)?;
-        for (key, value) in &self.image.delivery_owners {
-            delivery_owners.insert(key.as_slice(), value.as_slice())?;
-        }
-        drop(delivery_owners);
-        let existing_deadline_keys = write
-            .open_table(BLOB_RETENTION_DEADLINES)?
-            .iter()?
-            .map(|row| row.map(|(key, _)| key.value().to_vec()))
-            .collect::<Result<Vec<_>, redb::StorageError>>()?;
-        let mut deadlines = write.open_table(BLOB_RETENTION_DEADLINES)?;
-        for key in existing_deadline_keys {
-            deadlines.remove(key.as_slice())?;
-        }
-        for (key, value) in &self.image.deadlines {
-            deadlines.insert(key.as_slice(), value.as_slice())?;
-        }
-        drop(deadlines);
-        let existing_ttl_deadline_keys = write
-            .open_table(BLOB_TTL_DEADLINES)?
-            .iter()?
-            .map(|row| row.map(|(key, _)| key.value().to_vec()))
-            .collect::<Result<Vec<_>, redb::StorageError>>()?;
-        let mut ttl_deadlines = write.open_table(BLOB_TTL_DEADLINES)?;
-        for key in existing_ttl_deadline_keys {
-            ttl_deadlines.remove(key.as_slice())?;
-        }
-        for (key, value) in &self.image.ttl_deadlines {
-            ttl_deadlines.insert(key.as_slice(), value.as_slice())?;
-        }
-        drop(ttl_deadlines);
-        let mut resolvers = write.open_table(BLOB_RETIREMENT_RESOLVERS)?;
-        for (key, value) in &self.image.retirement_resolvers {
-            resolvers.insert(key.as_slice(), value.as_slice())?;
-        }
-        drop(resolvers);
-        let mut publications = write.open_table(super::BLOB_PUBLICATIONS)?;
-        for (key, value) in &self.image.publications {
-            publications.insert(key.as_slice(), value.as_slice())?;
-        }
-        drop(publications);
-        let mut operations = write.open_table(super::BLOB_OPERATIONS)?;
-        for (key, value) in &self.image.operations {
-            operations.insert(key.as_slice(), value.as_slice())?;
-        }
-        drop(operations);
-        let mut pending = write.open_table(super::BLOB_PENDING_SOURCES)?;
-        for (key, value) in &self.image.pending_sources {
-            pending.insert(key.as_slice(), value.as_slice())?;
-        }
-        drop(pending);
-        let pending_bytes =
-            self.image
-                .pending_sources
-                .iter()
-                .try_fold(0u64, |total, (key, value)| {
-                    total
-                        .checked_add(super::staging_entry_bytes(key.len(), value.len())?)
-                        .ok_or(StoreError::PayloadByteAccountingOverflow)
-                })?;
-        let mut network_metadata = write.open_table(super::BLOB_NETWORK_METADATA)?;
-        network_metadata.insert(
-            super::BLOB_NETWORK_STAGING_ROWS,
-            u64::try_from(self.image.pending_sources.len())
-                .map_err(|_| StoreError::ItemCountAccountingOverflow)?,
-        )?;
-        network_metadata.insert(super::BLOB_NETWORK_STAGING_BYTES, pending_bytes)?;
-        write.open_table(super::METADATA)?.insert(
-            super::BLOB_OPERATION_TOTAL_BYTES,
-            self.image.operation_bytes,
-        )?;
         Ok(())
     }
 }

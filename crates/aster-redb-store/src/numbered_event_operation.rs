@@ -197,7 +197,6 @@ pub enum NumberedEventOperationError {
     GlobalByteLimitExceeded,
     RecoverySnapshotTooLarge,
     LegacyStoreRequiresFreshState,
-    LegacyOperationDisabled,
     ClientNotFound,
     ClientRetired,
     SubscriptionOwnerMismatch,
@@ -229,10 +228,7 @@ impl fmt::Display for NumberedEventOperationError {
                 "publication recovery snapshot exceeds its response bound"
             }
             Self::LegacyStoreRequiresFreshState => {
-                "legacy Event operation state requires a fresh numbered-publication store"
-            }
-            Self::LegacyOperationDisabled => {
-                "legacy Event operation publication is disabled for this store"
+                "retired opaque or Event publication state requires a fresh store"
             }
             Self::SubscriptionOwnerMismatch => "Event subscription belongs to another client",
             Self::ClientRetired => "Event client identity is permanently retired",
@@ -1029,24 +1025,6 @@ pub(crate) fn validate_numbered_cleanup_cursor(
     Ok(())
 }
 
-#[cfg(any(test, feature = "test-utils"))]
-pub(crate) fn legacy_operation_allowed_write(
-    write: &redb::WriteTransaction,
-) -> Result<(), StoreError> {
-    match write
-        .open_table(METADATA)?
-        .get(MODE)?
-        .map(|value| value.value())
-    {
-        None => Ok(()),
-        Some(1) => Err(NumberedEventOperationError::LegacyOperationDisabled.into()),
-        Some(_) => Err(NumberedEventOperationError::Invariant(
-            "numbered Event operation mode is unknown",
-        )
-        .into()),
-    }
-}
-
 pub(crate) fn audit_numbered_tables_write(
     write: &redb::WriteTransaction,
 ) -> Result<NumberedEventOperationStats, StoreError> {
@@ -1092,19 +1070,17 @@ pub(crate) fn audit_numbered_tables_write(
         )
         .into());
     }
+    if present == 0 {
+        crate::require_new_store_write(write)?;
+    }
     let clients = write.open_table(CLIENTS)?;
     let results = write.open_table(RESULTS)?;
     let reverse = write.open_table(RESULT_BY_EVENT)?;
     let numbered_rows = clients.len()? != 0 || results.len()? != 0 || reverse.len()? != 0;
-    let legacy_rows = write.open_table(EVENT_OPERATION_LEDGER_V3)?.len()? != 0
-        || write.open_table(ACTIVE_OPERATION_BY_EVENT_V1)?.len()? != 0;
     let mode = write
         .open_table(METADATA)?
         .get(MODE)?
         .map(|value| value.value());
-    if legacy_rows && (numbered_rows || mode == Some(1)) {
-        return Err(NumberedEventOperationError::LegacyStoreRequiresFreshState.into());
-    }
     match mode {
         None if numbered_rows => {
             return Err(NumberedEventOperationError::Invariant(
@@ -1302,18 +1278,11 @@ pub(crate) fn audit_numbered_tables_read(
         )
         .into());
     }
-    let legacy_rows = (regular.contains(EVENT_OPERATION_LEDGER_V3.name())
-        && read.open_table(EVENT_OPERATION_LEDGER_V3)?.len()? != 0)
-        || (regular.contains(ACTIVE_OPERATION_BY_EVENT_V1.name())
-            && read.open_table(ACTIVE_OPERATION_BY_EVENT_V1)?.len()? != 0);
     let mode = read
         .open_table(METADATA)?
         .get(MODE)?
         .map(|value| value.value());
     if present == 0 {
-        if legacy_rows && mode == Some(1) {
-            return Err(NumberedEventOperationError::LegacyStoreRequiresFreshState.into());
-        }
         if let Some(value) = mode
             && value != 1
         {
@@ -1357,9 +1326,6 @@ pub(crate) fn audit_numbered_tables_read(
     let results = read.open_table(RESULTS)?;
     let reverse = read.open_table(RESULT_BY_EVENT)?;
     let numbered_rows = clients.len()? != 0 || results.len()? != 0 || reverse.len()? != 0;
-    if legacy_rows && (numbered_rows || mode == Some(1)) {
-        return Err(NumberedEventOperationError::LegacyStoreRequiresFreshState.into());
-    }
     match mode {
         None if numbered_rows => {
             return Err(NumberedEventOperationError::Invariant(
@@ -1779,6 +1745,18 @@ pub(crate) fn client_snapshot_revision_for_test(
 ) -> Result<u64, StoreError> {
     let write = store.database.begin_write()?;
     Ok(load_client_write(&write, client)?.snapshot_revision)
+}
+
+#[cfg(test)]
+pub(crate) fn result_for_test(
+    store: &crate::Store,
+    client: &EventClientId,
+    sequence: EventOperationSequence,
+) -> Result<Option<NumberedEventResult>, StoreError> {
+    let write = store.database.begin_write()?;
+    load_result_write(&write, client, sequence)?
+        .map(|result| canonical_numbered_result_write(&write, result).map(|(result, _)| result))
+        .transpose()
 }
 
 fn load_result_write(
@@ -3107,29 +3085,11 @@ mod tests {
     }
 
     fn fixture_legacy_row(write: &redb::WriteTransaction) {
-        use crate::event_operation::{
-            EVENT_OPERATION_LEDGER_V3, EventOperationLedgerRecord, EventOperationStats,
-            encode_event_operation_ledger_record, write_event_operation_stats,
-        };
-        let encoded = encode_event_operation_ledger_record(EventOperationLedgerRecord::Retired {
-            intent_digest: [0x75; 32],
-            reason: CustodyRetirementReason::Expired,
-        });
         write
             .open_table(EVENT_OPERATION_LEDGER_V3)
-            .expect("legacy ledger")
-            .insert([0x76; 32].as_slice(), encoded.as_slice())
-            .expect("legacy row");
-        write_event_operation_stats(
-            &mut write.open_table(METADATA).expect("metadata"),
-            EventOperationStats {
-                records_total: 1,
-                records_retired: 1,
-                logical_bytes: 67,
-                ..EventOperationStats::default()
-            },
-        )
-        .expect("legacy accounting");
+            .unwrap()
+            .insert(b"retired".as_slice(), b"retired".as_slice())
+            .unwrap();
     }
 
     fn assert_invariant(error: &StoreError, message: &'static str) {
@@ -3262,7 +3222,7 @@ mod tests {
     }
 
     #[test]
-    fn reopen_and_legacy_write_reject_unknown_mode() {
+    fn reopen_rejects_unknown_mode() {
         let file = CorruptionFile::new("unknown-mode");
         let store = file.open();
         let write = store.database.begin_write().expect("write");
@@ -3271,10 +3231,6 @@ mod tests {
             .expect("metadata")
             .insert(MODE, 2)
             .expect("unknown mode");
-        assert_invariant(
-            &legacy_operation_allowed_write(&write).expect_err("legacy write must reject"),
-            "numbered Event operation mode is unknown",
-        );
         write.commit().expect("commit");
         drop(store);
         assert_reopen_and_inspect_invariant(&file, "numbered Event operation mode is unknown");

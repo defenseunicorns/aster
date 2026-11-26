@@ -98,7 +98,7 @@ configuration, service identity, and supervisor procedure.
    mode, store use, durable operation headroom, and pending-delivery pressure.
 
 5. Run the publish/subscription flow with the generated Rust reference client,
-   then the generated Go compatibility client. Preserve operation keys across
+   then the generated Go client. Preserve the numbered publication journal across
    uncertain retries and acknowledge only after the application commits its
    effect durably.
 
@@ -123,63 +123,22 @@ required.
 | --- | --- |
 | `/livez` is unavailable or `503` | Inspect sanitized service telemetry; do not send work. |
 | `/readyz` is `503` | Wait for Ready or resolve startup/draining failure. |
-| Distinct accepted publish-operation keys reach 512 | Plan intervention; this is the profile warning level, separate from configured-ledger occupancy warnings. |
-| Distinct accepted publish-operation keys reach 1,024 | Stop new publication; preserve existing operation keys and the state directory for inspection. |
-| Pending deliveries reach 256 | Stop increasing workload and drain or repair consumers. |
-| `OPERATION_CAPACITY_EXHAUSTED` | Do not retry with new keys; escalate for controlled recovery. |
+| Publication capacity is exhausted | Retain the journal and original sequence; drain acknowledged results and inspect configured client limits. |
 | Unacknowledged Event returns after restart | Commit idempotently, then acknowledge the stable Event identity. |
 
-The 1,024-key boundary counts distinct accepted publish-operation keys over the
-entire state-directory lifetime, including restarts. It is an operator/harness
-stop, not an enforced store admission limit. The
-[accepted containment contract](../validation/linux-event-mvp-evaluation-profile-v0.1.md#durable-publish-operation-containment)
-selects a separate permanent ledger quota:
+Use the [numbered client lifecycle guide](../quickstart/event-client-lifecycle.md)
+for capacity inspection, journal recovery, admission tuning and permanent
+client retirement. Publication uses a stable client, fenced session and
+contiguous sequence, not an unbounded collection of caller-chosen keys.
 
-- `storage.operations.max_records = 1_000_000` records;
-- `storage.operations.max_logical_bytes = 201_326_592` logical ledger and
-  reverse-index bytes (192 MiB); and
-- `storage.operations.emergency_reserve = 10_000` records, with corresponding
-  byte headroom reserved from ordinary publication.
+After an unclean shutdown, preserve the state directory and publication
+journals. Let the supported store open and SDK recovery validate retained
+state before publishing again. Unsupported historical Event ledgers fail open
+without mutation, migration or reset. Do not delete state to bypass a refusal.
 
-Confirm these configured ceilings and ordinary/emergency headroom in
-authenticated `GetStatus`, separately from profile headroom and warning state.
-The aggregate Event/control store quota is separate and can stop admission
-earlier. These are logical quotas, not physical database-size limits or
-qualification of a workload above 1,024 operations. The
-[register records the selected capacity boundary](../validation/linux-event-mvp-evaluation-profile-v0.1-register.md#selected-operation-ledger-capacity-boundary).
-
-Configured-ledger exhaustion returns Connect `ResourceExhausted` with
-`OPERATION_CAPACITY_EXHAUSTED`, `retryable = false`, and no retry delay. Do not
-retry indefinitely or change keys to bypass it. For an unknown publication
-outcome, retain the original key and identical intent: exact retries add no
-ledger record. An exact retry of a retired operation remains the selected-node
-`ExpiredOrRetired` cause (Connect `NotFound` / `MISSING_DURABLE_OBJECT`);
-changed intent remains a conflict, and retirement never permits key reuse.
-
-Do not delete or replace the state directory to recover same-mission capacity;
-that invalidates durability and restart claims. Preserve it for inspection and
-follow the audit procedure below after unclean recovery.
-
-Do not raise limits during a candidate run. A changed limit changes the tested
-profile.
-
-## After unclean redb recovery
-
-After any unclean redb storage recovery, stop the service and confirm that no
-node process owns the state directory. Before resuming publication, run the
-complete offline operation-ledger audit on the recovered v3 store:
-
-```sh
-aster inspect --state DIR --audit-event-operations
-```
-
-Require a successful command and retain its `EVENT_OPERATION_AUDIT` receipt
-with `state=complete` and equal `scanned`/`total` counts. Counts include both
-ledger and active reverse-index rows. This complete audit is also required for
-release qualification; startup readiness and a background audit still in
-progress do not replace it. The inspection command does not repair or migrate
-the store. On failure, keep publication stopped and escalate with the sanitized
-receipt.
+The frozen [v0.1 evaluation profile](../validation/linux-event-mvp-evaluation-profile-v0.1.md)
+retains its original operation-ledger capacity and qualification requirements;
+those results do not qualify numbered publication or the v9 network.
 
 ## Reload the application bearer token
 

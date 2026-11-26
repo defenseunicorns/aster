@@ -96,7 +96,6 @@ Blob profile and map-unit contract is machine checked:
 {
   "schema": 1,
   "surface": "recipes",
-  "semantic_v7_v8_profile": "4:BlobRangesStreamV1",
   "semantic_v9_profile": "5:BlobStreamV1",
   "map_unit": "1048576-byte native plaintext segment",
   "record": "ASTRBS02, at most 1048706 bytes",
@@ -104,7 +103,7 @@ Blob profile and map-unit contract is machine checked:
 }
 ```
 <!-- ASTER-BLOB-CAPABILITY:RENDERED -->
-Semantic v7/v8 selects profile 4 BlobRangesStreamV1; semantic v9 selects profile 5 BlobStreamV1. Profile 5 maps 1,048,576-byte plaintext segments into append-only ASTRBS02 records of at most 1,048,706 bytes and sends one complete length-prefixed record per DATA body, at most 1,048,710 bytes, without repacking or re-encryption.
+The hybrid network requires semantic v9 and profile 5 BlobStreamV1. Profile 5 maps 1,048,576-byte plaintext segments into append-only ASTRBS02 records of at most 1,048,706 bytes and sends one complete length-prefixed record per DATA body, at most 1,048,710 bytes, without repacking or re-encryption.
 <!-- ASTER-BLOB-CAPABILITY:END -->
 
 Each returned chunk or page is authenticated, but whole-content verification

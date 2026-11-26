@@ -438,10 +438,6 @@ async fn sample_status(events: &SelectedEventHandle, r: &mut Receipt) -> Result<
         stats.clients == 10 && stats.reverse_edges == stats.outstanding_results,
         "numbered accounting",
     )?;
-    require(
-        status.event_operation_capacity.stats.records_total == 0,
-        "ordinary publication ledger must remain empty",
-    )?;
     r.peak_results = r.peak_results.max(stats.outstanding_results);
     r.peak_record_rows = r
         .peak_record_rows

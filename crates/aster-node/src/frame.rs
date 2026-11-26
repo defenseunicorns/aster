@@ -348,6 +348,7 @@ pub(crate) struct BlobObjectId([u8; 33]);
 impl BlobObjectId {
     const BLOB_CHUNK_KIND: u8 = 2;
 
+    #[cfg(test)]
     pub(crate) fn new(digest: [u8; 32]) -> Self {
         let mut bytes = [0u8; 33];
         bytes[0] = Self::BLOB_CHUNK_KIND;

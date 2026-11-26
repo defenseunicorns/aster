@@ -76,7 +76,9 @@ use zeroize::Zeroize;
 /// negotiated inside the authenticated handshake.
 pub(crate) const PROTOCOL_VERSION: u16 = 1;
 pub(crate) const SEMANTIC_PROTOCOL_V1: u16 = 1;
+#[cfg(test)]
 pub(crate) const SEMANTIC_PROTOCOL_V2: u16 = 2;
+#[cfg(test)]
 pub(crate) const SEMANTIC_PROTOCOL_V3: u16 = 3;
 pub(crate) const SEMANTIC_PROTOCOL_V4: u16 = 4;
 pub(crate) const SEMANTIC_PROTOCOL_V5: u16 = 5;
@@ -90,17 +92,7 @@ const NONCE_LEN: usize = 12;
 const HASH_LEN: usize = 32;
 const MAX_OFFERED_VERSIONS: usize = 16;
 const MAX_OFFERED_SUITES: usize = 16;
-pub(crate) const SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS: &[u16] = &[
-    SEMANTIC_PROTOCOL_V9,
-    SEMANTIC_PROTOCOL_V8,
-    SEMANTIC_PROTOCOL_V7,
-    SEMANTIC_PROTOCOL_V6,
-    SEMANTIC_PROTOCOL_V5,
-    SEMANTIC_PROTOCOL_V4,
-    SEMANTIC_PROTOCOL_V3,
-    SEMANTIC_PROTOCOL_V2,
-    SEMANTIC_PROTOCOL_V1,
-];
+pub(crate) const SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS: &[u16] = &[SEMANTIC_PROTOCOL_V9];
 // Preference order is policy, never numeric suite-ID order.
 const SUPPORTED_HYBRID_SUITES: &[u16] = &[HYBRID_SUITE_ID];
 const HYBRID_SUITE_LABEL: &[u8] =
@@ -2310,7 +2302,7 @@ mod tests {
     }
 
     fn complete_handshake(seed: u64) -> CompletedHandshake {
-        complete_handshake_with_versions(seed, vec![SEMANTIC_PROTOCOL_V1])
+        complete_handshake_with_versions(seed, vec![SEMANTIC_PROTOCOL_V9])
     }
 
     fn complete_handshake_with_versions(
@@ -2389,8 +2381,14 @@ mod tests {
     #[test]
     fn hybrid_handshake_agrees_on_directional_keys_and_fresh_runs_differ() {
         let first = complete_handshake(6);
-        assert_eq!(first.initiator_session.selected_version(), PROTOCOL_VERSION);
-        assert_eq!(first.responder_session.selected_version(), PROTOCOL_VERSION);
+        assert_eq!(
+            first.initiator_session.selected_version(),
+            SEMANTIC_PROTOCOL_V9
+        );
+        assert_eq!(
+            first.responder_session.selected_version(),
+            SEMANTIC_PROTOCOL_V9
+        );
         assert_eq!(
             first.initiator_session.transmit.expose(),
             first.responder_session.receive.expose()
@@ -2412,48 +2410,6 @@ mod tests {
         assert_ne!(
             first.initiator_session.transcript_hash,
             second.initiator_session.transcript_hash
-        );
-    }
-
-    #[test]
-    fn selected_semantic_version_is_bound_into_fresh_record_keys() {
-        let v1 = complete_handshake_with_versions(8_100, vec![SEMANTIC_PROTOCOL_V1]);
-        let v2 = complete_handshake_with_versions(
-            8_100,
-            vec![SEMANTIC_PROTOCOL_V2, SEMANTIC_PROTOCOL_V1],
-        );
-        assert_eq!(
-            v1.initiator_session.selected_version(),
-            SEMANTIC_PROTOCOL_V1
-        );
-        assert_eq!(
-            v2.initiator_session.selected_version(),
-            SEMANTIC_PROTOCOL_V2
-        );
-        assert_ne!(
-            v1.initiator_session.transmit.expose(),
-            v2.initiator_session.transmit.expose()
-        );
-
-        let CompletedHandshake {
-            mut initiator_provider,
-            initiator_session,
-            ..
-        } = v2;
-        let mut v2_channel = initiator_session.into_channel();
-        let v2_record = v2_channel
-            .seal(&mut initiator_provider, b"semantic-bound", b"test-aad")
-            .unwrap();
-
-        let CompletedHandshake {
-            responder_provider,
-            responder_session,
-            ..
-        } = v1;
-        let mut v1_channel = responder_session.into_channel();
-        assert_eq!(
-            v1_channel.open(&responder_provider, &v2_record, b"test-aad"),
-            Err(CryptoError::AuthenticationFailed)
         );
     }
 
@@ -2482,7 +2438,7 @@ mod tests {
         assert!(matches!(
             InitiatorHandshake::start(
                 &mut initiator_provider,
-                vec![PROTOCOL_VERSION, PROTOCOL_VERSION],
+                vec![SEMANTIC_PROTOCOL_V9, SEMANTIC_PROTOCOL_V9],
                 vec![HYBRID_SUITE_ID]
             ),
             Err(CryptoError::InvalidVersionOffer)
@@ -2490,19 +2446,23 @@ mod tests {
         assert!(matches!(
             InitiatorHandshake::start(
                 &mut initiator_provider,
-                vec![PROTOCOL_VERSION, PROTOCOL_VERSION + 1],
+                vec![SEMANTIC_PROTOCOL_V9, SEMANTIC_PROTOCOL_V9 + 1],
                 vec![HYBRID_SUITE_ID]
             ),
             Err(CryptoError::InvalidVersionOffer)
         ));
         assert!(matches!(
-            InitiatorHandshake::start(&mut initiator_provider, vec![PROTOCOL_VERSION], Vec::new()),
+            InitiatorHandshake::start(
+                &mut initiator_provider,
+                vec![SEMANTIC_PROTOCOL_V9],
+                Vec::new()
+            ),
             Err(CryptoError::InvalidSuiteOffer)
         ));
         assert!(matches!(
             InitiatorHandshake::start(
                 &mut initiator_provider,
-                vec![PROTOCOL_VERSION],
+                vec![SEMANTIC_PROTOCOL_V9],
                 too_many_suites
             ),
             Err(CryptoError::InvalidSuiteOffer)
@@ -2510,7 +2470,7 @@ mod tests {
         assert!(matches!(
             InitiatorHandshake::start(
                 &mut initiator_provider,
-                vec![PROTOCOL_VERSION],
+                vec![SEMANTIC_PROTOCOL_V9],
                 vec![HYBRID_SUITE_ID, HYBRID_SUITE_ID]
             ),
             Err(CryptoError::InvalidSuiteOffer)
@@ -2518,7 +2478,7 @@ mod tests {
         assert!(matches!(
             InitiatorHandshake::start(
                 &mut initiator_provider,
-                vec![PROTOCOL_VERSION],
+                vec![SEMANTIC_PROTOCOL_V9],
                 vec![HYBRID_SUITE_ID, HYBRID_SUITE_ID + 1]
             ),
             Err(CryptoError::InvalidSuiteOffer)
@@ -2534,7 +2494,7 @@ mod tests {
         assert!(matches!(
             InitiatorHandshake::start(
                 &mut initiator_provider,
-                vec![PROTOCOL_VERSION],
+                vec![SEMANTIC_PROTOCOL_V9],
                 vec![HYBRID_SUITE_ID + 1]
             ),
             Err(CryptoError::UnsupportedSuite)
@@ -2542,51 +2502,7 @@ mod tests {
     }
 
     #[test]
-    fn responder_selects_v2_and_falls_back_for_a_v1_only_peer() {
-        let mut initiator_provider = provider(7_002);
-        let mut responder_provider = provider(17_002);
-        let (_initiator, hello) = InitiatorHandshake::start(
-            &mut initiator_provider,
-            vec![PROTOCOL_VERSION + 1, PROTOCOL_VERSION],
-            vec![0x0202, HYBRID_SUITE_ID],
-        )
-        .unwrap_or_else(|error| panic!("client start failed: {error}"));
-
-        let prepared = ResponderHandshakePrepared::respond(&mut responder_provider, &hello)
-            .unwrap_or_else(|error| panic!("server preparation failed: {error}"));
-        assert_eq!(prepared.public_hello.selected_version, SEMANTIC_PROTOCOL_V2);
-        assert_eq!(prepared.public_hello.selected_suite, HYBRID_SUITE_ID);
-
-        let mut unsupported_version = hello.clone();
-        unsupported_version.supported_versions = vec![SEMANTIC_PROTOCOL_V9 + 1];
-        assert!(matches!(
-            ResponderHandshakePrepared::respond(&mut responder_provider, &unsupported_version),
-            Err(CryptoError::UnsupportedProtocolVersion)
-        ));
-
-        let (_v1_initiator, v1_hello) = InitiatorHandshake::start(
-            &mut initiator_provider,
-            vec![SEMANTIC_PROTOCOL_V1],
-            vec![HYBRID_SUITE_ID],
-        )
-        .unwrap_or_else(|error| panic!("v1 client start failed: {error}"));
-        let v1_prepared = ResponderHandshakePrepared::respond(&mut responder_provider, &v1_hello)
-            .unwrap_or_else(|error| panic!("v1 server preparation failed: {error}"));
-        assert_eq!(
-            v1_prepared.public_hello.selected_version,
-            SEMANTIC_PROTOCOL_V1
-        );
-
-        let mut unsupported_suite = hello;
-        unsupported_suite.offered_suites = vec![0x0202];
-        assert!(matches!(
-            ResponderHandshakePrepared::respond(&mut responder_provider, &unsupported_suite),
-            Err(CryptoError::UnsupportedSuite)
-        ));
-    }
-
-    #[test]
-    fn semantic_v9_selects_v9_and_falls_back_to_v8_and_v7_peers() {
+    fn semantic_v9_rejects_v8_and_v7_peers() {
         assert_eq!(
             select_highest_common_version(
                 SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS,
@@ -2599,7 +2515,7 @@ mod tests {
                 SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS,
                 &[SEMANTIC_PROTOCOL_V8, SEMANTIC_PROTOCOL_V7],
             ),
-            Ok(SEMANTIC_PROTOCOL_V8)
+            Err(CryptoError::UnsupportedProtocolVersion)
         );
         assert_eq!(
             select_highest_common_version(
@@ -2614,7 +2530,7 @@ mod tests {
                     SEMANTIC_PROTOCOL_V1,
                 ],
             ),
-            Ok(SEMANTIC_PROTOCOL_V7)
+            Err(CryptoError::UnsupportedProtocolVersion)
         );
     }
 
@@ -2628,7 +2544,7 @@ mod tests {
 
         let (state, hello) = InitiatorHandshake::start(
             &mut initiator_provider,
-            vec![PROTOCOL_VERSION],
+            vec![SEMANTIC_PROTOCOL_V9],
             vec![HYBRID_SUITE_ID],
         )
         .unwrap_or_else(|error| panic!("client start failed: {error}"));
@@ -2641,7 +2557,7 @@ mod tests {
                 b"server credential",
             )
             .unwrap_or_else(|error| panic!("server response failed: {error}"));
-        response.selected_version = PROTOCOL_VERSION + 1;
+        response.selected_version = SEMANTIC_PROTOCOL_V9 + 1;
         assert!(matches!(
             state.open_server_auth(&initiator_provider, &response),
             Err(CryptoError::UnsupportedProtocolVersion)
@@ -2649,7 +2565,7 @@ mod tests {
 
         let (state, hello) = InitiatorHandshake::start(
             &mut initiator_provider,
-            vec![PROTOCOL_VERSION],
+            vec![SEMANTIC_PROTOCOL_V9],
             vec![HYBRID_SUITE_ID],
         )
         .unwrap_or_else(|error| panic!("client start failed: {error}"));
@@ -2671,59 +2587,26 @@ mod tests {
 
     #[test]
     fn transcript_binds_the_complete_version_offer_against_downgrade() {
-        for (seed, stripped_versions) in [
-            (
-                7_004,
-                vec![
-                    SEMANTIC_PROTOCOL_V4,
-                    SEMANTIC_PROTOCOL_V3,
-                    SEMANTIC_PROTOCOL_V2,
-                    SEMANTIC_PROTOCOL_V1,
-                ],
-            ),
-            (7_005, vec![SEMANTIC_PROTOCOL_V2, SEMANTIC_PROTOCOL_V1]),
-            (7_006, vec![SEMANTIC_PROTOCOL_V1]),
-        ] {
-            let mut initiator_provider = provider(seed);
-            let mut responder_provider = provider(seed.wrapping_add(10_000));
-            let responder_key = responder_provider
-                .generate_signing_key()
-                .unwrap_or_else(|error| panic!("key generation failed: {error}"));
-            let (initiator_state, mut stripped_hello) = InitiatorHandshake::start(
-                &mut initiator_provider,
-                SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS.to_vec(),
-                vec![HYBRID_SUITE_ID],
+        let mut initiator_provider = provider(7_004);
+        let mut responder_provider = provider(17_004);
+        let responder_key = responder_provider.generate_signing_key().unwrap();
+        let (initiator, mut hello) =
+            InitiatorHandshake::start(&mut initiator_provider, vec![10, 9], vec![HYBRID_SUITE_ID])
+                .unwrap();
+        hello.supported_versions = vec![9];
+        let prepared =
+            ResponderHandshakePrepared::respond(&mut responder_provider, &hello).unwrap();
+        let (_, response) = prepared
+            .seal_server_auth(
+                &mut responder_provider,
+                &responder_key,
+                b"server credential",
             )
-            .unwrap_or_else(|error| panic!("client start failed: {error}"));
-            assert_eq!(
-                stripped_hello.supported_versions,
-                vec![
-                    SEMANTIC_PROTOCOL_V9,
-                    SEMANTIC_PROTOCOL_V8,
-                    SEMANTIC_PROTOCOL_V7,
-                    SEMANTIC_PROTOCOL_V6,
-                    SEMANTIC_PROTOCOL_V5,
-                    SEMANTIC_PROTOCOL_V4,
-                    SEMANTIC_PROTOCOL_V3,
-                    SEMANTIC_PROTOCOL_V2,
-                    SEMANTIC_PROTOCOL_V1
-                ]
-            );
-
-            stripped_hello.supported_versions = stripped_versions;
-            let prepared =
-                ResponderHandshakePrepared::respond(&mut responder_provider, &stripped_hello)
-                    .unwrap_or_else(|error| panic!("server preparation failed: {error}"));
-            let (_responder_state, server_hello) = prepared
-                .seal_server_auth(
-                    &mut responder_provider,
-                    &responder_key,
-                    b"server credential",
-                )
-                .unwrap_or_else(|error| panic!("server response failed: {error}"));
-            let result = initiator_state.open_server_auth(&initiator_provider, &server_hello);
-            assert!(matches!(result, Err(CryptoError::KeyConfirmationFailed)));
-        }
+            .unwrap();
+        assert!(matches!(
+            initiator.open_server_auth(&initiator_provider, &response),
+            Err(CryptoError::KeyConfirmationFailed)
+        ));
     }
 
     #[test]
@@ -2735,7 +2618,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("key generation failed: {error}"));
         let (initiator_state, client_hello) = InitiatorHandshake::start(
             &mut initiator_provider,
-            vec![PROTOCOL_VERSION],
+            vec![SEMANTIC_PROTOCOL_V9],
             vec![0x0202, HYBRID_SUITE_ID],
         )
         .unwrap_or_else(|error| panic!("client start failed: {error}"));
@@ -2768,7 +2651,7 @@ mod tests {
 
         let (state, hello) = InitiatorHandshake::start(
             &mut initiator_provider,
-            vec![PROTOCOL_VERSION],
+            vec![SEMANTIC_PROTOCOL_V9],
             vec![HYBRID_SUITE_ID],
         )
         .unwrap_or_else(|error| panic!("client start failed: {error}"));
@@ -2790,7 +2673,7 @@ mod tests {
 
         let (state, hello) = InitiatorHandshake::start(
             &mut initiator_provider,
-            vec![PROTOCOL_VERSION],
+            vec![SEMANTIC_PROTOCOL_V9],
             vec![HYBRID_SUITE_ID],
         )
         .unwrap_or_else(|error| panic!("client start failed: {error}"));

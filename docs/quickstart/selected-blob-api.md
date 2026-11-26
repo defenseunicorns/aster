@@ -38,12 +38,8 @@ publication and streaming `read_into`. Semantic v9 selects `BlobStreamV1`:
 1-MiB plaintext segments become append-only authenticated `ASTRBS02` records,
 and those same records move over ordered data/control streams without repacking
 or re-encryption. Lifecycle-owned provisional source or upload state plus the
-native pack checkpoint journal authorize resume. Semantic
-v7/v8 profile 4 remains a compatibility
-path for `BlobRangesStreamV1`; v7 admits durable work only and v8 also admits
-authenticated finite custody. A profile-5 attempt never falls back in place to
-profile 4. `EventPagesV1` is Event-only. The default semantic offer is
-`[9, 8, 7, 6, 5, 4, 3, 2, 1]`; profile-4 formats remain unchanged.
+native pack checkpoint journal authorize resume. The hybrid semantic offer is
+`[9]`; Blob requires profile 5. `EventPagesV1` is Event-only.
 
 Profile 5 uses one native pack representation for local upload, durable
 storage, and network transfer. A plaintext segment is 1,048,576 bytes, a
@@ -502,73 +498,25 @@ bounded pipeline into lifecycle-owned provisional source state and the native
 pack checkpoint journal. It atomically promotes only after terminal-root
 verification and before RESULT. RESULT_ACK or EOF settles only the attempt and
 owns no durable resume state. Interrupted attempts resume from that provisional
-state and journal. Semantic-v7/v8 profile 4
-remains the compatibility path described below. The receiver's completed
+state and journal. The receiver's completed
 publication and page reads survive another peerless restart.
 
-### Semantic-v7/v8 profile-4 compatibility
+### Contact policy
 
-The provider turns that exact topic/scope and the current epoch into an opaque
-32-byte peer proof inside the protected v7/v8 contact. Every Blob inventory,
-source, and range send requires the authenticated peer to have both the current
-content proof and current route authorization and to remain nonrevoked.
-Route-only peers cannot use the selected Blob lane. The source-envelope and
-complete manifest plan reconcile first; carrier requests begin only after that
-pending source is durably staged.
+The receiver needs an exact topic/scope interest and current content and route
+authorization. Route-only peers cannot use the Blob lane. Normal and `AtLeast`
+run eligible Blob work; `AtLeast` filters Event only. `ReceiveOnly` performs no
+Blob work. On a supported custody clock, profile 5 carries both durable and
+finite publications. Bounded lower-priority pressure recovery remains internal.
 
-Each scheduled range extends one exact contiguous prefix by at most 16 KiB. A
-bounded `ABRS` schedule receives indexed Data or Unavailable `ABRD` records
-and one schedule-bound `ABRE` terminal plus FIN; there is no per-range storage
-Result/Ack. The prefix is peer-neutral: its durable key is the source transfer
-ID plus strict kind-2 carrier ID, not the peer or session, so after
-runtime/store/provider-cache teardown and reopen any other eligible content
-peer can continue at the first missing byte. A valid terminal authorizes the
-turn's completion and cursor outcome but is not proof of remote storage.
+The receiver stages provisional source and native pack state, verifies content
+and current lineage, then atomically promotes the completed publication before
+RESULT. Interrupted attempts resume from the durable checkpoint. Same-epoch
+physical-lineage conflicts require advancing the numeric epoch.
 
-Network admission is bounded to 64 MiB of plaintext and 1,024 chunks. Pending
-source/manifest/prefix state is bounded to 10,000 rows and 64 MiB. A pending
-source, partial prefix, and even carrier-complete depot are not an ordinary Blob
-publication. Visibility appears only after the exact depot completion, a fresh
-provider pass that decrypts/authenticates every chunk and whole Blob, and a
-fresh current route/physical-lineage proof agree in one redb promotion
-transaction.
-
-Same-epoch key replacement invalidates old peer proofs and withholds old rows,
-but it is not a transparent physical replacement. Redb rejects another physical
-lineage for the same `(BlobID, content group, numeric epoch)` with
-`PhysicalLineageConflict`; republishing or resuming that Blob requires advancing
-the numeric epoch.
-
-Terminal or stale cleanup therefore does not erase the last physical-lineage
-witness. It removes pending source, prefix, and authenticated-cache visibility,
-but deliberately retains the exact depot import, its expected or committed
-chunk rows, any chunk files and finalized digest already present, and their
-reserved/committed accounting. That bounded staging is not a publication and
-cannot be read or served; it remains charged to the configured depot byte,
-chunk, and variant quotas until exact manifest-backed reclamation finalizes.
-Bounded maintenance can reclaim authorized unreferenced variants; an
-exact-lineage retry can resume retained staging, while a different lineage at
-the same numeric epoch still fails and must advance the epoch.
-
-Source/store/cache transitions are locally serialized. A successful abort
-removes the old authenticated claim, rereads durable source state, and freshly
-authenticates any exact concurrent restage before restoring its claim. A
-terminal content-verification failure aborts only the exact pending source and
-is cursor-neutral. Successful terminal source rotation uses the
-lexicographically greatest carrier ID, not the last manifest record.
-
-Normal and `AtLeast` run eligible v7/v8 profile-4 Blob work because `AtLeast`
-filters Event only.
-`ReceiveOnly` advertises, requests, stages, promotes, and counts zero Blob work.
-The live handle does not change those contact rules. On a host with a supported custody clock, the Rust
-`publish_with_options` surface activates local finite Blob publication and
-expiry. Semantic v9/profile 5 carries eligible durable or finite publications;
-on compatibility profile 4, v8 permits finite custody while v7 remains
-durable-only. Bounded strictly-lower-priority pressure recovery remains internal.
-Route-only Blob relay/custody, a metadata-independent whole-byte identity, and
-Blob TTL fields in the FFI surface are not implemented. The selected Linux
-local-agent path exposes TTL controls but not application subscriptions or
-transfer-status operations.
+Route-only Blob relay/custody and Blob TTL fields in the FFI surface are not
+implemented. The Linux local-agent path exposes TTL controls but not application
+subscriptions or transfer-status operations.
 
 `publish` requires a seekable source because it makes two bounded passes. The
 first computes the whole-content and per-chunk digests with one bounded,

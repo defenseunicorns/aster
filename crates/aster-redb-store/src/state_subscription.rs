@@ -1828,7 +1828,7 @@ pub(crate) fn state_subscription_schema_wholly_absent_read(
 
 pub(crate) fn audit_state_subscription_tables(
     write: &redb::WriteTransaction,
-    exact_legacy_state_extensions: bool,
+    initializing_state: bool,
 ) -> Result<StateSubscriptionStats, StoreError> {
     if write.list_multimap_tables()?.any(|table| {
         table.name() == STATE_SUBSCRIPTIONS.name()
@@ -1865,7 +1865,7 @@ pub(crate) fn audit_state_subscription_tables(
     };
     let metadata_present = metadata_presence.iter().filter(|present| **present).count();
     if tables_present == 0 && metadata_present == 0 {
-        if !exact_legacy_state_extensions {
+        if !initializing_state {
             return Err(StoreError::StateInvariant(
                 "State subscription schema group is incomplete",
             ));

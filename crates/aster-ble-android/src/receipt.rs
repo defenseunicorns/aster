@@ -179,11 +179,6 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    const V9_PROFILE_DIGEST: [u8; 32] = [
-        0xac, 0xe5, 0xad, 0x78, 0xfa, 0x87, 0x20, 0x39, 0x40, 0x22, 0x1a, 0xbc, 0x2a, 0x90, 0x61,
-        0x44, 0xbf, 0xb0, 0xca, 0xd7, 0x4f, 0xca, 0xfc, 0x50, 0x89, 0xb5, 0x75, 0x97, 0x1d, 0x63,
-        0x59, 0x6f,
-    ];
     static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
 
     struct TestConfig {
@@ -233,7 +228,9 @@ mod tests {
     fn valid_receipt() -> PeerReceipt {
         PeerReceipt {
             semantic_version: 9,
-            transfer_profile_digest: Some(V9_PROFILE_DIGEST),
+            transfer_profile_digest: Some(
+                canonical_v9_profile_digest().expect("current profile digest"),
+            ),
             negotiated_transfer_profiles: Some([2, 1, 1, 5, 1]),
             mission_peer: Some([0x11; 32]),
             fetched: 1,

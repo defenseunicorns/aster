@@ -281,9 +281,9 @@ are recorded separately in the
 - Canonical ordered semantic-version and complete-suite offers, with selection
   bound into the transcript, KDF, key confirmations, and hybrid authentication;
   there is no algorithm-by-algorithm mixing. The stable framing/profile remains
-  `1`, the default semantic offer is `[8, 7, 6, 5, 4, 3, 2, 1]`, and profile 1
+  `1`, the hybrid semantic offer is `[9]`, and profile 1
   has one registered complete suite.
-- Semantic-v7 profile, plan, header, page, and terminal records bind semantic
+- Event profile, plan, header, page, and terminal records bind semantic
   version, the canonical transfer-profile digest, lane, selected profile, and
   direction in record AAD. They retain the session's single directional send
   sequence but use a receive replay window separate from ordinary frames and
@@ -531,9 +531,8 @@ claimed or implemented.
 ### Selected semantic-v4 mutable availability and lineage
 
 State and Record reconciliation is enabled only after the hybrid mission
-session selects semantic version 4 through 8. The v1-v3 Event compatibility paths do not
-accept, act on, or expose mutable interests, inventory, IDs, objects, results,
-or finish counts. Within v4-v8, State and Record and both receiver directions are distinct
+session selects semantic v9 and the `LegacyV6` lane profile. State and Record
+and both receiver directions are distinct
 authenticated lanes. Cross-class/direction substitution, result/ack mismatch,
 and finish-remainder mismatch fail the contact.
 
@@ -567,125 +566,30 @@ contain metadata growth and prevent a fixed lexicographic prefix from starving
 later IDs across repeated partial contacts; they are not evidence of physical
 resource sufficiency or adversarial-link liveness.
 
-Normal and `AtLeast` run the v4-v8 State/Record lanes because `AtLeast` is an Event-only
+Normal and `AtLeast` run the `LegacyV6` State/Record lanes in v9 sessions because `AtLeast` is an Event-only
 threshold. `ReceiveOnly` initiates no contact and discloses no mutable interest,
 inventory, ID, or object. Event last-contact status is deliberately separate
 and is not evidence that State/Record converged. Selected State/Record finite
 TTL is structurally rejected; no mutable forwarding-age/expiry security claim
 is made.
 
-### Selected v7/v8 Blob authorization, staging, and visibility
+### Selected Blob authorization, staging, and visibility
 
-Selected Blob transfer is enabled only after the completed hybrid mission
-session selects semantic version 7 or 8 and both peers authenticate profile 4,
-`BlobRangesStreamV1`. Semantic v7 admits durable work only; v8 also admits
-finite work with an exact verified custody capability. V5/v6 retain historical
-Blob frame allocations but carrier attempts fail before carrier IO; they are
-not a fallback. Stable wire/profile, envelope, carrier, and ABI version 1 remain
-unchanged.
+The hybrid session requires semantic v9 and Blob profile 5 `BlobStreamV1`.
+Content-capable peers must prove current exact topic/scope/epoch authorization;
+route authority alone does not authorize Blob transfer. Revocation and current
+source/content lineage checks still apply throughout the attempt.
 
-The selected network path is direct between content-capable peers. A protected
-exact `(topic, scope, epoch)` interest includes an opaque 32-byte
-`BlobPeerContentProof` minted from the claimant's current content grant and
-bound to mission authority and authenticated NodeID. The sender requires both
-that proof and the peer's current exact route grant; route authority never
-implies content authority. It also rechecks durable revocation and control
-policy. Copying a proof to another identity, changing topic/scope/epoch or
-authority, tampering with it, or replacing the content key at the same epoch
-invalidates it. The proof is repeated and rechecked on every range fetch. This
-does not select the broader route-only Blob relay design.
+The receiver authenticates the protected DATA header and its exact adjacent
+native `ASTRBS02` record. It verifies segments before advancing durable credit.
+Provisional source state and the native pack checkpoint journal own resume;
+RESULT_ACK and EOF settle only the transport attempt. The receiver verifies
+FINISH and complete content, then atomically promotes the publication before
+RESULT. Pending bytes alone cannot appear in ordinary query or read results.
 
-Two independent lineage bindings close same-epoch substitution. Source route
-lineage binds the current authenticated routing grant. A domain-separated
-physical lineage binds the exact current content grant plus mission,
-scope/topic, and epoch. Pending source installation, carrier service, content
-verification, and publication promotion require the exact lineages committed
-by the plan; a provider-minted `CurrentBlobLineage` proves that both are still
-current at promotion. Historical same-epoch rows may remain durable for audit
-or exact local retry, but are not advertised, served, or promoted as current
-network publications. Redb does not transparently replace them: a new physical
-lineage for the same `(BlobID, content group, numeric epoch)` fails with
-`PhysicalLineageConflict`. Republishing or resuming that Blob after same-epoch
-key replacement under a different physical lineage requires advancing the
-numeric epoch. Terminal or stale cleanup does not erase this witness. It retires
-pending source and prefix visibility while retaining the exact depot import,
-expected or committed chunk rows, any chunk files and finalized digest, and
-their reserved/committed accounting. That bounded non-public staging remains
-owner/backing-bound, audited on every open path, and charged to the existing
-byte, chunk, and variant caps. Exact-lineage retry may resume it; a missing
-physical lineage is corruption, and another lineage at the same numeric epoch
-still conflicts.
-
-The lineage witness is a permanent, non-evictable fence with its own row and
-encoded-byte cap. A separate permanent replay fence binds every accepted Blob
-publisher dot to the exact semantic ID, transfer ID, source length, and source
-digest under an independent row/byte cap. Live publication lifecycle rows have
-a third row cap, and exact variant references carry a typed publication or
-pending-source owner. Selected defaults are 65,536 rows and 16 MiB for each
-fence class, plus 65,536 publication lifecycle rows. Capacity exhaustion fails
-admission without removing an older fence or publication. These fences preserve
-durable replay and same-epoch lineage safety; they do not define retention time
-or authorize reclamation.
-
-The source envelope and complete manifest plan are authenticated and staged
-before any carrier range is requested. Prefix progress is durable under the
-exact `(source transfer ID, carrier ObjectID)` and is not owned by a peer or
-session, so any later authenticated, nonrevoked content-capable peer proving the
-same current selector may continue the exact complement. A range is at most 16
-KiB. Network admission is capped at 64 MiB plaintext and 1,024 chunks; pending
-metadata and prefixes are capped at 10,000 rows and 64 MiB. Capacity failure is
-typed deferral and does not evict accepted data or overwrite existing progress.
-Conflicting prefixes and identity, proof, manifest, lineage, AEAD, digest, and
-whole-Blob failures fail closed for the affected exact work.
-
-An authenticated terminal-content failure aborts only the exact pending source
-and its cached claim. The failed turn is cursor-neutral, so corruption cannot
-advance past unrelated work. Successful terminal source rotation, when the
-stream outcome authorizes it, uses the lexicographically greatest canonical
-carrier ID across that source rather than manifest-last.
-
-The authenticated source cache and durable pending-source lifecycle are one
-serialized security boundary. Staging, sender-cache repair, terminal or stale
-abort, and post-abort reconciliation use the same local lifecycle lock without
-holding it over network I/O. Reconciliation removes the retired claim, rereads
-the exact durable projection, and freshly authenticates any concurrent exact
-restage before reinsertion. This prevents a delayed cache write from reviving an
-aborted source or an abort from deleting the winner's authenticated claim.
-
-Blob carrier streaming has no per-range storage Result/Ack. Its authenticated
-terminal plus FIN proves only that the sender finished the scheduled attempts,
-not remote durability. Durable Store prefixes are the sole recovery authority.
-A missing terminal retains accepted prefixes but authorizes no completion,
-publication, or cursor change; a later authenticated empty schedule may promote
-an already complete retained prefix without refetching bytes.
-Both peers must support `BlobRangesStreamV1`; incompatible offers fail before
-inventory, and older semantic Blob carrier attempts fail before carrier IO.
-
-Pending bytes confer no publication authority. Promotion requires the exact
-pending plan, all verified canonical carriers, a matching physical depot
-completion, a fresh provider-owned `VerifiedBlobContentCompletion` obtained by
-streaming/decrypting/authenticating every chunk and whole Blob, and the fresh
-current-lineage proof. Redb compares those bindings and installs all ordinary
-publication/index/counter rows while deleting pending rows in one transaction.
-Until that transaction commits, the Blob is absent from ordinary inventory,
-query, read, and serving surfaces. An interrupted or failed verification cannot
-publish a prefix or a merely carrier-complete object.
-
-All redb open modes cross-audit the pending source, its exact manifest route and
-carrier set, the depot expected plan, and the completed publication namespace.
-A self-consistent missing depot plan, changed canonical carrier record, or one
-source present as both pending and completed is corruption and fails without
-repair. Writable predecessor migration is likewise all-or-none: the four v5
-network tables may be added to the prior nine-table Blob schema only when the
-group is wholly absent and owner attribution is valid; read-only and partial-
-group opens never create or repair tables.
-
-Lifecycle migration follows the same fail-closed rule. Before changing a
-predecessor store, the implementation reconstructs all wrappers, typed roots,
-lineage and replay fences, accounting, and cursors; audits the base schema and
-physical depot; and preflights every lifecycle cap. Only one transaction makes
-that image authoritative. Current-schema open requires exact bidirectional
-agreement and never repairs a partial or contradictory lifecycle image.
+Store opens audit current lifecycle/accounting invariants. Unsupported old
+stores fail without mutation, migration, or reset. Partial or contradictory
+current state is corruption, not permission to repair it.
 
 The application boundary uses the same authority rather than a second Blob
 store. `RunningNode::selected_blobs()` returns a cloneable handle whose publish
@@ -755,7 +659,7 @@ pressure recovery retire exact work as a bounded atomic unit; policy or
 continuity failure otherwise withholds or rejects it. Permanent fences remain,
 and retained retirement records expire after 45 days of accumulated
 conservative lower-bound age. Finite Blob TTL and bounded pressure recovery are
-selected under authenticated semantic-v8 custody on Linux. The selected Linux
+selected under authenticated semantic-v9 custody on Linux. The selected Linux
 local-agent and `asterctl` path exposes bounded Blob publish/read operations
 with durable or finite TTL. Route-only custody, public GC controls, Blob
 subscription/status RPCs and CLI commands remain unimplemented. C ABI v2 and

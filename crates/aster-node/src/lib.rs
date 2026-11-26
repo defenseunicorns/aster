@@ -2,11 +2,11 @@
 //!
 //! The selected runtime composes mission-authenticated ordered carriers, bounded
 //! Negentropy reconciliation, mission-bound redb state, and the existing
-//! `aster-core` source-authenticated Event semantics. Negotiated semantic v3
-//! adds authenticated custody age, finite-TTL forwarding, bounded global and
+//! `aster-core` source-authenticated Event semantics. Semantic v9 supports
+//! authenticated custody age, finite-TTL forwarding, bounded global and
 //! per-scope quotas, priority-aware scheduling, and live
-//! [`EventEmissionPolicy`] control (including receive-only operation), while
-//! v1/v2 remain compatible for durable Events. Its application boundary also
+//! [`EventEmissionPolicy`] control (including receive-only operation).
+//! Its application boundary also
 //! composes source-authenticated latest-value State, explicit-conflict Record,
 //! and immutable Blob operations. State exposes durable positive-current-version
 //! delivery, Record exposes durable whole-projection delivery that never splits
@@ -26,7 +26,6 @@
 //! {
 //!   "schema": 1,
 //!   "surface": "node_api",
-//!   "semantic_v7_v8_profile": "4:BlobRangesStreamV1",
 //!   "semantic_v9_profile": "5:BlobStreamV1",
 //!   "map_unit": "1048576-byte native plaintext segment",
 //!   "record": "ASTRBS02, at most 1048706 bytes",
@@ -34,13 +33,11 @@
 //! }
 //! ```
 //! <!-- ASTER-BLOB-CAPABILITY:RENDERED -->
-//! Semantic v7/v8 selects profile 4 BlobRangesStreamV1; semantic v9 selects profile 5 BlobStreamV1. Profile 5 maps 1,048,576-byte plaintext segments into append-only ASTRBS02 records of at most 1,048,706 bytes and sends one complete length-prefixed record per DATA body, at most 1,048,710 bytes, without repacking or re-encryption.
+//! Semantic v9 selects profile 5 BlobStreamV1. Profile 5 maps 1,048,576-byte plaintext segments into append-only ASTRBS02 records of at most 1,048,706 bytes and sends one complete length-prefixed record per DATA body, at most 1,048,710 bytes, without repacking or re-encryption.
 //! <!-- ASTER-BLOB-CAPABILITY:END -->
 //!
-//! Profile 5 uses receiver-authoritative checkpoints; profile 4 keeps its
-//! historical bounds, v7 is durable-only, and v8 adds authenticated finite
-//! custody. Semantic v5/v6 Blob intent fails instead of falling back to a
-//! historical carrier path.
+//! Profile 5 uses receiver-authoritative checkpoints and authenticated finite
+//! custody. Unsupported semantic versions and Blob profiles are rejected.
 //! Shutdown and zeroization close live application
 //! admission before releasing the actor's store authority, so retained handles
 //! fail closed with [`application::ApplicationErrorKind::StateUnavailable`].
@@ -103,9 +100,8 @@ pub use runtime::{
     OrderedEventContactRole, PeerReceipt, RunningAutomaticEventTransportHandle, RunningNode,
     SelectedForwardingConfig, SoftwareZeroizationPathState, SoftwareZeroizationReceipt,
     SoftwareZeroizationState, SourceInterestSelector, StoreReceipt, TransportNeutralNodeConfig,
-    audit_store_event_operations, ensure_state_accepts_normal_operation,
-    format_control_transfer_id, inspect_store, put_opaque, run_demo, run_demo_scenario, run_node,
-    run_node_with_forwarding, start_externally_supervised_local_node,
+    ensure_state_accepts_normal_operation, format_control_transfer_id, inspect_store, run_demo,
+    run_demo_scenario, run_node, run_node_with_forwarding, start_externally_supervised_local_node,
     start_externally_supervised_transport_neutral_node, start_node, start_node_with_forwarding,
     start_node_with_forwarding_and_output_policy,
     start_supervised_node_with_forwarding_and_output_policy, start_transport_neutral_node,
@@ -321,9 +317,6 @@ pub fn fuzz_structured_v7_mechanics_frame(
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub fn fuzz_decode_mechanics_frame(input: &[u8]) -> bool {
-    if input.starts_with(b"ABRS") {
-        return runtime::blob_ranges_stream::fuzz_schedule(input);
-    }
     let Ok(frame) = frame::Frame::decode(input) else {
         return false;
     };

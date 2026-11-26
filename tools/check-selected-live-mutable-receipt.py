@@ -383,8 +383,6 @@ STOP_KEYS = (
     "carrier_path_transitions",
     "carrier_path_transition_saturations",
     "path_observation",
-    "opaque_items",
-    "opaque_acceptance_markers",
     "events",
     "event_acceptance_markers",
     "route_cached_events",
@@ -419,8 +417,6 @@ STOP_KEYS = (
 )
 STOP_NUMERIC_FIELDS = STOP_KEYS[4:11] + STOP_KEYS[12:-5]
 STOP_EXCLUDED_ZERO_FIELDS = (
-    "opaque_items",
-    "opaque_acceptance_markers",
     "events",
     "event_acceptance_markers",
     "route_cached_events",
