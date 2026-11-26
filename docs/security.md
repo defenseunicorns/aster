@@ -2,14 +2,14 @@
 
 - Version: 0.1.0
 - Status: reference design; production security and integration gates unsatisfied
-- Profile policy: [Decision 0033](decisions/0033-policy-selected-security-profiles.md)
+- Profile policy: [Security applicability amendment](#security-applicability-amendment)
   and its [requirements disposition](validation/security-profile-requirements-disposition.md)
 
 This document primarily describes suite/profile `0x0001` and the stock selected
 runtime. The additive, evaluation-only profile `0x0002` boundary is documented
 separately in [Classical P-256 / Iroh-QUIC security profile](classical-iroh-security-profile.md).
-Decision 0033 makes metadata exposure and classical versus hybrid-PQ use
-policy-selectable; neither profile reinterprets the other's bytes or evidence.
+Mission policy selects metadata exposure and classical versus hybrid-PQ use;
+neither profile reinterprets the other's bytes or evidence.
 
 ## Find a section
 
@@ -21,6 +21,65 @@ policy-selectable; neither profile reinterprets the other's bytes or evidence.
 | What do revocation and zeroization mean? | [Authority custody](#authority-custody-and-control-continuity) and [revocation meaning](#revocation-meaning) |
 | How is availability bounded? | [Causal evidence](#causal-evidence-and-bounded-state) and [availability controls](#availability-controls) |
 | What blocks production authorization? | [Mesh cryptographic provider status](#mesh-cryptographic-provider-status) and [production authorization boundary](#production-authorization-boundary) |
+
+## Security applicability amendment
+
+The stakeholder-approved applicability revision of 2026-08-28
+([Decision 0033, immutable source](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0033-policy-selected-security-profiles.md))
+replaces the interpretation that every profile must use hybrid-PQ cryptography
+and transport-independent protection for all metadata. It preserves the exact
+suite-`0x0001` mechanisms, including both required signatures and the hybrid
+composition review gate. It does not authorize a release or change existing
+wire bytes or validation credit.
+
+A security profile binds a complete suite, mission authorization, source-object
+forms, carrier/adjacency protection, metadata exposure, and compatibility rules.
+A suite ID alone is not a profile. Every supported profile must preserve:
+
+- Carrier-independent source encryption and authentication, protection at rest
+  and through store-and-forward custody, and fresh verification before semantic
+  consumption.
+- Aster mission authority distinct from carrier identity. Interactive peers must
+  authenticate replay-resistant authority bound to the exact channel before
+  inventory or protected synchronization metadata; offline/file exchanges must
+  bind equivalent authority to the exact serialized exchange or bundle.
+- Payload-blind authorized relay and bridge roles, without silently rewriting
+  persistent source or forwarding objects into weaker representations.
+- Minimal plaintext, a declared metadata exposure budget, and operator-visible
+  effective profile information that exposes no secrets.
+- Authenticated transcript selection and a mission-policy minimum. Failure or
+  missing PQ capability never permits a weaker retry; rollback requires explicit
+  authenticated policy.
+
+Mission policy permits exact classical or hybrid-PQ profiles and sets the minimum
+for contacts, stored objects, and releases. A hybrid-required mission must fail
+before inventory if no permitted hybrid profile overlaps. Classical operation
+requires explicit policy, applicable NIST/FIPS algorithm rules, end-to-end source
+protection, versioned agility, and downgrade protection. Hybrid-PQ remains the
+recommended choice for long confidentiality or authenticity lifetimes,
+harvest-now-decrypt-later exposure, and high-assurance policies.
+
+Metadata protection is best effort within that declared profile. Source-stable
+routing and authorization descriptors retain independent protection where
+payload-blind storage and forwarding require it; route members may read only
+fields needed for their role. Ephemeral metadata may use an authenticated
+encrypted carrier, an Aster adjacency layer when needed, or explicit
+policy-permitted exposure. Local indexes and operational metadata require
+minimization and practical storage, custody, and platform protections, not a
+blanket at-rest encryption claim. Carrier identifiers, addresses, timing,
+direction, packet sizes, and RF energy remain observable unless a named carrier
+mechanism demonstrably hides them. Packet-capture acceptance must establish no
+payload plaintext exposure and metadata exposure within the declared budget.
+
+Profile `0x0002` uses QUIC protection without a duplicate classical record layer.
+If policy requires PQ confidentiality for contact metadata, a contact instead
+needs a suitable hybrid record layer or an admitted PQ carrier profile. Release
+profiles must declare idle lifetime and reconnection policy and measure compute,
+memory, bytes, and energy on their targets. Retained capture, hostile-peer,
+independent interoperability, restart/stored-object compatibility, and
+snapshot-resistant rollback evidence remain release gates, alongside applicable
+module, dependency, platform, and integration review. These policy requirements
+do not imply an implemented stock runtime profile selector.
 
 ## Implemented profile boundary
 
@@ -189,8 +248,8 @@ complete process-memory erasure. This residual is separate from successful
 ciphertext authentication and is another production-review gate.
 
 This Rust-only provider is disabled by default and is not production admitted.
-[Decision 0018](decisions/0018-age-provisioning-provider.md) owns its dependency
-review, exceptions, and exit gates.
+Its build-time advisory exceptions are listed in [deny.toml](../deny.toml).
+They do not establish production readiness.
 
 The profile is X25519 and ChaCha20-Poly1305 based. It provides no post-quantum
 artifact-confidentiality or FIPS 140-3 validation claim. The C ABI v2, Go,

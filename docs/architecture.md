@@ -120,6 +120,18 @@ or key-bearing state is released, so retained clones return sanitized
 `StateUnavailable`. A stopped facade can acquire the writer only after the live
 actor has exited and must close before a new actor starts.
 
+The static Event bridge uses this same redb authority, rather than a separate
+store that could disagree about active routes. It commits authorization
+activation, exact source and wrapper bytes, route dependencies, and the active
+projection atomically under the store's item and byte limits. It retains the
+authorization chain and per-edge generation high-water marks. After reopen,
+the core adapter must verify the complete chain and exact route bytes against
+current policy and those high-water marks before exposing a route as current;
+a valid but stale authorization prefix is insufficient. The receiver commits
+its local outcome before returning a bridge result. See the
+[Event bridge transfer contract](protocol.md#93-selected-semantic-v6-event-bridge-transfer)
+for bounded offers, receiver checks, and payload delivery.
+
 For a semantic-v7 contact, the first protected exchange negotiates a transfer
 profile independently for Event, State, Record, Blob, and EventBridge. Every
 non-Blob lane offers `LegacyV6`; Event may additionally select

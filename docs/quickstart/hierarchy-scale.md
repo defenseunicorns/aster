@@ -120,6 +120,3 @@ quotas, dynamic routing or interest policy, revocation/rekey lifecycle,
 cross-class custody, physical or hostile-network behavior, target-device
 resource fitness, 100 members per scope, 1,000 nodes across bridges, complete
 MVP credit, or release authorization.
-
-The rationale and exact non-claims are recorded in
-[Decision 0040](../decisions/0040-bound-generated-hierarchy-scale-diagnostic.md).

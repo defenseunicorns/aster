@@ -338,12 +338,14 @@ This profile requires a fresh store boundary. A store containing the older
 arbitrary-key Event publication ledger is refused without migration or
 deletion, and a numbered store refuses later arbitrary-key publications.
 Persistent Event subscriptions, polling, delivery cursors and acknowledgements
-now require the same stable client owner and recovered session as publication.
-Populated stores with unowned subscription records are also refused without
-modifying the original bytes.
-Increment 3 adds explicit partial Rust SDK/CLI journal-loss
-reconstruction, permanent offline retirement and admission tuning. See
-[the lifecycle procedure](../decisions/0046-numbered-event-client-lifecycle.md).
+require the same stable client owner and recovered session as publication.
+Subscription records require version-2 ownership encoding and IDs use the
+version-2 client namespace. Startup refuses populated unowned subscription
+state without modifying the original bytes; it does not infer an owner or
+provide a compatibility mutation path. Empty subscription state can initialize.
+For partial Rust SDK/CLI journal-loss reconstruction, permanent offline
+retirement and admission tuning, see
+[the lifecycle procedure](event-client-lifecycle.md).
 Neither reconstruction nor retirement recovers lost application effects or
 permits client-ID reuse.
 
@@ -467,6 +469,13 @@ sequence before later work can commit; independent configured clients can
 continue. gRPC-Web request streaming is unsupported. Browser callers use
 ordered unary numbered calls within each client.
 
+A publication failure does not mean the application wants to discard the work.
+Repair the cause and retry the original journaled intent; do not replace it
+under the same sequence. Abandon only uncommitted work you choose to skip, and
+allocate replacement work separately. After an unknown outcome, recover or
+replay the original intent to determine whether it committed before considering
+abandonment. The SDK does not skip failed work automatically.
+
 The sole node actor groups already-admitted adjacent non-Flash publications,
 splits incompatible custody cohorts, and falls back in order after a failed
 cohort. It does not wait to fill a batch or delay other actor work. Flash Events
@@ -495,6 +504,9 @@ the `operation_key` bytes (including non-UTF-8 keys; Protobuf
 JSON represents bytes as base64).
 
 ## Commit before acknowledging
+
+Client ownership coordinates cooperating processes. The shared mission bearer
+credential does not provide per-client security isolation.
 
 `CreateEventSubscription` creates or replays an immutable durable selector by
 the pair of owning client ID and operation key. Create, poll, stream, acknowledgement
